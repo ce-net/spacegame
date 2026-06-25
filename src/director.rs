@@ -1,0 +1,267 @@
+//! Director — the thin **mesh I/O** layer that turns the pure decision modules
+//! ([`crate::shard`], [`crate::snapshot`], [`crate::leaderboard`]) into real CE SDK calls.
+//!
+//! Everything testable lives in those pure modules; this module is deliberately small and is the one
+//! place that touches the network, so the showcase capabilities map to concrete `ce-rs` calls:
+//!
+//! | Showcase | What the director does | SDK call |
+//! |---|---|---|
+//! | **Distribution** | place a sector's authoritative cell on a chosen node | [`CeClient::mesh_deploy`] |
+//! | **Latency** | gather capacity + latency, score, pick the closest capable host | [`CeClient::atlas`], [`CeClient::netgraph`] |
+//! | **Concurrency** | rendezvous-hash a sector to a host so the galaxy spreads across the mesh | (pure: [`crate::shard::shard_for`]) |
+//! | **Replication** | snapshot a sector to a content-addressed object, advertise + announce its CID | [`CeClient::put_object`], [`CeClient::advertise_service`], [`CeClient::publish`] |
+//! | **Consensus** | seal the galaxy leaderboard's CID against the PoW beacon, broadcast it | [`CeClient::put_object`], [`CeClient::beacon`], [`CeClient::publish`] |
+//! | **Economy** | open a payment channel paying the sector host per session, sign rising receipts | [`CeClient::channel_open`], [`CeClient::sign_receipt`] |
+//!
+//! These functions are `async` and hit the local node, so they are not unit-tested here (the
+//! deterministic logic they wrap is). Failures are returned to the caller, which logs and continues —
+//! a transient mesh hiccup must never take a sector down.
+
+use anyhow::{Context, Result};
+use ce_rs::{Amount, BidSpec, CeClient, Receipt};
+use std::collections::HashMap;
+
+use crate::leaderboard::{Commitment, Leaderboard};
+use crate::shard::{best_host, nearest_host, shard_for, HostCandidate};
+use crate::sim::Sim;
+use crate::snapshot::SectorSnapshot;
+use crate::wire::topics;
+
+/// Galaxy id the leaderboard is sealed under. A deployment hosting one galaxy uses one id.
+pub const GALAXY: &str = "main";
+
+/// Minimum capacity the director requires of a host before placing a sector cell there.
+pub const MIN_CORES: u32 = 1;
+pub const MIN_MEM_MB: u32 = 128;
+
+/// Build the [`HostCandidate`] set from the live node view: the capacity atlas (cores/mem/load and
+/// the `spacegame` self-tag that signals "I can host a sector cell") joined with the latency graph
+/// (RTT per peer). This is the **latency + distribution** input — `best_host`/`nearest_host`/
+/// `shard_for` all consume what this returns.
+pub async fn gather_candidates(ce: &CeClient) -> Result<Vec<HostCandidate>> {
+    let atlas = ce.atlas().await.context("atlas")?;
+    let rtt: HashMap<String, f64> = match ce.netgraph().await {
+        Ok(edges) => edges.into_iter().map(|e| (e.peer, e.rtt_ms)).collect(),
+        Err(e) => {
+            tracing::debug!(error = %e, "netgraph unavailable; placing without measured latency");
+            HashMap::new()
+        }
+    };
+
+    Ok(atlas
+        .into_iter()
+        .map(|a| HostCandidate {
+            rtt_ms: rtt.get(&a.node_id).copied(),
+            // A node advertises hostability with the `spacegame` tag; absent that we still consider
+            // any general-purpose node (docker/linux) capable, so a fresh mesh can still host.
+            can_host: a.has_tag("spacegame") || a.has_tag("docker") || a.has_tag("linux") || a.tags.is_empty(),
+            node_id: a.node_id,
+            cpu_cores: a.cpu_cores,
+            mem_mb: a.mem_mb,
+            running_jobs: a.running_jobs,
+        })
+        .collect())
+}
+
+/// Decide where a sector's authoritative cell **should** run, latency-first, over the live mesh.
+/// Returns the chosen host NodeId, or `None` if no candidate is capable (the caller then hosts the
+/// sector locally as a fallback).
+pub async fn choose_host(ce: &CeClient, _sector: &str) -> Result<Option<String>> {
+    let cands = gather_candidates(ce).await?;
+    Ok(best_host(&cands, MIN_CORES, MIN_MEM_MB).map(|c| c.node_id.clone()))
+}
+
+/// Coordinator-free shard assignment: of the currently-capable hosts, which one owns `sector` by
+/// rendezvous hash. Every node computes the same answer, so a busy galaxy's sectors spread evenly
+/// across the mesh with no scheduler (the **concurrency** story). `None` if no host is capable.
+pub async fn shard_owner(ce: &CeClient, sector: &str) -> Result<Option<String>> {
+    let cands = gather_candidates(ce).await?;
+    let ids: Vec<String> = cands
+        .into_iter()
+        .filter(|c| c.is_capable(MIN_CORES, MIN_MEM_MB))
+        .map(|c| c.node_id)
+        .collect();
+    Ok(shard_for(sector, &ids).map(|s| s.to_string()))
+}
+
+/// **Distribution:** place the cell that hosts `sector` on `node_id` over the mesh (`mesh_deploy`).
+/// The deployed cell runs `game-spacegame host --sector <sector>` — the very binary this crate builds
+/// — so the authoritative simulation of that region of space runs on the chosen node. Returns the
+/// host-assigned job id.
+pub async fn deploy_sector_cell(
+    ce: &CeClient,
+    node_id: &str,
+    sector: &str,
+    image: &str,
+    duration_secs: u64,
+    bid: Amount,
+    grant: Option<&str>,
+) -> Result<String> {
+    let spec = BidSpec {
+        image: image.to_string(),
+        cmd: vec!["game-spacegame".into(), "host".into(), "--sector".into(), sector.to_string()],
+        cpu_cores: MIN_CORES,
+        mem_mb: MIN_MEM_MB as u64,
+        duration_secs,
+        bid,
+    };
+    let job_id = ce
+        .mesh_deploy(node_id, &spec, grant)
+        .await
+        .with_context(|| format!("mesh_deploy sector {sector} on {node_id}"))?;
+    tracing::info!(sector, node_id, job_id, "deployed authoritative sector cell on chosen host");
+    Ok(job_id)
+}
+
+/// A client's latency-aware host pick: of the nodes currently advertising `sector` in the DHT, the
+/// **nearest** one to this client (lowest measured RTT). `None` if nobody hosts the sector.
+pub async fn nearest_sector_host(ce: &CeClient, sector: &str) -> Result<Option<String>> {
+    let hosts = ce.find_service(&topics::service(sector)).await.context("find_service")?;
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+    let rtt: HashMap<String, f64> = match ce.netgraph().await {
+        Ok(edges) => edges.into_iter().map(|e| (e.peer, e.rtt_ms)).collect(),
+        Err(_) => HashMap::new(),
+    };
+    Ok(nearest_host(&hosts, &rtt).map(|s| s.to_string()))
+}
+
+/// **Replication:** snapshot a sector's authoritative `sim` to a content-addressed object, advertise
+/// the sector's snapshot service, and announce the CID + tick so a recovering host can fail over.
+/// Returns the snapshot CID. Every node that fetches the object caches it, so each is a CDN edge —
+/// "content-addressed = every node is a CDN edge".
+pub async fn replicate_snapshot(ce: &CeClient, sector: &str, sim: &Sim) -> Result<String> {
+    let snap = SectorSnapshot::capture(sim);
+    let bytes = snap.encode().context("encode snapshot")?;
+    let cid = ce.put_object(&bytes).await.context("put_object snapshot")?;
+    if let Err(e) = ce.advertise_service(&snapshot_service(sector)).await {
+        tracing::debug!(error = %e, sector, "snapshot-service advertise failed (continuing)");
+    }
+    let ann = SnapshotAnnounce { cid: cid.clone(), tick: snap.tick };
+    if let Ok(b) = serde_json::to_vec(&ann)
+        && let Err(e) = ce.publish(&snapshot_topic(sector), &b).await
+    {
+        tracing::debug!(error = %e, sector, "snapshot CID announce failed (continuing)");
+    }
+    tracing::debug!(sector, cid, tick = snap.tick, "replicated authoritative sector snapshot to blob store");
+    Ok(cid)
+}
+
+/// Restore a sector's [`Sim`] from a replicated snapshot object by CID — what a host that has just
+/// taken over a sector calls so play resumes from the last replicated state with at most one
+/// snapshot-interval of loss, instead of an empty sector.
+pub async fn restore_snapshot(ce: &CeClient, cid: &str) -> Result<Sim> {
+    let bytes = ce.get_object(cid).await.with_context(|| format!("get_object {cid}"))?;
+    let snap = SectorSnapshot::decode(&bytes).context("decode snapshot")?;
+    tracing::info!(cid, tick = snap.tick, ships = snap.ships.len(), "restored sector from replicated snapshot");
+    Ok(snap.restore())
+}
+
+/// The DHT service name under which holders of a sector's latest replicated snapshot advertise.
+pub fn snapshot_service(sector: &str) -> String {
+    format!("{}/snap", topics::service(sector))
+}
+
+/// The pubsub topic on which a host announces each freshly-replicated snapshot's CID.
+pub fn snapshot_topic(sector: &str) -> String {
+    format!("{}/snap", topics::service(sector))
+}
+
+/// An announcement that a fresh snapshot exists. Published on [`snapshot_topic`] after each
+/// [`replicate_snapshot`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SnapshotAnnounce {
+    pub cid: String,
+    pub tick: u64,
+}
+
+/// **Consensus:** seal the galaxy's current standings against the PoW chain and broadcast the
+/// commitment. `sim` is one sector's authoritative state; for a single-process multi-sector host this
+/// is the union of its sectors' kills (the binary folds them with [`Leaderboard::merge`] before
+/// sealing). Returns the published commitment.
+pub async fn seal_leaderboard(ce: &CeClient, board: &Leaderboard, host: &str) -> Result<Commitment> {
+    let bytes = board.encode().context("encode leaderboard")?;
+    let cid = ce.put_object(&bytes).await.context("put_object leaderboard")?;
+    let beacon = ce.beacon().await.context("beacon")?;
+    let commitment = Commitment::seal(board, &cid, beacon.height, &beacon.hash, host);
+    let frame = commitment.encode().context("encode commitment")?;
+    ce.publish(&seal_topic(), &frame).await.context("publish seal")?;
+    tracing::info!(
+        galaxy = %board.galaxy,
+        cid,
+        height = beacon.height,
+        digest = commitment.digest,
+        "sealed tamper-proof galaxy leaderboard against the PoW chain"
+    );
+    Ok(commitment)
+}
+
+/// Reduce one sector's sim to its `(id, name, kills)` standings as a [`Leaderboard`] — the per-shard
+/// contribution the binary folds across sectors before sealing.
+pub fn board_for_sector(sim: &Sim) -> Leaderboard {
+    let rows = sim.ships.iter().map(|(id, s)| (id.clone(), s.name.clone(), s.kills));
+    Leaderboard::from_scores(GALAXY, sim.tick, rows)
+}
+
+/// The galaxy-wide leaderboard-seal topic: where a host broadcasts [`Commitment`]s and clients listen
+/// to render the verified, chain-anchored standings.
+pub fn seal_topic() -> String {
+    format!("ce-game/{}/{}/seal", topics::GAME, GALAXY)
+}
+
+/// **Economy / marketplace:** open a payment channel paying the sector `host` for hosting this
+/// player's session, then sign an initial receipt. Per-session billing for compute is the marketplace
+/// angle — a player funds the node that simulates their region of space. Returns the channel id and
+/// the first signed receipt; the caller signs rising receipts as the session continues (see
+/// [`pay_host_tick`]). Best-effort: a node without channels just surfaces the error to the caller.
+pub async fn open_host_channel(
+    ce: &CeClient,
+    host: &str,
+    capacity: Amount,
+    per_tick: Amount,
+) -> Result<(String, Receipt)> {
+    let channel_id = ce.channel_open(host, capacity, 0).await.context("channel_open")?;
+    let receipt = ce.sign_receipt(&channel_id, host, per_tick).await.context("sign first receipt")?;
+    tracing::info!(host, channel_id, "opened payment channel to the sector host (per-session billing)");
+    Ok((channel_id, receipt))
+}
+
+/// Sign the next rising receipt on an open host channel — call periodically to pay for ongoing
+/// hosting. `cumulative` is the monotonic total authorized so far; the host redeems the highest one.
+pub async fn pay_host_tick(ce: &CeClient, channel_id: &str, host: &str, cumulative: Amount) -> Result<Receipt> {
+    ce.sign_receipt(channel_id, host, cumulative).await.context("sign receipt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The director's logic is wired SDK I/O; the deterministic decisions it composes are tested in
+    // their own modules. These pin the pure string/topic helpers clients and standby hosts must agree
+    // on exactly, plus the per-sector board reduction.
+
+    #[test]
+    fn seal_topic_is_galaxy_scoped() {
+        assert_eq!(seal_topic(), "ce-game/spacegame/main/seal");
+    }
+
+    #[test]
+    fn snapshot_service_is_distinct_from_host_service() {
+        assert_eq!(snapshot_service("0_0"), "ce-game/spacegame/0_0/snap");
+        assert_ne!(snapshot_service("0_0"), topics::service("0_0"));
+    }
+
+    #[test]
+    fn board_for_sector_reduces_kills() {
+        let mut sim = Sim::new();
+        sim.join("nodeA", "Ace", 1);
+        sim.join("nodeB", "Bee", 2);
+        sim.ships.get_mut("nodeA").unwrap().kills = 5;
+        sim.ships.get_mut("nodeB").unwrap().kills = 2;
+        let board = board_for_sector(&sim);
+        assert_eq!(board.galaxy, GALAXY);
+        assert_eq!(board.champion().unwrap().id, "nodeA");
+        assert_eq!(board.champion().unwrap().kills, 5);
+    }
+}

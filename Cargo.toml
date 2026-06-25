@@ -1,0 +1,30 @@
+[package]
+name = "game-spacegame"
+version = "0.1.0"
+edition = "2024"
+description = "Authoritative, sector-sharded mesh backend for CE Spacegame — a real-time multiplayer space arena. The galaxy is a grid of SECTORS; each sector is an independent authoritative cell, rendezvous-hashed onto a latency-optimal mesh node, snapshot-replicated to content-addressed blobs for failover, with the leaderboard sealed against the PoW chain. A flagship demonstration that CE is a global supercomputer."
+license = "MIT"
+
+# A lib (the pure, testable sim + sharding + snapshot + consensus) plus a thin binary that
+# wires the sector cells to the local CE node over the mesh.
+[lib]
+name = "game_spacegame"
+path = "src/lib.rs"
+
+[[bin]]
+name = "game-spacegame"
+path = "src/main.rs"
+
+[dependencies]
+ce-rs = { path = "../ce-rs" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
