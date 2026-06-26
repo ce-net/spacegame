@@ -470,8 +470,9 @@ impl Sim {
         self.rules = rules;
     }
 
+    /// Number of **human players** in the sector (NPC fleet ships are excluded).
     pub fn player_count(&self) -> usize {
-        self.ships.len()
+        self.ships.values().filter(|s| s.owner.is_none()).count()
     }
 
     fn tun(&self) -> Tunables {
@@ -1581,6 +1582,15 @@ mod tests {
         s
     }
 
+    /// Clear every faction's roster + autonomy so no NPC fleet ships spawn — for tests that assert
+    /// pure single-ship mechanics (counts, snapshot ordering, missile targeting) without fleet noise.
+    fn solo(s: &mut Sim) {
+        for f in s.factions.values_mut() {
+            f.units.clear();
+            f.policy.enabled = false;
+        }
+    }
+
     #[test]
     fn rock_field_is_deterministic() {
         for cx in -4..8 {
@@ -1632,6 +1642,7 @@ mod tests {
         // with wrapped local coords and carried velocity, and is removed from this sector.
         let mut s = Sim::for_sector(SectorId::new(0, 0), Arc::new(Ruleset::builtin()));
         s.join("n", "p", 0);
+        solo(&mut s);
         {
             let p = s.ships.get_mut("n").unwrap();
             p.x = SECTOR_SIZE - 2.0;
