@@ -49,6 +49,52 @@ sys.exit(1)
 PY
 echo "    ok: wasm table growable"
 
+echo "==> smoke 1b: every wasm import is defined by the served glue (no LinkError on boot)"
+# The wasm-bindgen glue (.js) must define EVERY import the .wasm declares. If a deploy serves a NEW wasm
+# (a new web-sys/js call adds an import) against an OLD/cached glue, the browser fails instantiation with
+# "import requires a callable" and the page never boots — invisible to curl and to `cargo test`. (This
+# shipped once: adding window.performance introduced __wbg_performance that a cached glue lacked.) We parse
+# the wasm import section and assert each import name is defined in the served glue + its snippet modules.
+python3 - "$BASE" <<'PY' || fail "a wasm import is not defined by the served glue -> the browser would LinkError on boot (stale/mismatched glue)"
+import sys, re, urllib.request
+base = sys.argv[1]; UA = {"User-Agent": "Mozilla/5.0 (smoke)"}
+def fetch(p, b=False):
+    r = urllib.request.urlopen(urllib.request.Request(base + p, headers=UA), timeout=25)
+    return r.read() if b else r.read().decode("utf-8", "ignore")
+wasm = fetch("/pkg/spacegame_wasm_bg.wasm", True)
+defs = fetch("/pkg/spacegame_wasm.js")
+for sp in set(re.findall(r"\./(snippets/[^\"']+\.js)", defs)):
+    try: defs += fetch("/pkg/" + sp)
+    except Exception: pass
+def uleb(d, i):
+    r = s = 0
+    while True:
+        b = d[i]; i += 1; r |= (b & 0x7f) << s; s += 7
+        if not (b & 0x80): break
+    return r, i
+i = 8; imports = []
+while i < len(wasm):
+    sid = wasm[i]; i += 1
+    size, i = uleb(wasm, i); end = i + size
+    if sid == 2:  # import section
+        n, j = uleb(wasm, i)
+        for _ in range(n):
+            mlen, j = uleb(wasm, j); j += mlen
+            flen, j = uleb(wasm, j); fld = wasm[j:j+flen].decode("utf-8", "ignore"); j += flen
+            kind = wasm[j]; j += 1
+            if kind == 0: _, j = uleb(wasm, j)          # func typeidx
+            elif kind == 3: j += 2                       # global: valtype+mut
+            else: break                                  # table/mem imports unused here
+            imports.append(fld)
+        break
+    i = end
+missing = [f for f in imports if f not in defs]
+print("    parsed %d wasm imports; %d undefined in glue" % (len(imports), len(missing)))
+for f in missing[:20]: print("      MISSING:", f)
+sys.exit(1 if missing else 0)
+PY
+echo "    ok: all wasm imports satisfied by the served glue"
+
 echo "==> smoke 2/3: served by ce-serve WITH the mesh bridge injected"
 page=$(curl -s -m 15 -A "Mozilla/5.0 (smoke)" "$BASE/")
 [ -n "$page" ] || fail "page $BASE/ empty"
