@@ -36,6 +36,7 @@
 //! unit-tested; this module adds the thin mesh I/O loop that the binary drives.
 
 pub mod aabb;
+pub mod build;
 pub mod director;
 pub mod faction;
 pub mod leaderboard;
@@ -43,6 +44,7 @@ pub mod physics;
 pub mod replication;
 pub mod room;
 pub mod ruleset;
+pub mod shape;
 pub mod shard;
 pub mod sim;
 pub mod snapshot;

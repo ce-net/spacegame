@@ -31,6 +31,11 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::build::{
+    Blueprint, BpParam, Catalog, ObjectCategory, ObjectDef, ObjectStats, Placement, Repeat, Transform2D,
+};
+use crate::shape::Shape2D;
+
 /// How a weapon delivers damage. The authoritative simulation dispatches firing on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +218,13 @@ pub struct Ruleset {
     pub weapons: Vec<WeaponDef>,
     /// The tech tree.
     pub tech: Vec<TechNode>,
+    /// The buildable object/block catalogue (structure, armor, weapons, thrusters, command centres,
+    /// radars, sensors, tanks, containers, upgrades…) — hot-reloadable like everything else.
+    #[serde(default)]
+    pub objects: Vec<ObjectDef>,
+    /// Reusable, recursive blueprints designers build from the object catalogue.
+    #[serde(default)]
+    pub blueprints: Vec<Blueprint>,
     /// Frontend assets (shaders, art params).
     #[serde(default)]
     pub assets: Assets,
@@ -443,8 +455,25 @@ impl Ruleset {
                     effect: TechEffect::UnlockWeapon { weapon: "lance".into() },
                 },
             ],
+            objects: builtin_objects(),
+            blueprints: builtin_blueprints(),
             assets: Assets::default(),
         }
+    }
+
+    /// A read-only view of the buildable catalogue for [`crate::build::resolve_blueprint`].
+    pub fn catalog(&self) -> Catalog<'_> {
+        Catalog { objects: &self.objects, blueprints: &self.blueprints }
+    }
+
+    /// Resolve a blueprint by id (with optional parameter overrides) into a concrete assembled craft —
+    /// the bridge from a design to the mass/thrust/weapons/shape the sim and physics consume.
+    pub fn resolve_craft(
+        &self,
+        id: &str,
+        args: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<crate::build::ResolvedCraft, String> {
+        crate::build::resolve_blueprint(&self.catalog(), id, args)
     }
 
     /// The weapon with `id`, if present.
@@ -506,6 +535,9 @@ impl Ruleset {
         if self.tunables.damping <= 0.0 || self.tunables.damping > 1.0 {
             return Err("damping must be in (0, 1]".into());
         }
+        // The buildable catalogue: shapes sane, references resolve, no blueprint cycles, interior-only
+        // objects placed inside a holder.
+        crate::build::validate_catalog(&self.catalog())?;
         Ok(())
     }
 
@@ -531,6 +563,121 @@ impl Default for Ruleset {
 /// A shared, cheaply-clonable handle to the live ruleset. The sim stores one of these and reads it
 /// each tick; a hot reload swaps the pointed-to value.
 pub type RulesetHandle = Arc<Ruleset>;
+
+/// The built-in buildable object catalogue — a starter set spanning every category and several shape
+/// families (rectangles, triangles, trapezoids, discs, hex plates). Designers extend or rebalance this
+/// live by editing the ruleset.
+fn builtin_objects() -> Vec<ObjectDef> {
+    use ObjectCategory::*;
+    let s = |stats: ObjectStats| stats;
+    vec![
+        ObjectDef::new("struct-block", "Structure Block", Structure, Shape2D::Rect { w: 2.0, h: 2.0 }).mass(2.0).hp(220),
+        ObjectDef::new("struct-corner", "Corner Brace", Structure, Shape2D::Triangle { w: 2.0, h: 2.0, skew: 0.0 })
+            .mass(1.4)
+            .hp(160),
+        ObjectDef::new("container", "Cargo Container", Container, Shape2D::Rect { w: 2.0, h: 2.0 })
+            .mass(1.5)
+            .hp(140)
+            .stats(s(ObjectStats { capacity: 200.0, ..Default::default() })),
+        ObjectDef::new("armor-plate", "Armor Plate", Armor, Shape2D::Rect { w: 2.0, h: 1.0 })
+            .mass(1.2)
+            .hp(260)
+            .stats(s(ObjectStats { armor: 60, ..Default::default() })),
+        ObjectDef::new("armor-wedge", "Armor Wedge", Armor, Shape2D::Triangle { w: 2.0, h: 2.0, skew: 0.0 })
+            .mass(1.0)
+            .hp(200)
+            .stats(s(ObjectStats { armor: 45, ..Default::default() })),
+        ObjectDef::new("armor-hex", "Hex Plate", Armor, Shape2D::RegularPolygon { sides: 6, r: 1.2 })
+            .mass(1.3)
+            .hp(240)
+            .stats(s(ObjectStats { armor: 55, ..Default::default() })),
+        ObjectDef::new("gun", "Auto Gun", Gun, Shape2D::Rect { w: 0.8, h: 1.4 })
+            .mass(0.6)
+            .hp(60)
+            .stats(s(ObjectStats { weapon: Some("blaster".into()), power: -1.0, ..Default::default() })),
+        ObjectDef::new("turret", "Turret", Turret, Shape2D::Disc { r: 0.9 })
+            .mass(0.9)
+            .hp(90)
+            .stats(s(ObjectStats { weapon: Some("blaster".into()), power: -2.0, ..Default::default() })),
+        ObjectDef::new("missile-rack", "Missile Rack", Weapon, Shape2D::Rect { w: 1.2, h: 1.4 })
+            .mass(1.1)
+            .hp(80)
+            .stats(s(ObjectStats { weapon: Some("missile".into()), power: -3.0, ..Default::default() })),
+        ObjectDef::new("thruster", "Thruster", Thruster, Shape2D::Trapezoid { top_w: 0.6, bottom_w: 1.4, h: 1.2, top_skew: 0.0 })
+            .mass(0.8)
+            .hp(70)
+            .stats(s(ObjectStats { thrust: 60.0, power: -6.0, ..Default::default() })),
+        ObjectDef::new("command-center", "Command Center", CommandCenter, Shape2D::Rect { w: 1.2, h: 1.2 })
+            .mass(1.0)
+            .hp(120)
+            .stats(s(ObjectStats { power: 16.0, ..Default::default() })),
+        ObjectDef::new("radar", "Radar", Radar, Shape2D::Disc { r: 0.7 })
+            .mass(0.5)
+            .hp(50)
+            .stats(s(ObjectStats { sensor_range: 4000.0, power: -3.0, ..Default::default() })),
+        ObjectDef::new("sensor", "Sensor", Sensor, Shape2D::Rect { w: 0.8, h: 0.8 })
+            .mass(0.3)
+            .hp(40)
+            .stats(s(ObjectStats { sensor_range: 1200.0, power: -1.0, ..Default::default() })),
+        ObjectDef::new("tank-round", "Round Tank", StorageTank, Shape2D::Disc { r: 1.1 })
+            .mass(1.0)
+            .hp(100)
+            .stats(s(ObjectStats { capacity: 600.0, ..Default::default() })),
+        ObjectDef::new("tank-rect", "Box Tank", StorageTank, Shape2D::Rect { w: 2.0, h: 1.4 })
+            .mass(1.1)
+            .hp(110)
+            .stats(s(ObjectStats { capacity: 700.0, ..Default::default() })),
+        ObjectDef::new("reactor", "Reactor Upgrade", Upgrade, Shape2D::Rect { w: 1.0, h: 1.0 })
+            .mass(0.8)
+            .hp(80)
+            .stats(s(ObjectStats { power: 40.0, ..Default::default() })),
+        ObjectDef::new("targeting-amp", "Targeting Amp", Upgrade, Shape2D::Rect { w: 0.8, h: 0.8 })
+            .mass(0.3)
+            .hp(50)
+            .stats(s(ObjectStats { boost: 0.25, ..Default::default() })),
+    ]
+}
+
+/// Built-in blueprints showing the recursive system: a `turret-pod` (a structure holding a turret) and
+/// a parametric `scout` that nests two turret pods, places a command centre + radar inside a structure,
+/// repeats a spine of blocks, and sizes an armour plate from its `armor` parameter.
+fn builtin_blueprints() -> Vec<Blueprint> {
+    let pod = Blueprint {
+        id: "turret-pod".into(),
+        name: "Turret Pod".into(),
+        params: vec![],
+        root: vec![Placement::object("struct-block", Transform2D::default())
+            .with_children(vec![Placement::object("turret", Transform2D::default())])],
+    };
+    let scout = Blueprint {
+        id: "scout".into(),
+        name: "Scout".into(),
+        params: vec![BpParam { name: "armor".into(), default: 2.0, min: Some(1.0), max: Some(6.0) }],
+        root: vec![
+            // A spine of three structure blocks.
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_repeat(Repeat {
+                count: 3,
+                dx: 0.0,
+                dy: 2.0,
+                drot: 0.0,
+            }),
+            // The brain + radar live inside a structure block.
+            Placement::object("struct-block", Transform2D::new(0.0, 2.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("radar", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            // Two thrusters at the tail.
+            Placement::object("thruster", Transform2D::new(-0.8, -1.6, 0.0)),
+            Placement::object("thruster", Transform2D::new(0.8, -1.6, 0.0)),
+            // Two turret pods on the wings — blueprint within blueprint.
+            Placement::blueprint("turret-pod", Transform2D::new(-2.6, 1.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.6, 1.0, 0.0)),
+            // A parametric armour plate: its width follows the `armor` parameter (dynamic customisation).
+            Placement::object("armor-plate", Transform2D::new(0.0, 5.0, 0.0)).with_bind("w", "armor"),
+        ],
+    };
+    vec![pod, scout]
+}
 
 #[cfg(test)]
 mod tests {
@@ -627,5 +774,23 @@ mod tests {
         assert_eq!(r.version, 7);
         assert_eq!(r.default_weapon(), "blaster");
         assert_eq!(r.tunables.max_speed, 7.0);
+    }
+
+    #[test]
+    fn builtin_catalog_and_blueprints_validate_and_resolve() {
+        let r = Ruleset::builtin();
+        assert!(r.validate().is_ok(), "builtin ruleset incl. the buildable catalogue validates");
+        // The recursive `scout` expands: spine(3) + (struct+command+radar=3) + 2 thrusters +
+        // 2 turret-pods×(struct+turret=2)=4 + 1 armor plate = 13 parts.
+        let craft = r.resolve_craft("scout", &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(craft.parts.len(), 13, "scout resolved to all nested parts");
+        assert!(craft.total_thrust > 0.0, "it has thrusters");
+        assert!(craft.weapon_mounts.len() >= 2, "the two turret pods mount weapons");
+        assert!(craft.parts.iter().any(|p| p.category == crate::build::ObjectCategory::CommandCenter));
+        // The `armor` parameter dynamically widens the armour plate (and adds mass).
+        let wide = r
+            .resolve_craft("scout", &std::collections::BTreeMap::from([("armor".to_string(), 6.0)]))
+            .unwrap();
+        assert!(wide.total_mass > craft.total_mass, "a wider armour parameter makes a heavier craft");
     }
 }

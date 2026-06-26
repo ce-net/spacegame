@@ -226,6 +226,72 @@ pub struct Placement {
     pub repeat: Option<Repeat>,
 }
 
+impl Placement {
+    /// Place a concrete object at a transform (no children/params).
+    pub fn object(def: &str, at: Transform2D) -> Self {
+        Placement {
+            at,
+            kind: PlacementKind::Object { def: def.into() },
+            params: BTreeMap::new(),
+            bind: BTreeMap::new(),
+            shape: None,
+            children: vec![],
+            repeat: None,
+        }
+    }
+    /// Place a nested blueprint at a transform.
+    pub fn blueprint(id: &str, at: Transform2D) -> Self {
+        Placement {
+            at,
+            kind: PlacementKind::Blueprint { id: id.into(), args: BTreeMap::new(), arg_bind: BTreeMap::new() },
+            params: BTreeMap::new(),
+            bind: BTreeMap::new(),
+            shape: None,
+            children: vec![],
+            repeat: None,
+        }
+    }
+    /// Objects placed inside this one (structures/containers).
+    pub fn with_children(mut self, children: Vec<Placement>) -> Self {
+        self.children = children;
+        self
+    }
+    /// A literal numeric customisation (e.g. `("w", 4.0)`).
+    pub fn with_param(mut self, key: &str, v: f32) -> Self {
+        self.params.insert(key.into(), v);
+        self
+    }
+    /// Bind a customisation key to a scope variable (dynamic sizing).
+    pub fn with_bind(mut self, key: &str, var: &str) -> Self {
+        self.bind.insert(key.into(), var.into());
+        self
+    }
+    /// Repeat this placement.
+    pub fn with_repeat(mut self, repeat: Repeat) -> Self {
+        self.repeat = Some(repeat);
+        self
+    }
+    /// Override the shape for this instance.
+    pub fn with_shape(mut self, shape: Shape2D) -> Self {
+        self.shape = Some(shape);
+        self
+    }
+    /// Pass a literal arg to a nested blueprint (only meaningful on a [`PlacementKind::Blueprint`]).
+    pub fn with_arg(mut self, name: &str, v: f32) -> Self {
+        if let PlacementKind::Blueprint { args, .. } = &mut self.kind {
+            args.insert(name.into(), v);
+        }
+        self
+    }
+    /// Bind a nested blueprint's arg to a scope variable.
+    pub fn with_arg_bind(mut self, name: &str, var: &str) -> Self {
+        if let PlacementKind::Blueprint { arg_bind, .. } = &mut self.kind {
+            arg_bind.insert(name.into(), var.into());
+        }
+        self
+    }
+}
+
 /// A declared blueprint parameter (a setting / customization knob).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BpParam {

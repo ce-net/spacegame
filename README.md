@@ -46,6 +46,10 @@ faction metagame, and the proximity-replica fault-tolerance system.
 - **Infinite map:** a ship that crosses a sector edge is *handed off* to the neighbouring sector
   (cross-sector transit), carrying its full loadout — one continuous galaxy, not walled arenas.
 - **Ship↔ship collision physics** keep ships from stacking.
+- **Free-form building:** design craft by placing objects (structure, armor, weapons, turrets,
+  thrusters, command centres, radars, sensors, tanks, containers, upgrades) with **variable, reusable
+  shapes**, then compose them into **recursive blueprints** (blueprints inside blueprints) with
+  parameters that resolve at runtime into a concrete craft. All hot-reloadable. See [`BUILDING.md`](BUILDING.md).
 - **Hot reload:** weapons, items, tech tree, tunables and even **frontend shaders** can be changed
   *while people are playing* and the change reaches every host and client across the mesh instantly.
 
@@ -74,7 +78,12 @@ src/
   replication.rs  proximity-replica fault tolerance: K high-precision replicas on nearby players' nodes,
                   heartbeat failure detection, deterministic takeover, re-replicate to the next best.
   ruleset.rs      the hot-reloadable game definition as DATA: weapon catalogue, tech tree, physics
-                  tunables, and an opaque shader/asset blob. Versioned; swapped live with no restart.
+                  tunables, the buildable object/blueprint catalogue, and a shader/asset blob.
+  shape.rs        the dynamic shape kernel every block type reuses: parametric rect/triangle/trapezoid/
+                  disc/regular-polygon/polygon with area/centroid/inertia/AABB + physics conversion.
+  build.rs        free-form building: object catalog (structure/armor/weapon/turret/thruster/command/
+                  radar/sensor/tank/container/upgrade) + placement + RECURSIVE blueprints (blueprints
+                  in blueprints) with params, repeat, and runtime resolution to a concrete craft.
   shard.rs        SectorId + rendezvous-hash sharding + latency-first host scoring + interest set.
   wire.rs         sector-keyed pubsub topics + ClientMsg / Snapshot JSON wire types (weapons, beams).
   room.rs         glue: authenticated mesh msg -> sim intent; sim -> wire Snapshot (full + viewport-

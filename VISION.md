@@ -68,3 +68,7 @@ paraphrase or "correct" the quotes below.
 ### 13 — missiles are real and explode
 
 > Missiles should be real simulated and have physics and go and explode
+
+### 14 — free-form building system + recursive blueprints
+
+> Free form building system - place shapes and objects like weapons, turrens, guns, thrusters, armor, structure blocks. Then inside structure blocks you can place command centers and radars and sensors. Armor and structure should have many different shapes and be customizable. Rectangle of variable height and width, triangle of variable height and width and angles etc. Lots of different objects for structure and then upgrades whcih are also placable inside structures. Objeccts and items are hot reloadable. Storage tank and container are also object types of all different kinds of shapes. First make the dynamic shape system which block types of variable shapes can reuse.  Recursive blueprint system, blueprints can have blueprints which can have blueprints. And bluepritnts can define settings and customization and be dynamic and we resolve blueprints during runtime.
