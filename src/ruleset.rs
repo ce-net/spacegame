@@ -263,10 +263,12 @@ fn default_energy_regen() -> f32 {
 impl Default for Tunables {
     fn default() -> Self {
         Tunables {
-            max_speed: 7.0,
-            thrust: 0.55,
-            damping: 0.94,
-            turn_rate: 0.16,
+            // Movement defaults are the canonical constants in `sim` so the authoritative server and the
+            // client's local prediction read ONE source of truth (fast, momentum-carrying flight).
+            max_speed: crate::sim::MAX_SPEED,
+            thrust: crate::sim::THRUST,
+            damping: crate::sim::DAMPING,
+            turn_rate: crate::sim::TURN_RATE,
             thruster_step: 0.16,
             base_hp: 100,
             respawn_ticks: 64,
