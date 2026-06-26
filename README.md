@@ -30,7 +30,9 @@ spacegame shard   --sector 1_0                 # which node rendezvous-hash assi
 spacegame nearest --sector 1_0                 # nearest live host of this sector (client view)
 ```
 
-See [`SCALING.md`](SCALING.md) for how this design holds **1,000,000+ concurrent players**.
+See [`SCALING.md`](SCALING.md) for how this design holds **1,000,000+ concurrent players**, and
+[`SYSTEMS.md`](SYSTEMS.md) for the LOD rigid-body physics, nested/dynamic AABBs, the always-alive
+faction metagame, and the proximity-replica fault-tolerance system.
 
 ### Combat, content and the infinite map
 
@@ -57,8 +59,16 @@ src/
   sim.rs          pure authoritative simulation of ONE sector: ships, physics, weapons (blaster /
                   homing missile / railgun / laser), mining, tech tree, kills, respawns, ship<->ship
                   collision, and cross-sector transit. Deterministic: same inputs -> same state.
-  aabb.rs         recursive AABB tree (loose quadtree): the broad-phase for collision, hitscan, homing
-                  target-acquire and viewport interest queries. Keeps the tick near-linear at scale.
+  aabb.rs         recursive AABB trees: a per-tick loose quadtree (broad-phase for collision, hitscan,
+                  homing, viewport interest) PLUS a dynamic fat-AABB BVH that follows moving objects and
+                  nests (Compound: recursive AABBs holding recursive AABBs) for compound bodies.
+  physics.rs      advanced 2D rigid-body engine (mass, inertia, restitution, friction, angular impulse)
+                  with level-of-detail precision: high framerate near players, coarse far away. GPU/SoA-
+                  friendly so replicas stay bit-identical across CPU and GPU.
+  faction.rs      your always-alive faction: factories, swarm, resources, tech, and an autonomous build
+                  policy that spends your resources for you every tick, online or not.
+  replication.rs  proximity-replica fault tolerance: K high-precision replicas on nearby players' nodes,
+                  heartbeat failure detection, deterministic takeover, re-replicate to the next best.
   ruleset.rs      the hot-reloadable game definition as DATA: weapon catalogue, tech tree, physics
                   tunables, and an opaque shader/asset blob. Versioned; swapped live with no restart.
   shard.rs        SectorId + rendezvous-hash sharding + latency-first host scoring + interest set.
