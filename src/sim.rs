@@ -1142,7 +1142,23 @@ impl Sim {
                 (s.role, s.owner.clone().unwrap_or_default(), s.x, s.y)
             };
             let cmd = self.factions.get(&owner).map(|f| f.command).unwrap_or_default();
-            let (tx, ty, want_fire) = self.npc_goal(role, &owner, x, y, cmd, &tree);
+            let (tx, ty, want_fire) = self.npc_goal(&id, role, &owner, x, y, cmd, &tree);
+            // ANTI-RAM: never steer an escort INTO its owner. If a unit ends up closer to its commanding
+            // player than the standoff radius, push its goal radially outward so the fleet screens you
+            // instead of piling on and crashing. (Engaging an enemy overrides this — that's real combat.)
+            let (mut tx, mut ty) = (tx, ty);
+            if want_fire == false
+                && let Some(ow) = self.ships.get(&owner)
+                && owner != id
+            {
+                let (ox, oy) = (ow.x, ow.y);
+                let od = ((x - ox).powi(2) + (y - oy).powi(2)).sqrt();
+                if od < 200.0 {
+                    let ang = (y - oy).atan2(x - ox);
+                    tx = ox + 240.0 * ang.cos();
+                    ty = oy + 240.0 * ang.sin();
+                }
+            }
             if let Some(s) = self.ships.get_mut(&id) {
                 let dx = tx - x;
                 let dy = ty - y;
@@ -1154,7 +1170,9 @@ impl Sim {
                     d = d.clamp(-tun.turn_rate, tun.turn_rate);
                     s.a = (s.a + d).rem_euclid(std::f32::consts::TAU);
                 }
-                s.want_thrust = dist > 45.0;
+                // Hold position at the formation slot (no thrust within a deadband) so units settle into a
+                // ring around you and stop jostling, instead of perpetually accelerating toward a point.
+                s.want_thrust = dist > 70.0;
                 s.want_turn = 0;
                 s.want_fire = want_fire;
                 s.last_input_tick = now; // server-owned: never idle-expire
@@ -1167,6 +1185,7 @@ impl Sim {
     /// haulers escort. The "owner" anchor is the commanding player's own ship if present.
     fn npc_goal(
         &self,
+        id: &str,
         role: ShipRole,
         owner: &str,
         x: f32,
@@ -1179,6 +1198,10 @@ impl Sim {
             .get(owner)
             .map(|s| (s.x, s.y))
             .unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+        // A stable slot on a ring around the owner: each unit holds a distinct angle (hashed from its id)
+        // and the whole screen drifts slowly, so the fleet forms a defensive ring AROUND you rather than
+        // converging on your exact position and crashing into you.
+        let escort = self.escort_slot(id, anchor);
         match role {
             ShipRole::Fighter => {
                 let engage_r = match cmd {
@@ -1199,7 +1222,7 @@ impl Sim {
                 match cmd {
                     FactionCommand::Hold => (x, y, false),
                     FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
-                    _ => (anchor.0, anchor.1, false), // escort the owner
+                    _ => (escort.0, escort.1, false), // screen the owner from a ring slot
                 }
             }
             ShipRole::Drone => match cmd {
@@ -1208,17 +1231,31 @@ impl Sim {
                     if let Some((rx, ry)) = self.nearest_live_rock(x, y, 1400.0) {
                         (rx, ry, false)
                     } else {
-                        (anchor.0, anchor.1, false)
+                        (escort.0, escort.1, false)
                     }
                 }
             },
             ShipRole::Hauler => match cmd {
                 FactionCommand::Hold => (x, y, false),
                 FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
-                _ => (anchor.0, anchor.1, false),
+                _ => (escort.0, escort.1, false),
             },
             ShipRole::Player => (x, y, false),
         }
+    }
+
+    /// A stable ring slot around `anchor` for an escorting unit: the slot angle is a hash of the unit's
+    /// id (so units fan out into distinct slots, deterministically) plus a slow shared orbit so the
+    /// screen feels alive. The standoff radius keeps the fleet off the owner. Pure.
+    fn escort_slot(&self, id: &str, anchor: (f32, f32)) -> (f32, f32) {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in id.bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        let base = (h as f32 / u64::MAX as f32) * std::f32::consts::TAU;
+        let ang = base + self.tick as f32 * 0.0025; // slow shared orbit (radians/tick)
+        let r = 240.0; // standoff radius
+        (anchor.0 + r * ang.cos(), anchor.1 + r * ang.sin())
     }
 
     /// Nearest alive ship of a *different faction* than `owner` (an enemy) within `radius`.
