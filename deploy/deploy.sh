@@ -143,12 +143,23 @@ dns() {
   fi
 }
 
+# POST-DEPLOY SMOKE GATE — prove the LIVE browser data path (wasm boots + a joining player's ship comes
+# back over the public /ce bridge). This is the coverage the unit/integration suite and the local/VM e2e
+# can't give, and whose absence let browser-only regressions ship (see deploy/smoke.sh). It runs ON THE
+# RELAY because a laptop/sandbox may buffer the SSE stream and false-fail. A failure FAILS the deploy.
+smoke() {
+  echo "==> POST-DEPLOY SMOKE: assert the live browser path (boot + join -> ship over the bridge)"
+  rsync -az -e "$RSH" "$HERE"/deploy/smoke.sh "$RELAY:/opt/ce-build/spacegame-run/smoke.sh"
+  "${SSH[@]}" "$RELAY" "bash /opt/ce-build/spacegame-run/smoke.sh https://$APP.ce-net.com"
+}
+
 case "${1:-all}" in
   backend)  backend ;;
   frontend) frontend ;;
   dns)      dns ;;
   nginx)    nginxblock ;;
-  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; nginxblock ;;
-  *) echo "usage: deploy.sh [all|backend|frontend|dns|nginx]"; exit 1 ;;
+  smoke)    smoke ;;
+  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; nginxblock; smoke ;;
+  *) echo "usage: deploy.sh [all|backend|frontend|dns|nginx|smoke]"; exit 1 ;;
 esac
 echo "==> done"
