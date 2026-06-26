@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::aabb::{Aabb, AabbTree};
+use crate::faction::Faction;
+use crate::physics::{self, RigidBody, Shape, Vec2};
 use crate::ruleset::{Ruleset, RulesetHandle, TechEffect, Tunables, WeaponKind};
 use crate::shard::SectorId;
 use crate::snapshot::ShipSnap;
@@ -330,6 +332,12 @@ pub struct Sim {
     pub beams: Vec<BeamEvent>,
     /// Ships that left this sector this tick, to be delivered to neighbours. Drained by the host.
     pub transit_out: Vec<Transit>,
+    /// Per-player **always-alive** factions, keyed by owner NodeId. Ticked every sim tick whether or
+    /// not the player's ship is present — your industrial swarm keeps building while you are away.
+    pub factions: std::collections::HashMap<String, Faction>,
+    /// Free-floating wreckage simulated with the LOD rigid-body engine: high precision near players,
+    /// coarse far away. Spawned on kills; demonstrates the advanced 2D physics at scale.
+    pub debris: physics::World,
 }
 
 impl Default for Sim {
@@ -345,6 +353,8 @@ impl Default for Sim {
             kill_feed: Vec::new(),
             beams: Vec::new(),
             transit_out: Vec::new(),
+            factions: std::collections::HashMap::new(),
+            debris: physics::World::new(),
         }
     }
 }

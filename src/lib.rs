@@ -37,7 +37,10 @@
 
 pub mod aabb;
 pub mod director;
+pub mod faction;
 pub mod leaderboard;
+pub mod physics;
+pub mod replication;
 pub mod room;
 pub mod ruleset;
 pub mod shard;

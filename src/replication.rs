@@ -1,0 +1,333 @@
+//! Proximity-replica fault tolerance — the system spacegame exists to harden: **critical real-time
+//! state survives a device vanishing at any instant**, because the devices of the players standing
+//! next to you already hold a high-precision replica of your shared corner of the world.
+//!
+//! In a compute mesh, any node can disappear without warning — a phone locks, a laptop sleeps, a home
+//! connection drops. For a region of space that several players are fighting over, losing the
+//! authoritative host must *not* lose the fight. So we keep a **replication constraint**: at least `k`
+//! high-precision replicas of a region exist at all times, and they are placed on the **nodes of the
+//! players who are physically close in-game** — they are already simulating that region at
+//! [`Lod::High`](crate::physics::Lod), so a replica is nearly free for them and instantly warm.
+//!
+//! When a replica drops:
+//! 1. failure is detected from missing heartbeats ([`ReplicaSet::expire`]);
+//! 2. if it was the **primary** (authoritative host), the best healthy backup is **promoted**
+//!    deterministically — every node computes the same winner, so there is no split brain;
+//! 3. the **high-precision map is copied to the next-best node** ([`ReplicationPlan::copy_to`]) to
+//!    restore the `k` constraint — typically the nearest remaining player's device, else a capable
+//!    mesh node.
+//!
+//! All of that is the *pure decision layer* here ([`ReplicaSet::plan`]): deterministic, unit-tested, no
+//! mesh. The actual heartbeat publish, snapshot copy and promotion handshake are thin `ce-rs` calls in
+//! [`crate::director`]. The replica payload itself is the content-addressed [`SectorSnapshot`] plus a
+//! live delta stream, so "copy the high-precision map to the next best node" is a CID fetch from the
+//! nearest holder — every node that has the snapshot is a CDN edge for it.
+//!
+//! ### Why this is also the GPU / cross-compatibility forcing function
+//!
+//! For a backup to *instantly* take over, its replica must evolve **bit-identically** to the primary.
+//! That forces the simulation to be deterministic across heterogeneous hardware — the same result
+//! whether a node runs the physics kernels on a CPU or a GPU. The physics state is laid out for that
+//! (see [`crate::physics`]): plain `Copy` arrays and fixed-iteration kernels that produce the same
+//! numbers on either backend. Fault tolerance and GPU cross-compatibility are the same requirement
+//! viewed from two sides: *every replica must agree, on any device.*
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// The replication constraint for a region: the total number of high-precision replicas (including the
+/// primary) that must exist. `k = 3` means one authoritative host + two hot standbys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationConstraint {
+    pub k: usize,
+}
+
+impl Default for ReplicationConstraint {
+    fn default() -> Self {
+        ReplicationConstraint { k: 3 }
+    }
+}
+
+/// A node that *could* hold a replica of the region — usually a nearby player's device, possibly a
+/// general mesh node. The fields are exactly what the placement decision needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicaCandidate {
+    pub node_id: String,
+    /// Measured round-trip latency from the primary, if known.
+    pub rtt_ms: Option<f64>,
+    /// How close this node's player is to the region **in game**. Smaller = closer; closer players
+    /// already simulate the region at high precision, so they are the cheapest, warmest replicas.
+    pub in_game_dist: f32,
+    /// Spare cores the node advertises (capacity headroom).
+    pub free_cores: u32,
+    /// Is the node currently reachable?
+    pub alive: bool,
+}
+
+impl ReplicaCandidate {
+    /// Suitability score — **higher is better**. In-game proximity dominates (a close player's device
+    /// is the ideal replica), then low latency, then spare capacity. A dead node scores nothing.
+    pub fn score(&self) -> f64 {
+        if !self.alive {
+            return f64::NEG_INFINITY;
+        }
+        let proximity = 1000.0 / (1.0 + self.in_game_dist as f64); // closer => much higher
+        let rtt = self.rtt_ms.unwrap_or(120.0).max(0.0);
+        let latency = 200.0 / (20.0 + rtt);
+        let capacity = 1.0 + (self.free_cores as f64).min(16.0) / 16.0;
+        proximity * 4.0 + latency + capacity
+    }
+}
+
+/// A member's role in the replica set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaRole {
+    /// The authoritative host that owns the live simulation.
+    Primary,
+    /// A hot standby holding a high-precision replica, ready to take over.
+    Backup,
+}
+
+/// One member of a region's replica set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaMember {
+    pub node_id: String,
+    pub role: ReplicaRole,
+    /// Last tick we heard a heartbeat from this member.
+    pub last_seen_tick: u64,
+    /// Health flag, updated by [`ReplicaSet::expire`].
+    pub healthy: bool,
+}
+
+/// The live replica set for one region.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaSet {
+    pub region: String,
+    pub constraint: ReplicationConstraint,
+    pub members: Vec<ReplicaMember>,
+}
+
+/// What to do this round to satisfy the constraint — computed deterministically by [`ReplicaSet::plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPlan {
+    /// A backup to promote to primary (the old primary is gone). `None` if the primary is healthy.
+    pub promote: Option<String>,
+    /// Nodes to copy the high-precision map to, restoring `k` healthy replicas (best candidates first).
+    pub copy_to: Vec<String>,
+    /// Dead members to retire from the set.
+    pub drop: Vec<String>,
+}
+
+impl ReplicaSet {
+    /// A new set with `primary` as the only (healthy) member.
+    pub fn new(region: &str, primary: &str, constraint: ReplicationConstraint, now: u64) -> Self {
+        ReplicaSet {
+            region: region.to_string(),
+            constraint,
+            members: vec![ReplicaMember {
+                node_id: primary.to_string(),
+                role: ReplicaRole::Primary,
+                last_seen_tick: now,
+                healthy: true,
+            }],
+        }
+    }
+
+    pub fn primary(&self) -> Option<&ReplicaMember> {
+        self.members.iter().find(|m| m.role == ReplicaRole::Primary)
+    }
+
+    pub fn healthy_count(&self) -> usize {
+        self.members.iter().filter(|m| m.healthy).count()
+    }
+
+    pub fn contains(&self, node: &str) -> bool {
+        self.members.iter().any(|m| m.node_id == node)
+    }
+
+    /// Record a heartbeat from a member (marks it seen + healthy). A heartbeat from a node not in the
+    /// set is ignored (it joins only via a [`ReplicationPlan::copy_to`] handshake).
+    pub fn observe(&mut self, node: &str, now: u64) {
+        if let Some(m) = self.members.iter_mut().find(|m| m.node_id == node) {
+            m.last_seen_tick = now;
+            m.healthy = true;
+        }
+    }
+
+    /// Add a member that has finished receiving the high-precision map (the other side of `copy_to`).
+    pub fn admit(&mut self, node: &str, now: u64) {
+        if !self.contains(node) {
+            self.members.push(ReplicaMember {
+                node_id: node.to_string(),
+                role: ReplicaRole::Backup,
+                last_seen_tick: now,
+                healthy: true,
+            });
+        }
+    }
+
+    /// Mark any member silent for longer than `timeout` ticks as unhealthy (failure detection).
+    pub fn expire(&mut self, now: u64, timeout: u64) {
+        for m in self.members.iter_mut() {
+            if now.saturating_sub(m.last_seen_tick) > timeout {
+                m.healthy = false;
+            }
+        }
+    }
+
+    /// Compute the deterministic recovery plan: who to promote, where to copy the map, what to drop.
+    /// Every node runs the same function over the same set + candidate view and gets the same answer,
+    /// so promotion has no split brain. `candidates` are potential new replica holders (nearby players'
+    /// nodes first). Call [`expire`](Self::expire) before this.
+    pub fn plan(&self, candidates: &[ReplicaCandidate]) -> ReplicationPlan {
+        let mut plan = ReplicationPlan { promote: None, copy_to: Vec::new(), drop: Vec::new() };
+
+        // Dead members are retired.
+        for m in &self.members {
+            if !m.healthy {
+                plan.drop.push(m.node_id.clone());
+            }
+        }
+
+        // Promote if the primary is gone: choose the best healthy backup deterministically (highest
+        // candidate score, then lexicographically smallest id as a stable tiebreak).
+        let primary_ok = self.primary().map(|p| p.healthy).unwrap_or(false);
+        if !primary_ok {
+            let cand_score: HashMap<&str, f64> =
+                candidates.iter().map(|c| (c.node_id.as_str(), c.score())).collect();
+            let best = self
+                .members
+                .iter()
+                .filter(|m| m.healthy && m.role == ReplicaRole::Backup)
+                .max_by(|a, b| {
+                    let sa = cand_score.get(a.node_id.as_str()).copied().unwrap_or(0.0);
+                    let sb = cand_score.get(b.node_id.as_str()).copied().unwrap_or(0.0);
+                    sa.total_cmp(&sb).then_with(|| b.node_id.cmp(&a.node_id))
+                });
+            plan.promote = best.map(|m| m.node_id.clone());
+        }
+
+        // Restore the constraint: count replicas that will be healthy after dropping the dead, then
+        // copy the map to the best fresh candidates until we reach k.
+        let surviving = self.healthy_count();
+        let need = self.constraint.k.saturating_sub(surviving);
+        if need > 0 {
+            let mut fresh: Vec<&ReplicaCandidate> = candidates
+                .iter()
+                .filter(|c| c.alive && !self.contains(&c.node_id))
+                .collect();
+            // Best first; stable by id on ties.
+            fresh.sort_by(|a, b| b.score().total_cmp(&a.score()).then_with(|| a.node_id.cmp(&b.node_id)));
+            plan.copy_to = fresh.into_iter().take(need).map(|c| c.node_id.clone()).collect();
+        }
+
+        plan
+    }
+
+    /// Apply a plan to the in-memory set (promotion + admit fresh backups + retire dead). The host
+    /// performs the side effects (snapshot copy, role handshake) via [`crate::director`]; this keeps
+    /// the local view consistent.
+    pub fn apply(&mut self, plan: &ReplicationPlan, now: u64) {
+        // Retire dead members.
+        self.members.retain(|m| !plan.drop.contains(&m.node_id));
+        // Promote.
+        if let Some(new_primary) = &plan.promote {
+            for m in self.members.iter_mut() {
+                m.role = if &m.node_id == new_primary { ReplicaRole::Primary } else { ReplicaRole::Backup };
+            }
+        }
+        // Admit fresh backups (they will heartbeat once the copy completes).
+        for node in &plan.copy_to {
+            self.admit(node, now);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(id: &str, dist: f32, rtt: f64, alive: bool) -> ReplicaCandidate {
+        ReplicaCandidate { node_id: id.into(), rtt_ms: Some(rtt), in_game_dist: dist, free_cores: 4, alive }
+    }
+
+    #[test]
+    fn closer_player_node_scores_higher() {
+        let near = cand("near", 100.0, 30.0, true);
+        let far = cand("far", 5000.0, 10.0, true);
+        assert!(near.score() > far.score(), "in-game proximity beats raw latency for replica placement");
+        let dead = cand("dead", 1.0, 1.0, false);
+        assert!(dead.score().is_infinite() && dead.score() < 0.0);
+    }
+
+    #[test]
+    fn plan_copies_to_restore_k_replicas() {
+        let now = 100;
+        let mut set = ReplicaSet::new("3_4", "host", ReplicationConstraint { k: 3 }, now);
+        // Only the primary exists -> need 2 more.
+        let candidates = vec![
+            cand("playerA", 200.0, 25.0, true),
+            cand("playerB", 400.0, 40.0, true),
+            cand("playerC", 9000.0, 15.0, true),
+        ];
+        let plan = set.plan(&candidates);
+        assert!(plan.promote.is_none(), "primary healthy, no promotion");
+        assert_eq!(plan.copy_to.len(), 2, "copy the map to two nearby nodes to reach k=3");
+        assert_eq!(plan.copy_to[0], "playerA", "nearest player's node first");
+        set.apply(&plan, now);
+        assert_eq!(set.members.len(), 3);
+    }
+
+    #[test]
+    fn primary_loss_promotes_a_backup_deterministically() {
+        let mut set = ReplicaSet::new("0_0", "host", ReplicationConstraint { k: 3 }, 0);
+        set.admit("backupA", 0);
+        set.admit("backupB", 0);
+        // Heartbeats from backups at t=10, but not the primary.
+        set.observe("backupA", 10);
+        set.observe("backupB", 10);
+        set.expire(20, 5); // primary last seen at 0 -> unhealthy
+        let candidates = vec![
+            cand("backupA", 150.0, 30.0, true), // closer => higher score => promoted
+            cand("backupB", 800.0, 10.0, true),
+        ];
+        let plan = set.plan(&candidates);
+        assert_eq!(plan.promote.as_deref(), Some("backupA"), "the best healthy backup takes over");
+        assert!(plan.drop.contains(&"host".to_string()), "the dead primary is retired");
+
+        // Re-running on another node with the same inputs yields the same decision (no split brain).
+        let plan2 = set.plan(&candidates);
+        assert_eq!(plan, plan2);
+    }
+
+    #[test]
+    fn re_replicates_to_next_best_after_a_drop() {
+        let mut set = ReplicaSet::new("1_1", "host", ReplicationConstraint { k: 3 }, 0);
+        set.admit("a", 0);
+        set.admit("b", 0);
+        // 'a' goes silent.
+        set.observe("host", 30);
+        set.observe("b", 30);
+        set.expire(40, 5);
+        let candidates = vec![
+            cand("host", 50.0, 5.0, true),
+            cand("b", 300.0, 20.0, true),
+            cand("c", 500.0, 25.0, true), // the next-best fresh node to copy the map to
+        ];
+        let plan = set.plan(&candidates);
+        assert!(plan.drop.contains(&"a".to_string()), "the dropped replica is retired");
+        assert_eq!(plan.copy_to, vec!["c".to_string()], "the high-precision map is copied to the next best node");
+    }
+
+    #[test]
+    fn healthy_set_needs_no_action() {
+        let mut set = ReplicaSet::new("2_2", "host", ReplicationConstraint { k: 2 }, 0);
+        set.admit("a", 0);
+        set.observe("host", 100);
+        set.observe("a", 100);
+        set.expire(101, 50);
+        let plan = set.plan(&[cand("host", 10.0, 5.0, true), cand("a", 20.0, 6.0, true)]);
+        assert!(plan.promote.is_none() && plan.copy_to.is_empty() && plan.drop.is_empty());
+    }
+}
