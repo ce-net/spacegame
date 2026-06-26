@@ -1,59 +1,58 @@
-# Deploying spacegame — a first-class ce-net app, not a demo
+# Deploying spacegame — served by ce-serve (the ONLY way to serve a ce-net app)
 
-Spacegame is deployed **exactly like any other system on ce-net** (ce-hub, ce-serve, drift): a
-server-class backend running as a systemd service on the relay, plus a browser client published to the
-hub under its own app id and served on its own domain. It is **not** a bundled page in
-`web/demos/` — that pipeline (`spa.ce-net.com/game`) is retired in favour of this.
+**Architectural rule (Leif's directive): ce-serve is the only supported way to serve a ce-net demo/app
+to the browser. The hub is the registry/tracker, NOT a web server.** Serving an app's files straight from
+the hub (`/apps/<id>/…`) is deprecated and was a mistake: a hub-served page gets **no mesh bridge**, so the
+browser has **no `window.__ceNode`**, no transport, and the game can't reach the mesh (you'd join and see
+no ship). ce-serve resolves Host → a content-addressed bundle, serves each file from the node blob store
+(wasm as `application/wasm`), and **auto-injects `/__ce/mesh-bridge.js`**, which gives every page
+`window.__ceNode` over one same-origin **WebSocket** (`/mesh-bridge`) — the transport the WASM client speaks.
 
 ```
-                          ┌─────────────────────────── relay (178.105.145.170) ───────────────────────────┐
-  browser / native  ──────┤  spacegame.ce-net.com  →  nginx *.ce-net.com  →  ce-hub :8970  (app "spacegame")│
-  (renders + predicts)    │                                                   serves index.html + pkg/*.wasm │
-        │ mesh            │                                                                                  │
-        └────────────────┤  ce-relay (`ce start`)  ←→  spacegame-host.service  (authoritative sim)          │
-                          │     :8844 mesh node            real Rust `spacegame` binary, pinned sectors      │
-                          └──────────────────────────────────────────────────────────────────────────────┘
+                       ┌──────────────────────────── relay (178.105.145.170) ────────────────────────────┐
+  browser  ────────────┤  spa.ce-net.com → nginx (*.ce-net.com regex) → ce-serve :8790                    │
+   (renders+predicts)  │     ce-serve resolves Host→bundle (ce-hub), serves blobs, injects the mesh bridge │
+        │  WebSocket    │     window.__ceNode  ⇄  /mesh-bridge (WS)  ⇄  ce node :8844  ⇄  the mesh         │
+        └───────────────┤  ce-relay (`ce start`)  ←→  spacegame-node.service (genesis host + controller +  │
+                        │     :8844 mesh node           gateway; the authoritative adaptive-galaxy sim)     │
+                        └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## The two halves
 
 | Half | What runs | Where | How |
 |---|---|---|---|
-| **Backend** | the real Rust `spacegame` binary hosting pinned sectors (authoritative sim, hot-reloadable ruleset) | `spacegame-host.service` on the relay, `/opt/ce-build/spacegame` | `deploy.sh backend` |
-| **Frontend** | the browser client (`spacegame-wasm`: Rust→WASM + wgpu) | hub app `spacegame` → `spacegame.ce-net.com` | `deploy.sh frontend` |
+| **Backend** | the adaptive-galaxy node (genesis host + leaderless controller + gateway) | `spacegame-node.service` on the relay, `/opt/ce-build/spacegame-run/` | `deploy.sh backend` |
+| **Frontend** | the browser client (`spacegame-wasm`: Rust→WASM + wgpu), published as a **content-addressed bundle** | ce-serve (`spa.ce-net.com`) | `deploy.sh frontend` |
 
-Both are built **natively on the relay** (the deploy target), never on the laptop — same dogfooding
-rule as `web/deploy/ce-build.sh`.
+Both build natively on the relay. The frontend is published with **`ce-serve-publish <dir> spa.ce-net.com spa`**:
+it blob-uploads each file to the node, builds the `{spa, files}` manifest, and registers `spa.ce-net.com →
+bundle` in ce-hub. ce-serve then serves it. No nginx edits, no per-file hub upload.
 
 ## Deploy
 
 ```bash
-ssh-add ~/.ssh/id_ed25519                 # the relay key must be in your agent
-bash deploy/deploy.sh                      # dns + backend + frontend
+ssh-add ~/.ssh/id_ed25519                 # a relay key in your agent
+bash deploy/deploy.sh                      # dns + backend + frontend(ce-serve) + unshadow + smoke
 # or piecemeal:
-bash deploy/deploy.sh backend              # (re)build + restart the authoritative host
-bash deploy/deploy.sh frontend             # (re)build the wasm client, publish to the hub
-bash deploy/deploy.sh dns                   # ensure spacegame.ce-net.com (needs CLOUDFLARE_API_TOKEN)
+bash deploy/deploy.sh backend              # (re)build + restart the adaptive-galaxy node service
+bash deploy/deploy.sh frontend             # (re)build the wasm, ce-serve-publish the bundle
+bash deploy/deploy.sh unshadow             # ensure no bespoke nginx block shadows the host (ce-serve owns it)
+bash deploy/deploy.sh smoke                # POST-DEPLOY GATE: live browser path (boot + bridge + join→ship)
 ```
 
-## Why a pinned authoritative host
+`deploy.sh` runs **`smoke.sh` as a blocking final gate** — it asserts, against the LIVE url, that the wasm
+boots (growable function table), that **ce-serve is serving with the mesh bridge injected**, and that a
+joining player's ship comes back over the bridge. A red gate fails the deploy. See `LIVE-STATUS.md`.
 
-Like drift, the world only advances if a **server-class** node runs the sim: the browser bundle ships
-only the renderer + local prediction (`default-features = false`, no mesh I/O), so a browser-elected
-host cannot be authoritative. `spacegame-host.service` pins the relay as the authoritative host for a
-plus-shaped block of sectors around the origin; every client renders and predicts against the state it
-publishes, and failover/replication (`replication.rs`) promotes another node if it drops. Grow the
-pinned region by editing the `--sector` flags in the unit, or place neighbours on other mesh nodes with
-`spacegame place` as more hosts join.
+## Why a server-class node
 
-## Hot reload in production
-
-The service runs `host --ruleset /opt/ce-build/spacegame/live.json`. Edit that file on the relay
-(weapons, tech tree, tunables, **shaders** — the whole `Ruleset`) and the watcher pushes it live to the
-entire galaxy with no restart and no dropped players; every client re-fetches and hot-applies it. Seed
-or reset it with `spacegame ruleset init live.json`.
+The world only advances if a server-class node runs the authoritative sim: the browser bundle ships only
+the renderer + local prediction (`default-features = false`, no mesh I/O). `spacegame-node.service` is the
+genesis host + controller + gateway; clients render/predict against the state it publishes. See
+`../GALAXY-SCALE.md`.
 
 ## Local play / dev
 
-For driving the game on your own machines over the real mesh (native window + browser, screenshots),
-see [`../SPACEGAME-PLAY.md`](../SPACEGAME-PLAY.md) and `../play.sh`.
+See [`../SPACEGAME-PLAY.md`](../SPACEGAME-PLAY.md) and `../play.sh` for driving the game on your own
+machines over the real mesh (native window + browser, screenshots).

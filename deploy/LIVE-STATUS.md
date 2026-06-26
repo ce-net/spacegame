@@ -57,5 +57,9 @@ bash deploy/deploy.sh                     # dns + backend + frontend
 Runtime artifacts install to `/opt/ce-build/spacegame-run/` (binary + `live.json`) — OUTSIDE the synced
 source tree, so a `frontend` re-sync can't clobber the running node. The node's API token is injected via
 a systemd drop-in (`/etc/systemd/system/spacegame-node.service.d/api-token.conf`), kept out of the repo.
-`spa.ce-net.com` is served by a dedicated nginx block (`/etc/nginx/sites-available/spa-serve`) that maps
-the host to the hub's per-file app store plus the `/ce` bridge.
+
+**Serving: ce-serve only.** `spa.ce-net.com` is served by **ce-serve** from a content-addressed bundle
+(`ce-serve-publish`), NOT the hub. ce-serve injects `/__ce/mesh-bridge.js`, so the page gets
+`window.__ceNode` over a WebSocket (`/mesh-bridge`) — the transport the client needs. The earlier custom
+nginx block that served straight from the hub was removed: a hub-served page has no mesh bridge, so the
+browser had no transport (you'd join and see no ship). The hub is the registry/tracker, not a web server.

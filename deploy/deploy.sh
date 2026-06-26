@@ -86,41 +86,34 @@ frontend() {
   "${SSH[@]}" "$RELAY" 'source $HOME/.cargo/env; cd '"$REMOTE"'/spacegame-wasm &&
     (command -v wasm-pack >/dev/null || cargo install wasm-pack) &&
     (RUSTFLAGS="-C link-arg=--growable-table" wasm-pack build --release --target web --out-dir pkg > /tmp/spacegame-wasm-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-wasm-build.log; exit $rc)'
-  echo "==> publish the client to the hub as app '"$APP"' (serves at https://$APP.ce-net.com/)"
-  # Upload index.html, the page's JS, and the built pkg/ to /apps/spacegame/ on the local hub, with the
-  # right content types (wasm MUST be application/wasm or the browser refuses to stream-compile it).
+  echo "==> publish the client as a CONTENT-ADDRESSED BUNDLE via ce-serve (the ONLY way to serve a ce-net app)"
+  # ce-serve is ce-net's single public HTTP edge: it resolves Host -> bundle, serves each file from the
+  # node blob store (wasm as application/wasm), and AUTO-INJECTS /__ce/mesh-bridge.js, which gives the page
+  # `window.__ceNode` over ONE same-origin WebSocket (/mesh-bridge) — the transport the WASM client speaks.
+  # The hub is the registry/tracker, NOT a web server. So we ce-serve-publish a clean bundle dir (which
+  # blob-uploads each file, builds the {spa,files} manifest, and registers the host->bundle in ce-hub).
   "${SSH[@]}" "$RELAY" '
     set -e; cd '"$REMOTE"'/spacegame-wasm
-    ctype() { case "$1" in
-      *.html) echo "text/html; charset=utf-8";; *.js|*.mjs) echo "text/javascript; charset=utf-8";;
-      *.css) echo "text/css; charset=utf-8";; *.json) echo "application/json";; *.wasm) echo "application/wasm";;
-      *.svg) echo "image/svg+xml";; *.png) echo "image/png";; *.ts) echo "text/plain; charset=utf-8";;
-      *) echo "application/octet-stream";; esac; }
-    # publish the shell files (page, external boot module, in-tab-peer scaffold, gateway directory) +
-    # everything under pkg/. The gateway directory serves at /galaxy/gateways.json (same-origin).
-    for rel in index.html boot.js galaxy-peer.js galaxy/gateways.json $(find pkg -type f | sed "s|^\./||"); do
-      [ -f "$rel" ] || continue
-      code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "'"$HUB"'/apps/'"$APP"'/$rel" \
-        -H "content-type: $(ctype "$rel")" --data-binary @"$rel")
-      echo "    $rel -> $code"
-    done
-    # Register the host -> app binding in the hub domain registry (used by host-routed serving).
-    curl -s -o /dev/null -w "    domain '"$APP"'.ce-net.com -> %{http_code}\n" -X PUT -H "content-type: application/json" \
-      --data "{\"domain\":\"'"$APP"'.ce-net.com\"}" "'"$HUB"'/apps/'"$APP"'/domain"'
-  echo "==> spacegame frontend live: https://$APP.ce-net.com/   and   https://ce-net.com/apps/$APP/"
+    STAGE=/opt/ce-build/spa-bundle
+    rm -rf "$STAGE" && mkdir -p "$STAGE/galaxy"
+    cp index.html boot.js galaxy-peer.js "$STAGE/"
+    cp galaxy/gateways.json "$STAGE/galaxy/"
+    cp -r pkg "$STAGE/pkg"
+    CE_API_TOKEN=$(cat /root/.local/share/ce/api.token) \
+      /opt/ce-serve/ce-serve-publish "$STAGE" '"$APP"'.ce-net.com '"$APP"
+  echo "==> spacegame frontend live via ce-serve: https://$APP.ce-net.com/"
 }
 
-# Install the dedicated nginx server block for spa.ce-net.com (exact server_name beats the *.ce-net.com
-# regex), substituting the relay's CE node API token into the /ce bridge. Idempotent; reloads nginx.
-nginxblock() {
-  echo "==> install spa.ce-net.com nginx block (per-file app store + /ce bridge)"
-  rsync -az -e "$RSH" "$HERE"/deploy/spa-serve.nginx "$RELAY:/etc/nginx/sites-available/spa-serve.tmpl"
+# Ensure NO bespoke nginx block shadows spa.ce-net.com. ce-serve must own it: the *.ce-net.com regex
+# server in the main `ce` site already proxies `/` and the `/mesh-bridge` WebSocket to ce-serve (:8790),
+# so once any old exact-name `spa-serve` block is gone, the host resolves to our published bundle and the
+# page gets the injected mesh bridge. (Earlier we wrongly served spacegame straight from the hub with a
+# custom block — that path has no mesh bridge, so the browser had no transport. ce-serve is the only way.)
+unshadow() {
+  echo "==> ensure ce-serve owns $APP.ce-net.com (remove any bespoke nginx block)"
   "${SSH[@]}" "$RELAY" '
-    tok=$(cat /root/.local/share/ce/api.token) &&
-    sed "s/__CE_API_TOKEN__/$tok/" /etc/nginx/sites-available/spa-serve.tmpl > /etc/nginx/sites-available/spa-serve &&
-    rm -f /etc/nginx/sites-available/spa-serve.tmpl &&
-    ln -sf /etc/nginx/sites-available/spa-serve /etc/nginx/sites-enabled/spa-serve &&
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "    nginx reloaded"'
+    rm -f /etc/nginx/sites-enabled/spa-serve /etc/nginx/sites-available/spa-serve /etc/nginx/sites-available/spa-serve.tmpl
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx && echo "    nginx reloaded (spa.ce-net.com -> ce-serve)"'
 }
 
 dns() {
@@ -157,9 +150,9 @@ case "${1:-all}" in
   backend)  backend ;;
   frontend) frontend ;;
   dns)      dns ;;
-  nginx)    nginxblock ;;
+  unshadow) unshadow ;;
   smoke)    smoke ;;
-  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; nginxblock; smoke ;;
-  *) echo "usage: deploy.sh [all|backend|frontend|dns|nginx|smoke]"; exit 1 ;;
+  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; unshadow; smoke ;;
+  *) echo "usage: deploy.sh [all|backend|frontend|dns|unshadow|smoke]"; exit 1 ;;
 esac
 echo "==> done"

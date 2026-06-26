@@ -49,11 +49,16 @@ sys.exit(1)
 PY
 echo "    ok: wasm table growable"
 
-echo "==> smoke 2/3: page + bridge reachable"
-code=$(curl -s -m 15 -o /dev/null -w "%{http_code}" "$BASE/"); [ "$code" = 200 ] || fail "page $BASE/ -> $code"
-sid=$(curl -s -m 15 "$BASE/ce/status" | grep -oE '"node_id":"[0-9a-f]+"' | head -1) || true
-[ -n "$sid" ] || fail "/ce/status (the mesh bridge) returned no node_id"
-echo "    ok: page 200, bridge node $sid"
+echo "==> smoke 2/3: served by ce-serve WITH the mesh bridge injected"
+page=$(curl -s -m 15 -A "Mozilla/5.0 (smoke)" "$BASE/")
+[ -n "$page" ] || fail "page $BASE/ empty"
+# ce-serve injects <script src="/__ce/mesh-bridge.js"> into every HTML page it serves. Its ABSENCE means
+# the page is NOT served by ce-serve (e.g. straight from the hub) -> the browser gets no window.__ceNode
+# -> no transport -> "player id local" -> no ship. This is the exact failure that shipped; assert it gone.
+echo "$page" | grep -q "/__ce/mesh-bridge.js" || fail "page is not served by ce-serve (no /__ce/mesh-bridge.js bridge injected -> the browser would have no mesh transport)"
+sid=$(curl -s -m 15 -A "Mozilla/5.0 (smoke)" "$BASE/ce/status" | grep -oE '"node_id":"[0-9a-f]+"' | head -1) || true
+[ -n "$sid" ] || fail "/ce/status returned no node_id"
+echo "    ok: ce-serve serving + mesh bridge injected; node $sid"
 
 echo "==> smoke 3/3: a joining player's ship is delivered over the live /ce SSE bridge"
 python3 - "$BASE" <<'PY' || fail "joining player's ship never arrived over the public /ce SSE bridge (the no-ship regression)"
