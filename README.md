@@ -81,6 +81,8 @@ src/
                   tunables, the buildable object/blueprint catalogue, and a shader/asset blob.
   shape.rs        the dynamic shape kernel every block type reuses: parametric rect/triangle/trapezoid/
                   disc/regular-polygon/polygon with area/centroid/inertia/AABB + physics conversion.
+  shapedef.rs     recursive SHAPE BLUEPRINTS (shapes composed of shapes) + a material palette; auto root
+                  AABB for collision/physics; GPU flatten to packed repr(C) vertex/index/material buffers.
   build.rs        free-form building: object catalog (structure/armor/weapon/turret/thruster/command/
                   radar/sensor/tank/container/upgrade) + placement + RECURSIVE blueprints (blueprints
                   in blueprints) with params, repeat, and runtime resolution to a concrete craft.

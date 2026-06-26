@@ -36,6 +36,7 @@ use crate::build::{
 };
 use crate::procgen::{GeneratedShip, ModuleDef, ShipGrammar, Slot, SlotRule};
 use crate::shape::{NamedShape, Shape2D};
+use crate::shapedef::{MaterialDef, ShapeBlueprint, ShapeKind, ShapeLibrary, ShapePart, Xform};
 
 /// How a weapon delivers damage. The authoritative simulation dispatches firing on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,9 +220,16 @@ pub struct Ruleset {
     pub weapons: Vec<WeaponDef>,
     /// The tech tree.
     pub tech: Vec<TechNode>,
-    /// Named, reusable shape library — shapes as first-class hot-reloadable entities.
+    /// Named, reusable primitive shape library — shapes as first-class hot-reloadable entities.
     #[serde(default)]
     pub shapes: Vec<NamedShape>,
+    /// Material palette (authoring form) — hot-reloadable; referenced by shape blueprints.
+    #[serde(default)]
+    pub materials: Vec<MaterialDef>,
+    /// Recursive **shape blueprints** (shapes composed of shapes) with materials — defined, saved and
+    /// edited live; flattened to a GPU mesh + root AABB on demand.
+    #[serde(default)]
+    pub shape_blueprints: Vec<ShapeBlueprint>,
     /// The buildable object/block catalogue (structure, armor, weapons, thrusters, command centres,
     /// radars, sensors, tanks, containers, upgrades…) — hot-reloadable like everything else.
     #[serde(default)]
@@ -466,6 +474,8 @@ impl Ruleset {
                 },
             ],
             shapes: builtin_shapes(),
+            materials: builtin_materials(),
+            shape_blueprints: builtin_shape_blueprints(),
             objects: builtin_objects(),
             blueprints: builtin_blueprints(),
             modules: builtin_modules(),
@@ -489,9 +499,25 @@ impl Ruleset {
         crate::build::resolve_blueprint(&self.catalog(), id, args)
     }
 
-    /// Look up a named shape from the hot-reloadable shape library.
+    /// Look up a named primitive shape from the hot-reloadable shape library.
     pub fn shape(&self, id: &str) -> Option<&Shape2D> {
         self.shapes.iter().find(|s| s.id == id).map(|s| &s.def)
+    }
+
+    /// A read-only view of the recursive shape-blueprint / primitive / material libraries.
+    pub fn shape_library(&self) -> ShapeLibrary<'_> {
+        ShapeLibrary { blueprints: &self.shape_blueprints, prims: &self.shapes, materials: &self.materials }
+    }
+
+    /// Flatten a recursive shape blueprint to a GPU-ready mesh (triangulated geometry, material
+    /// palette, root AABB) — the bridge from a defined shape to the graphics layer.
+    pub fn flatten_shape(&self, id: &str) -> Result<crate::shapedef::GpuMesh, String> {
+        crate::shapedef::flatten_gpu(&self.shape_library(), id)
+    }
+
+    /// Resolve a recursive shape blueprint into its world-placed primitives (for collision/physics).
+    pub fn resolve_shape(&self, id: &str) -> Result<Vec<crate::shapedef::FlatPrim>, String> {
+        crate::shapedef::resolve_shape(&self.shape_library(), id)
     }
 
     /// **Procedurally generate a ship** from a grammar id + seed: recursively attaches modules per the
@@ -585,8 +611,10 @@ impl Ruleset {
         crate::build::validate_catalog(&self.catalog())?;
         // Named shape library: each entry is sane geometry.
         for ns in &self.shapes {
-            ns.shape.validate().map_err(|e| format!("shape {}: {e}", ns.id))?;
+            ns.def.validate().map_err(|e| format!("shape {}: {e}", ns.id))?;
         }
+        // Recursive shape blueprints: references resolve, materials exist, no cycles.
+        crate::shapedef::validate_shape_library(&self.shape_library())?;
         // Procgen modules reference real blueprints; grammars reference a rootable module tag.
         for m in &self.modules {
             if self.blueprints.iter().all(|b| b.id != m.blueprint) {
@@ -790,6 +818,64 @@ fn builtin_shapes() -> Vec<NamedShape> {
     ]
 }
 
+/// A hot-reloadable material palette referenced by shape blueprints.
+fn builtin_materials() -> Vec<MaterialDef> {
+    let m = |id: &str, color: [f32; 4], emissive: [f32; 3], es: f32, metallic: f32, roughness: f32| MaterialDef {
+        id: id.into(),
+        color,
+        emissive,
+        emissive_strength: es,
+        metallic,
+        roughness,
+    };
+    vec![
+        m("hull-steel", [0.55, 0.58, 0.66, 1.0], [0.0; 3], 0.0, 0.9, 0.45),
+        m("armor-ceramic", [0.82, 0.80, 0.74, 1.0], [0.0; 3], 0.0, 0.1, 0.7),
+        m("canopy-glass", [0.3, 0.6, 0.9, 0.5], [0.05, 0.1, 0.2], 0.4, 0.2, 0.1),
+        m("engine-glow", [0.2, 0.7, 1.0, 1.0], [0.2, 0.8, 1.0], 4.0, 0.0, 0.3),
+        m("gold-trim", [1.0, 0.82, 0.35, 1.0], [0.1, 0.07, 0.0], 0.6, 1.0, 0.25),
+    ]
+}
+
+/// Built-in recursive shape blueprints: a detailed `hull-plate` (steel slab + a glowing strip + a gold
+/// rivet) and a `ship-skin` that recursively composes plates plus a glass canopy — shapes within shapes
+/// with materials, flattenable to a GPU mesh + root AABB.
+fn builtin_shape_blueprints() -> Vec<ShapeBlueprint> {
+    let plate = ShapeBlueprint {
+        id: "hull-plate".into(),
+        name: "Hull Plate".into(),
+        material: Some("hull-steel".into()),
+        root: vec![
+            ShapePart { at: Xform::default(), kind: ShapeKind::Prim { shape: Shape2D::Rect { w: 4.0, h: 1.2 } }, material: None },
+            ShapePart {
+                at: Xform::new(0.0, 0.0, 0.0, 1.0),
+                kind: ShapeKind::Prim { shape: Shape2D::Rect { w: 4.0, h: 0.18 } },
+                material: Some("engine-glow".into()),
+            },
+            ShapePart {
+                at: Xform::new(1.7, 0.4, 0.0, 1.0),
+                kind: ShapeKind::PrimRef { shape: "round".into() },
+                material: Some("gold-trim".into()),
+            },
+        ],
+    };
+    let skin = ShapeBlueprint {
+        id: "ship-skin".into(),
+        name: "Ship Skin".into(),
+        material: Some("armor-ceramic".into()),
+        root: vec![
+            ShapePart { at: Xform::new(0.0, 1.4, 0.0, 1.0), kind: ShapeKind::Ref { blueprint: "hull-plate".into() }, material: None },
+            ShapePart { at: Xform::new(0.0, -1.4, 0.0, 1.0), kind: ShapeKind::Ref { blueprint: "hull-plate".into() }, material: None },
+            ShapePart {
+                at: Xform::new(0.0, 0.0, 0.0, 1.0),
+                kind: ShapeKind::Prim { shape: Shape2D::Disc { r: 0.8 } },
+                material: Some("canopy-glass".into()),
+            },
+        ],
+    };
+    vec![plate, skin]
+}
+
 /// Procgen modules: each wraps a module blueprint with a role tag and the slots others dock to.
 fn builtin_modules() -> Vec<ModuleDef> {
     vec![
@@ -973,5 +1059,22 @@ mod tests {
         for s in &fleet {
             assert!(r.resolve_generated(s).is_ok());
         }
+    }
+
+    #[test]
+    fn builtin_shape_blueprints_resolve_and_flatten_to_gpu() {
+        let r = Ruleset::builtin();
+        assert!(r.validate().is_ok(), "builtin shape blueprints + materials validate");
+        // ship-skin -> 2× hull-plate (rect + strip + rivet = 3) + 1 canopy = 7 primitives.
+        let prims = r.resolve_shape("ship-skin").unwrap();
+        assert_eq!(prims.len(), 7, "recursive shape flattened to all primitives");
+        // It flattens to a GPU mesh with triangulated geometry, a material palette, and a root AABB.
+        let mesh = r.flatten_shape("ship-skin").unwrap();
+        assert!(!mesh.vertices.is_empty() && mesh.indices.len() % 3 == 0, "triangulated");
+        assert!(mesh.materials.len() >= 3, "material palette built (default + used)");
+        assert!(mesh.aabb[2] > mesh.aabb[0] && mesh.aabb[3] > mesh.aabb[1], "non-degenerate root AABB");
+        // And a pointer-free raw form for upload.
+        let raw = mesh.to_raw();
+        assert_eq!(raw.vertices.len(), mesh.vertices.len() * 5);
     }
 }

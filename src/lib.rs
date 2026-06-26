@@ -46,6 +46,7 @@ pub mod replication;
 pub mod room;
 pub mod ruleset;
 pub mod shape;
+pub mod shapedef;
 pub mod shard;
 pub mod sim;
 pub mod snapshot;
