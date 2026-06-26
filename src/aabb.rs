@@ -863,4 +863,61 @@ mod tests {
         // The broad phase may include 2 as a candidate; the caller's distance test rejects it. We only
         // assert it is never missing a true hit.
     }
+
+    #[test]
+    fn dynamic_tree_insert_query_and_followed_movement() {
+        let mut t: DynamicAabbTree<u32> = DynamicAabbTree::new(8.0);
+        let p = t.insert(Aabb::around(100.0, 100.0, 5.0), 1);
+        t.insert(Aabb::around(800.0, 800.0, 5.0), 2);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.query(&Aabb::around(100.0, 100.0, 6.0)), vec![1]);
+
+        // A tiny move stays inside the fat box -> no restructure (cheap follow).
+        assert!(!t.update(p, Aabb::around(102.0, 101.0, 5.0)), "small move is absorbed by the fat box");
+        // A big move leaves the fat box -> re-inserted, and the query follows it.
+        assert!(t.update(p, Aabb::around(400.0, 400.0, 5.0)), "big move re-inserts");
+        assert!(t.query(&Aabb::around(100.0, 100.0, 6.0)).is_empty(), "no longer at the old spot");
+        assert_eq!(t.query(&Aabb::around(400.0, 400.0, 6.0)), vec![1], "found at the new spot");
+    }
+
+    #[test]
+    fn dynamic_tree_stays_balanced_under_many_inserts() {
+        let mut t: DynamicAabbTree<u32> = DynamicAabbTree::new(2.0);
+        for i in 0..500u32 {
+            let x = (i.wrapping_mul(991) % 1000) as f32;
+            let y = (i.wrapping_mul(631) % 1000) as f32;
+            t.insert(Aabb::around(x, y, 2.0), i);
+        }
+        assert_eq!(t.len(), 500);
+        // A balanced tree over 500 leaves has height well under a degenerate ~500; expect ~log2.
+        assert!(t.height() < 40, "tree should stay balanced, height {}", t.height());
+    }
+
+    #[test]
+    fn dynamic_tree_remove_works() {
+        let mut t: DynamicAabbTree<u32> = DynamicAabbTree::new(4.0);
+        let a = t.insert(Aabb::around(10.0, 10.0, 2.0), 1);
+        t.insert(Aabb::around(20.0, 20.0, 2.0), 2);
+        t.remove(a);
+        assert_eq!(t.len(), 1);
+        assert!(t.query(&Aabb::around(10.0, 10.0, 3.0)).is_empty());
+        assert_eq!(t.query(&Aabb::around(20.0, 20.0, 3.0)), vec![2]);
+    }
+
+    #[test]
+    fn compound_is_a_recursive_aabb_holding_a_recursive_aabb() {
+        // A ship at (1000, 1000) rotated 90 degrees, made of two modules in local space.
+        let mut ship: Compound<&str> = Compound::new(Transform::from_pos_angle(1000.0, 1000.0, std::f32::consts::FRAC_PI_2));
+        ship.local.insert(Aabb::around(20.0, 0.0, 6.0), "nose");
+        ship.local.insert(Aabb::around(-20.0, 0.0, 6.0), "engine");
+        ship.local_bounds = Aabb::new(-30.0, -10.0, 30.0, 10.0);
+
+        // The world bound has followed the transform out to (1000,1000).
+        let wb = ship.world_bounds();
+        assert!(wb.contains_point(1000.0, 1000.0));
+
+        // The nose is at local +x = world +y after a 90-degree rotation, i.e. near (1000, 1020).
+        let hits = ship.query_world(&Aabb::around(1000.0, 1020.0, 8.0));
+        assert!(hits.contains(&"nose"), "deep query resolves into the nested tree to the struck module: {hits:?}");
+    }
 }
