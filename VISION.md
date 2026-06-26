@@ -76,3 +76,7 @@ paraphrase or "correct" the quotes below.
 ### 15 — everything hot-reloadable + recursive procedural ship generation
 
 > Shapes and blueprints and objects and items and weapons everything should be hot reloadable. Make a recursive procedural ship generation system which takes blueprints and a system which defines how blueprints can and should be placed and then makes a bunch of different ship designs with cool hapes and functions.
+
+### 16 — recursive shape blueprints, materials, GPU flattening
+
+> So shapes should also have their own shape blueprints and system for defining, saving and making new shapes. Also recursvive and shapes can be complicated with lots of shape details because its recursvie. shapes auto build aabb on root for collision and physics. Shapes will create the graphics eventually and each shape can have  materials. it needs to be easily sent to gpu with proper flatting and memory defining with aabb, material and all shapes.

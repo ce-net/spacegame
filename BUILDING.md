@@ -24,6 +24,25 @@ Every shape yields its **outline** (centred on its centre of mass, ready for ren
 collision, and can be **resized per placement** (`sized(w, h, r)`) or uniformly **scaled**. So one
 "armour plate" definition becomes a whole family of plates just by changing parameters — no new data.
 
+### Recursive shape blueprints + materials + GPU (`shapedef.rs`)
+
+Above the primitives sits a **recursive composite shape** system for *defining, saving and making new
+shapes*. A `ShapeBlueprint` is a tree of placed parts; each part is a primitive, a reference to a saved
+primitive, **or a reference to another shape blueprint** — so shapes nest shapes and can carry arbitrary
+detail (a hull plate of plates of rivets). Every part has a **material** from a hot-reloadable
+`MaterialDef` palette (colour, emissive, metallic, roughness), inherited down the tree and overridable
+per part.
+
+- **Auto root AABB**: `resolve_shape` flattens the recursion into world-placed primitives and
+  `root_aabb` unions them — the one box collision/physics broad-phase uses; the flattened primitives are
+  the narrow-phase.
+- **GPU-ready**: `flatten_gpu` triangulates the whole composite into a packed `#[repr(C)]` `GpuMesh`
+  (vertices = position + uv + material index, an index array, a std140-friendly material palette, and the
+  root AABB), with `to_raw()` giving pointer-free `Vec<f32>`/`Vec<u32>` for a direct upload — no
+  `unsafe`. Cycles and depth are guarded.
+
+Shape blueprints, primitives and materials all live in the ruleset, so all of it is hot-reloadable.
+
 ## 2. Objects & free-form placement (`build.rs`)
 
 An [`ObjectDef`] is a buildable thing: a [`ObjectCategory`], a reused `Shape2D`, `mass`/`hp`, and a flat
