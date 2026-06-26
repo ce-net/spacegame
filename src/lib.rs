@@ -142,6 +142,7 @@ pub async fn run_sector(
     let service = topics::service(&cfg.sector);
     let transit_topic = director::transit_topic(&cfg.sector);
     let ruleset_topic = director::ruleset_topic();
+    let replica_topic = director::replica_topic(&cfg.sector);
     let sector_id = shard::SectorId::parse(&cfg.sector).unwrap_or(shard::SectorId::new(0, 0));
 
     ce.subscribe(&in_topic).await?;
@@ -153,6 +154,16 @@ pub async fn run_sector(
     if let Err(e) = ce.subscribe(&ruleset_topic).await {
         tracing::debug!(error = %e, "ruleset subscribe failed (continuing)");
     }
+    // FAULT TOLERANCE: heartbeat with the region's other replica holders.
+    if let Err(e) = ce.subscribe(&replica_topic).await {
+        tracing::debug!(error = %e, "replica subscribe failed (continuing)");
+    }
+    // The local view of who holds a high-precision replica of this region, for K-replica takeover.
+    let mut replicas =
+        replication::ReplicaSet::new(&cfg.sector, &host_id, replication::ReplicationConstraint::default(), 0);
+    // How often (ticks) to heartbeat + run the replication-constraint maintenance.
+    let replica_every: u64 = 40;
+    let replica_timeout: u64 = 120;
     if let Err(e) = ce.advertise_service(&service).await {
         tracing::warn!(error = %e, "initial advertise_service failed (continuing)");
     }
@@ -301,6 +312,42 @@ pub async fn run_sector(
                             }
                         });
                     }
+
+                    // FAULT TOLERANCE: heartbeat, detect dropped replicas, and keep K high-precision
+                    // replicas alive on the nodes of nearby players. The decision is deterministic
+                    // (replication::ReplicaSet::plan) so every holder agrees on takeover.
+                    if sim.tick.is_multiple_of(replica_every) {
+                        // Heartbeat that we hold this region.
+                        {
+                            let ce2 = ce.clone();
+                            let region = cfg.sector.clone();
+                            let me = host_id.clone();
+                            let t = sim.tick;
+                            tokio::spawn(async move {
+                                let _ = director::publish_heartbeat(&ce2, &region, &me, t).await;
+                            });
+                        }
+                        replicas.observe(&host_id, sim.tick);
+                        replicas.expire(sim.tick, replica_timeout);
+                        let candidates = director::gather_replica_candidates(ce).await.unwrap_or_default();
+                        let plan = replicas.plan(&candidates);
+                        if plan.promote.is_some() || !plan.copy_to.is_empty() || !plan.drop.is_empty() {
+                            if let Some(p) = &plan.promote {
+                                tracing::info!(region = %cfg.sector, new_primary = %p, "replica takeover: promoting new primary");
+                            }
+                            if !plan.copy_to.is_empty() {
+                                tracing::info!(region = %cfg.sector, targets = ?plan.copy_to, "replicating high-precision map to restore K replicas");
+                                // Ensure a fresh snapshot exists for the new replicas to adopt.
+                                let ce2 = ce.clone();
+                                let sector2 = cfg.sector.clone();
+                                let sim2 = sim.clone();
+                                tokio::spawn(async move {
+                                    let _ = director::replicate_snapshot(&ce2, &sector2, &sim2).await;
+                                });
+                            }
+                            replicas.apply(&plan, sim.tick);
+                        }
+                    }
                 }
 
                 // Inbound mesh messages: player inputs, neighbour transits, and live ruleset updates.
@@ -321,6 +368,15 @@ pub async fn run_sector(
                                 Ok(t) if t.to == sector_id => sim.accept_transit(t.ship),
                                 Ok(_) => {}
                                 Err(e) => tracing::debug!(error = %e, "undecodable transit"),
+                            }
+                        } else if m.topic == replica_topic {
+                            // FAULT TOLERANCE: another node holds a replica of this region. Track it so
+                            // a drop is detected and the set can fail over.
+                            if let Ok(hb) = serde_json::from_slice::<director::Heartbeat>(&payload)
+                                && hb.node != host_id
+                            {
+                                replicas.admit(&hb.node, sim.tick);
+                                replicas.observe(&hb.node, sim.tick);
                             }
                         } else if m.topic == ruleset_topic {
                             // HOT RELOAD: a newer ruleset was published — fetch and apply it live.
