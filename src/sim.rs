@@ -324,6 +324,20 @@ pub struct Bullet {
     /// Homing steer rate, radians/tick. `0.0` = a straight projectile.
     #[serde(default)]
     pub homing: f32,
+    /// If `> 0`, this round is a **missile**: on impact, expiry, or leaving the sector it detonates,
+    /// dealing area-of-effect damage within this radius (with distance falloff) and emitting an
+    /// [`Explosion`]. `0.0` = an ordinary bullet that deals point damage and vanishes.
+    #[serde(default)]
+    pub explode_radius: f32,
+}
+
+/// A one-tick explosion (a missile detonation) for the renderer to flash and shake.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Explosion {
+    pub x: f32,
+    pub y: f32,
+    pub r: f32,
+    pub hue: u32,
 }
 
 /// A one-tick beam a hitscan weapon emits, for the renderer to draw (railgun shot, laser sweep).
@@ -1129,18 +1143,29 @@ impl Sim {
                     });
                 }
             }
-            WeaponKind::Railgun => {
-                let (hit, end) = self.hitscan(id, wx, wy, wa, def.range, tree);
-                self.beams.push(BeamEvent { owner: id.to_string(), x0: wx, y0: wy, x1: end.0, y1: end.1, hue, kind: 0 });
-                if let Some(victim) = hit {
-                    self.apply_damage(&victim, def.damage, id, now);
-                }
-            }
-            WeaponKind::Laser => {
-                let (hit, end) = self.hitscan(id, wx, wy, wa, def.range, tree);
-                self.beams.push(BeamEvent { owner: id.to_string(), x0: wx, y0: wy, x1: end.0, y1: end.1, hue, kind: 1 });
-                if let Some(victim) = hit {
-                    self.apply_damage(&victim, def.damage, id, now);
+            WeaponKind::Railgun | WeaponKind::Laser => {
+                // Hitscan weapons honour `count`/`spread`, so a weapon can fire a fan of beams: a
+                // scatter laser, a twin-lance railgun, etc. Each ray emits its own beam and hits the
+                // first ship it crosses.
+                let beam_kind: u8 = if def.kind == WeaponKind::Railgun { 0 } else { 1 };
+                let count = def.count.max(1);
+                let spread = def.spread;
+                for g in 0..count {
+                    let off = if count > 1 { (g as f32 - (count as f32 - 1.0) / 2.0) * spread } else { 0.0 };
+                    let a = wa + off;
+                    let (hit, end) = self.hitscan(id, wx, wy, a, def.range, tree);
+                    self.beams.push(BeamEvent {
+                        owner: id.to_string(),
+                        x0: wx,
+                        y0: wy,
+                        x1: end.0,
+                        y1: end.1,
+                        hue,
+                        kind: beam_kind,
+                    });
+                    if let Some(victim) = hit {
+                        self.apply_damage(&victim, def.damage, id, now);
+                    }
                 }
             }
         }
