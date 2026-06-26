@@ -22,7 +22,7 @@ use ce_rs::{Amount, BidSpec, CeClient, Receipt};
 use std::collections::HashMap;
 
 use crate::leaderboard::{Commitment, Leaderboard};
-use crate::replication::ReplicaCandidate;
+use crate::replication::{ReplicaCandidate, StateProof};
 use crate::ruleset::Ruleset;
 use crate::shard::{best_host, nearest_host, shard_for, HostCandidate, SectorId};
 use crate::sim::{Sim, Transit};
@@ -412,6 +412,22 @@ pub async fn publish_heartbeat(ce: &CeClient, region: &str, node: &str, tick: u6
     let hb = Heartbeat { region: region.to_string(), node: node.to_string(), tick };
     let bytes = serde_json::to_vec(&hb).context("encode heartbeat")?;
     ce.publish(&replica_topic(region), &bytes).await.context("publish heartbeat")?;
+    Ok(())
+}
+
+/// The pubsub topic on which replicas publish their per-checkpoint [`StateProof`] (the deterministic
+/// state hash), so the set can detect a host that cheated or desynced by comparing hashes.
+pub fn proof_topic(region: &str) -> String {
+    format!("{}/proof", topics::service(region))
+}
+
+/// Publish this replica's state hash for `tick` — its claim about the authoritative world. Honest
+/// replicas of the same sector publish the same hash; a cheater's differs and is outvoted
+/// ([`crate::replication::agree`]).
+pub async fn publish_state_proof(ce: &CeClient, region: &str, node: &str, tick: u64, hash: u64) -> Result<()> {
+    let p = StateProof { region: region.to_string(), node: node.to_string(), tick, hash };
+    let bytes = serde_json::to_vec(&p).context("encode state proof")?;
+    ce.publish(&proof_topic(region), &bytes).await.context("publish state proof")?;
     Ok(())
 }
 

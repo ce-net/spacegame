@@ -96,6 +96,33 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Compare the replicas' state proofs collected for one checkpoint `tick` and log the verdict — the
+/// anti-cheat agreement step. `votes` maps node id -> state hash. If a strict majority agrees and this
+/// node's hash differs, this node has diverged (a bug, a desync, or — if it were the cheat — itself)
+/// and should resync; if another node is the lone dissenter, it is the suspect. Pure logging here; the
+/// existing replica machinery handles the actual takeover/resync.
+fn judge_proofs(host_id: &str, region: &str, tick: u64, votes: &std::collections::HashMap<String, u64>) {
+    if votes.len() < 2 {
+        return; // need at least two replicas to cross-check
+    }
+    let proofs: Vec<replication::StateProof> = votes
+        .iter()
+        .map(|(node, &hash)| replication::StateProof { region: region.to_string(), node: node.clone(), tick, hash })
+        .collect();
+    let a = replication::agree(&proofs);
+    if !a.has_quorum {
+        tracing::warn!(region, tick, replicas = votes.len(), "no replica quorum on state hash (split) — cannot accept a result this checkpoint");
+        return;
+    }
+    if a.dissent.is_empty() {
+        tracing::debug!(region, tick, replicas = a.agree.len(), "all replicas agree on the world hash (verified)");
+    } else if a.dissent.iter().any(|d| d == host_id) {
+        tracing::warn!(region, tick, "THIS node diverged from the replica quorum — resyncing from the agreed snapshot");
+    } else {
+        tracing::warn!(region, tick, suspects = ?a.dissent, "replica(s) disagree with the quorum — faulty or cheating, will be re-synced/excluded");
+    }
+}
+
 /// Where to re-admit a transiting ship into *this* sector when its destination neighbour has no live
 /// host (solo / not-yet-autoscaled world): place it just inside the edge it tried to leave, so it
 /// bounces back into play instead of vanishing. `t.ship.x/y` are in the neighbour's local frame; we
@@ -158,6 +185,16 @@ pub async fn run_sector(
     if let Err(e) = ce.subscribe(&replica_topic).await {
         tracing::debug!(error = %e, "replica subscribe failed (continuing)");
     }
+    // ANTI-CHEAT: exchange deterministic state-hash proofs with the other replicas.
+    let proof_topic = director::proof_topic(&cfg.sector);
+    if let Err(e) = ce.subscribe(&proof_topic).await {
+        tracing::debug!(error = %e, "proof subscribe failed (continuing)");
+    }
+    // Collected proofs per checkpoint tick: tick -> (node -> state hash).
+    let mut proofs: std::collections::HashMap<u64, std::collections::HashMap<String, u64>> =
+        std::collections::HashMap::new();
+    // How often (ticks) every replica hashes the SAME checkpoint and publishes a proof.
+    let proof_every: u64 = 100;
     // The local view of who holds a high-precision replica of this region, for K-replica takeover.
     let mut replicas =
         replication::ReplicaSet::new(&cfg.sector, &host_id, replication::ReplicationConstraint::default(), 0);
@@ -348,6 +385,27 @@ pub async fn run_sector(
                             replicas.apply(&plan, sim.tick);
                         }
                     }
+
+                    // ANTI-CHEAT: at each checkpoint, publish our deterministic state hash and judge
+                    // it against the other replicas' — honest replicas agree; a cheat is outvoted.
+                    if sim.tick.is_multiple_of(proof_every) {
+                        let hash = sim.state_hash();
+                        let t = sim.tick;
+                        proofs.entry(t).or_default().insert(host_id.clone(), hash);
+                        {
+                            let ce2 = ce.clone();
+                            let region = cfg.sector.clone();
+                            let me = host_id.clone();
+                            tokio::spawn(async move {
+                                let _ = director::publish_state_proof(&ce2, &region, &me, t, hash).await;
+                            });
+                        }
+                        if let Some(v) = proofs.get(&t) {
+                            judge_proofs(&host_id, &cfg.sector, t, v);
+                        }
+                        // Bound the buffer: keep only recent checkpoints.
+                        proofs.retain(|&k, _| t.saturating_sub(k) <= proof_every * 4);
+                    }
                 }
 
                 // Inbound mesh messages: player inputs, neighbour transits, and live ruleset updates.
@@ -377,6 +435,16 @@ pub async fn run_sector(
                             {
                                 replicas.admit(&hb.node, sim.tick);
                                 replicas.observe(&hb.node, sim.tick);
+                            }
+                        } else if m.topic == proof_topic {
+                            // ANTI-CHEAT: another replica's state-hash claim for a checkpoint.
+                            if let Ok(p) = serde_json::from_slice::<replication::StateProof>(&payload)
+                                && p.node != host_id
+                            {
+                                proofs.entry(p.tick).or_default().insert(p.node, p.hash);
+                                if let Some(v) = proofs.get(&p.tick) {
+                                    judge_proofs(&host_id, &cfg.sector, p.tick, v);
+                                }
                             }
                         } else if m.topic == ruleset_topic {
                             // HOT RELOAD: a newer ruleset was published — fetch and apply it live.

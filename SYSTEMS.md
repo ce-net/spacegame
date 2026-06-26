@@ -103,6 +103,33 @@ Failure detection, promotion and re-replication are the pure, unit-tested decisi
 (`ReplicaSet::plan`); the heartbeat publish, candidate gathering and snapshot copy are thin `ce-rs`
 calls in `director.rs`, driven from the host loop in `lib.rs`.
 
+## 5. Local-first, replicated authority — zero delay + anti-cheat (`sim::state_hash`, `replication::agree`)
+
+Two properties fall out of the deterministic simulation, and they are what the user asked for:
+
+**Zero delay locally.** Because [`Sim`](src/sim.rs) is a pure, deterministic function of its inputs, the
+**same code runs on your own node** for the patch of space around you. Your inputs apply *instantly* to
+your local copy — there is no round-trip to a server before your ship turns — while the authoritative
+snapshots stream in to confirm and, if needed, gently correct. The local node predicts; the mesh
+confirms. (The wire and the sim are already shared, so the in-browser WASM node runs the identical
+logic — see the e2e mobile leg.)
+
+**No one can cheat — agreement by replication.** The region is simulated by **several replicas at once**
+(§4), not one server. Every replica periodically hashes its authoritative state with
+[`Sim::state_hash`] — a deterministic digest (floats quantised, order-independent fields XOR-folded) —
+and publishes a [`StateProof`] on the region's proof topic. [`replication::agree`] compares them: the
+hash a **strict majority** computed is the accepted truth, and any replica that computed a different
+hash diverged — a bug, a desync, or a host that fudged the rules (teleported a ship, faked a kill,
+minted minerals). A cheater changes the hash, so it is the odd one out and gets outvoted; honest nodes
+agree for free because they ran the same deterministic code. A 1-vs-1 split is reported as *no quorum*
+rather than a false accusation, so one liar cannot frame one honest node. The host loop publishes and
+judges these proofs every checkpoint and logs/acts on dissent; the same replica machinery (§4) then
+re-syncs or excludes the divergent node.
+
+This is the same determinism the GPU/fault-tolerance story needs, used for a third purpose:
+**redundancy, anti-cheat, and instant local feel are all the deterministic-replica property seen from
+different angles.**
+
 ### Why this is also the GPU / cross-compatibility forcing function
 
 For a backup to take over **instantly**, its replica must have been evolving **bit-identically** to the

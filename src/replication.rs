@@ -244,6 +244,69 @@ impl ReplicaSet {
     }
 }
 
+// ----------------------------------------------------------------------------------------------
+// ANTI-CHEAT / REDUNDANCY: replicas simulate the same sector and must AGREE on its state hash.
+// ----------------------------------------------------------------------------------------------
+
+/// One replica's claim about the authoritative state at a given tick — the deterministic
+/// [`state_hash`](crate::sim::Sim::state_hash) it computed. Replicas publish these; comparing them is
+/// how the mesh tells an honest simulation from a host that cheated (teleported a ship, faked a kill,
+/// minted resources). A cheat changes the hash, so the cheater is the odd one out.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StateProof {
+    pub region: String,
+    pub node: String,
+    pub tick: u64,
+    pub hash: u64,
+}
+
+/// The outcome of comparing replicas' [`StateProof`]s for one tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agreement {
+    /// The hash the majority of replicas computed (the accepted truth), if a majority exists.
+    pub quorum_hash: Option<u64>,
+    /// Nodes whose hash matched the quorum.
+    pub agree: Vec<String>,
+    /// Nodes whose hash disagreed with the quorum — faulty or cheating, to be re-synced or excluded.
+    pub dissent: Vec<String>,
+    /// True if a strict majority of replicas agreed (the result can be trusted).
+    pub has_quorum: bool,
+}
+
+/// Compare the replicas' state proofs for a single tick and decide the agreed truth. The most common
+/// hash wins (ties broken by the lowest hash value, deterministically); every replica that computed a
+/// different hash is a **dissenter** — a host that is faulty or cheating. `has_quorum` is true only if
+/// the winning hash has a strict majority, so a single honest node can never be overruled by one liar
+/// and a 1-vs-1 split is reported as no-quorum rather than a false accusation.
+pub fn agree(proofs: &[StateProof]) -> Agreement {
+    use std::collections::BTreeMap;
+    if proofs.is_empty() {
+        return Agreement { quorum_hash: None, agree: vec![], dissent: vec![], has_quorum: false };
+    }
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    for p in proofs {
+        *counts.entry(p.hash).or_insert(0) += 1;
+    }
+    // Winner: highest count, then lowest hash (BTreeMap iterates hashes ascending, so this is stable).
+    let (winner, top) = counts.iter().fold((0u64, 0usize), |(bh, bc), (&hash, &c)| {
+        if c > bc { (hash, c) } else { (bh, bc) }
+    });
+    let total = proofs.len();
+    let has_quorum = top * 2 > total;
+    let mut agree_nodes = Vec::new();
+    let mut dissent_nodes = Vec::new();
+    for p in proofs {
+        if p.hash == winner {
+            agree_nodes.push(p.node.clone());
+        } else {
+            dissent_nodes.push(p.node.clone());
+        }
+    }
+    agree_nodes.sort();
+    dissent_nodes.sort();
+    Agreement { quorum_hash: Some(winner), agree: agree_nodes, dissent: dissent_nodes, has_quorum }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +392,42 @@ mod tests {
         set.expire(101, 50);
         let plan = set.plan(&[cand("host", 10.0, 5.0, true), cand("a", 20.0, 6.0, true)]);
         assert!(plan.promote.is_none() && plan.copy_to.is_empty() && plan.drop.is_empty());
+    }
+
+    fn proof(node: &str, hash: u64) -> StateProof {
+        StateProof { region: "0_0".into(), node: node.into(), tick: 42, hash }
+    }
+
+    #[test]
+    fn honest_majority_outvotes_a_cheater() {
+        // Three replicas agree on hash 7; one cheater reports 9. The quorum is 7 and the cheater is
+        // the sole dissenter.
+        let a = agree(&[proof("a", 7), proof("b", 7), proof("c", 7), proof("cheat", 9)]);
+        assert_eq!(a.quorum_hash, Some(7));
+        assert!(a.has_quorum);
+        assert_eq!(a.agree, vec!["a", "b", "c"]);
+        assert_eq!(a.dissent, vec!["cheat"]);
+    }
+
+    #[test]
+    fn a_one_to_one_split_is_no_quorum_not_a_false_accusation() {
+        // Two replicas, two different hashes: we must NOT pick a "cheater" — there is no majority, so
+        // a single liar cannot frame a single honest node.
+        let a = agree(&[proof("a", 1), proof("b", 2)]);
+        assert!(!a.has_quorum, "a 1-1 split has no quorum");
+    }
+
+    #[test]
+    fn unanimous_agreement_has_no_dissent() {
+        let a = agree(&[proof("a", 5), proof("b", 5)]);
+        assert!(a.has_quorum);
+        assert!(a.dissent.is_empty());
+        assert_eq!(a.quorum_hash, Some(5));
+    }
+
+    #[test]
+    fn empty_proofs_is_inconclusive() {
+        let a = agree(&[]);
+        assert!(!a.has_quorum && a.quorum_hash.is_none());
     }
 }

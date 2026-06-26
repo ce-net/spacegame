@@ -56,3 +56,15 @@ paraphrase or "correct" the quotes below.
 ### 10 — factions are NPC ships you command
 
 > Yeah we need to keep track of factions. Factions are actual npc ships under your command.
+
+### 11 — more weapons
+
+> Add weapons like homing missile launchers and different laser weapon types.
+
+### 12 — local-first, replicated authority (anti-cheat + redundancy)
+
+> Since local state is computed on my local node on ce-net there should be zero delay for whats going on around me and my node should auto sync backend with other nodes - multiple replicas simulating the same thing so that no one can cheat and for redundancy.
+
+### 13 — missiles are real and explode
+
+> Missiles should be real simulated and have physics and go and explode

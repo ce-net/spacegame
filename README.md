@@ -37,8 +37,11 @@ faction metagame, and the proximity-replica fault-tolerance system.
 ### Combat, content and the infinite map
 
 - **Weapons are data** in a hot-reloadable [ruleset](src/ruleset.rs): the **blaster** (ballistic),
-  **homing missile** (steers to the nearest enemy), **railgun** (instant hitscan ray) and **laser**
-  (continuous beam). Add or re-balance weapons by editing the ruleset — no redeploy.
+  **homing missiles** that fly and **explode** with area damage (single seeker, multi-tube **missile
+  pod**, **heavy seeker**), **railguns** (instant hitscan ray) and several **laser types** — continuous
+  **beam**, gated **pulse**, fan-firing **scatter**, and long-range **beam lance**. Hitscan weapons
+  honour count/spread, so new fan/multi-shot variants are pure ruleset data. Add or re-balance weapons
+  by editing the ruleset — no redeploy.
 - **Tech tree** unlocks weapons and upgrades (hull / thrusters / guns), server-priced and gated.
 - **Infinite map:** a ship that crosses a sector edge is *handed off* to the neighbouring sector
   (cross-sector transit), carrying its full loadout — one continuous galaxy, not walled arenas.
@@ -105,6 +108,7 @@ async mesh I/O.
 | **Hot reload** — change the game while it runs | `ruleset.rs` holds weapons/tech/tunables/shaders as versioned data; `director::publish_ruleset` `ce.put_object()`s it and `ce.publish`es `{cid, version}`; hosts `Sim::apply_ruleset` between ticks and clients re-fetch. `spacegame ruleset push` / `host --ruleset live.json` (file-watch). | Edit a weapon stat or a shader and save; within ~1s every running host re-tunes and every client hot-applies it — no restart, no dropped session. |
 | **Scale (latency under load)** — recursive AABB | `aabb.rs` is a recursively subdivided AABB tree; `sim` queries it for bullet/hitscan/homing/ship collision and `room::build_snapshot_view` queries it for per-client viewport scoping. | A sector with thousands of entities still ticks inside its budget, and a client receives only what is on screen — bandwidth and CPU stay bounded as the galaxy fills. See `SCALING.md`. |
 | **Infinite map** — seamless sectors | `Sim::take_transits` emits a `Transit` when a ship crosses a sector edge; `director::publish_transit` delivers it to the neighbour's host, which `accept_transit`s it; `director::prewarm_neighbors` autoscales hosts ahead of demand. | Fly across a sector boundary and keep going — your ship, loadout and minerals appear in the neighbouring region (often on a different node), one continuous galaxy. |
+| **Local-first + anti-cheat** — agreement by replication | The deterministic `Sim` runs locally for zero-delay feel; several replicas simulate the same sector and publish `Sim::state_hash` proofs; `replication::agree` takes the majority hash as truth and flags any divergent (cheating/faulty) replica. | Your ship reacts with no server round-trip; a host that fudges the rules produces a different state hash and is outvoted by the honest replicas — and the world survives any of them dropping. |
 
 ---
 
