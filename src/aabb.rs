@@ -296,6 +296,455 @@ impl<T: Clone> AabbTree<T> {
     }
 }
 
+/// Grow a box by the larger of an absolute and a relative margin — used to give a dynamic-tree leaf a
+/// "fat" AABB so a moving object can travel a little without forcing a re-insert.
+impl Aabb {
+    /// The combined box that tightly contains both `self` and `o`.
+    pub fn union(&self, o: &Aabb) -> Aabb {
+        Aabb {
+            min_x: self.min_x.min(o.min_x),
+            min_y: self.min_y.min(o.min_y),
+            max_x: self.max_x.max(o.max_x),
+            max_y: self.max_y.max(o.max_y),
+        }
+    }
+
+    /// Perimeter (2D "surface area") — the cost metric the dynamic tree minimises when choosing where
+    /// to insert, so the tree stays cheap to query as objects move.
+    pub fn perimeter(&self) -> f32 {
+        2.0 * ((self.max_x - self.min_x) + (self.max_y - self.min_y))
+    }
+
+    /// True if `self` fully contains `o`.
+    pub fn contains(&self, o: &Aabb) -> bool {
+        self.min_x <= o.min_x && self.min_y <= o.min_y && self.max_x >= o.max_x && self.max_y >= o.max_y
+    }
+}
+
+/// A 2D rigid transform (rotation + translation) that places a nested body's local space into its
+/// parent's space. Used so a **recursive AABB can hold other recursive AABBs**: a compound object (a
+/// ship made of modules, an asteroid cluster, a planet with stations) carries its own local
+/// [`DynamicAabbTree`], and this transform maps it into the world tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    pub tx: f32,
+    pub ty: f32,
+    pub cos: f32,
+    pub sin: f32,
+}
+
+impl Transform {
+    pub fn identity() -> Self {
+        Transform { tx: 0.0, ty: 0.0, cos: 1.0, sin: 0.0 }
+    }
+
+    /// A transform from a position and heading (radians).
+    pub fn from_pos_angle(x: f32, y: f32, a: f32) -> Self {
+        Transform { tx: x, ty: y, cos: a.cos(), sin: a.sin() }
+    }
+
+    /// Map a local point into parent space.
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (self.cos * x - self.sin * y + self.tx, self.sin * x + self.cos * y + self.ty)
+    }
+
+    /// Map a parent-space point back into local space (inverse of [`apply`](Self::apply)).
+    pub fn inverse_apply(&self, x: f32, y: f32) -> (f32, f32) {
+        let dx = x - self.tx;
+        let dy = y - self.ty;
+        (self.cos * dx + self.sin * dy, -self.sin * dx + self.cos * dy)
+    }
+
+    /// Map a local AABB into parent space (axis-aligned bound of the rotated box — conservative).
+    pub fn apply_aabb(&self, b: &Aabb) -> Aabb {
+        let corners = [
+            self.apply(b.min_x, b.min_y),
+            self.apply(b.max_x, b.min_y),
+            self.apply(b.min_x, b.max_y),
+            self.apply(b.max_x, b.max_y),
+        ];
+        let mut out = Aabb { min_x: corners[0].0, min_y: corners[0].1, max_x: corners[0].0, max_y: corners[0].1 };
+        for (x, y) in corners.into_iter().skip(1) {
+            out.min_x = out.min_x.min(x);
+            out.min_y = out.min_y.min(y);
+            out.max_x = out.max_x.max(x);
+            out.max_y = out.max_y.max(y);
+        }
+        out
+    }
+}
+
+/// A stable handle to a leaf in a [`DynamicAabbTree`], returned by `insert` and used by `update` /
+/// `remove`. (An index into the node arena; reused after removal via the free list.)
+pub type Proxy = usize;
+
+const DYN_NIL: usize = usize::MAX;
+
+#[derive(Debug, Clone)]
+struct DynNode<T> {
+    /// The fat box stored in the tree (the leaf's tight box grown by a margin).
+    aabb: Aabb,
+    parent: usize,
+    child1: usize,
+    child2: usize,
+    /// Leaf height is 0; internal nodes are 1 + max(child heights); a free-list slot is -1.
+    height: i32,
+    /// `Some` for a leaf, `None` for an internal node.
+    payload: Option<T>,
+}
+
+/// A **dynamic** bounding-volume hierarchy (Box2D-style) whose leaves are *fattened* so a moving
+/// object only re-inserts when it leaves its fat box. This is the broad-phase that **follows objects
+/// around** — players, ships, debris, asteroids, planets — frame to frame at low cost, instead of the
+/// per-tick full rebuild a static [`AabbTree`] does. Insertion picks the sibling that least grows the
+/// tree (surface-area heuristic) and balances with tree rotations, so queries stay logarithmic as the
+/// world churns.
+///
+/// Leaves can carry any payload `T`; pairing it with a nested [`DynamicAabbTree`] via a [`Transform`]
+/// gives **recursive AABBs that hold recursive AABBs** (compound bodies) — see [`Compound`].
+#[derive(Debug, Clone)]
+pub struct DynamicAabbTree<T> {
+    nodes: Vec<DynNode<T>>,
+    root: usize,
+    free: usize,
+    count: usize,
+    /// Margin added on every side of an inserted box (movement slack).
+    pub fat_margin: f32,
+}
+
+impl<T: Clone> Default for DynamicAabbTree<T> {
+    fn default() -> Self {
+        Self::new(8.0)
+    }
+}
+
+impl<T: Clone> DynamicAabbTree<T> {
+    pub fn new(fat_margin: f32) -> Self {
+        DynamicAabbTree { nodes: Vec::new(), root: DYN_NIL, free: DYN_NIL, count: 0, fat_margin }
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn alloc(&mut self, aabb: Aabb, payload: Option<T>) -> usize {
+        if self.free != DYN_NIL {
+            let id = self.free;
+            self.free = self.nodes[id].child1;
+            let n = &mut self.nodes[id];
+            n.aabb = aabb;
+            n.parent = DYN_NIL;
+            n.child1 = DYN_NIL;
+            n.child2 = DYN_NIL;
+            n.height = 0;
+            n.payload = payload;
+            id
+        } else {
+            self.nodes.push(DynNode {
+                aabb,
+                parent: DYN_NIL,
+                child1: DYN_NIL,
+                child2: DYN_NIL,
+                height: 0,
+                payload,
+            });
+            self.nodes.len() - 1
+        }
+    }
+
+    fn freenode(&mut self, id: usize) {
+        self.nodes[id].child1 = self.free;
+        self.nodes[id].height = -1;
+        self.nodes[id].payload = None;
+        self.free = id;
+    }
+
+    fn fatten(&self, tight: Aabb) -> Aabb {
+        tight.expanded(self.fat_margin)
+    }
+
+    /// Insert a leaf with tight box `tight` and `payload`; returns a stable [`Proxy`].
+    pub fn insert(&mut self, tight: Aabb, payload: T) -> Proxy {
+        let fat = self.fatten(tight);
+        let leaf = self.alloc(fat, Some(payload));
+        self.insert_leaf(leaf);
+        self.count += 1;
+        leaf
+    }
+
+    /// Update a leaf to a new tight box. If the object is still inside its fat box this is a no-op
+    /// (the whole point — cheap movement); otherwise the leaf is re-inserted with a fresh fat box.
+    /// Returns true if the tree was restructured.
+    pub fn update(&mut self, proxy: Proxy, tight: Aabb) -> bool {
+        if self.nodes[proxy].aabb.contains(&tight) {
+            return false;
+        }
+        self.remove_leaf(proxy);
+        self.nodes[proxy].aabb = self.fatten(tight);
+        self.insert_leaf(proxy);
+        true
+    }
+
+    /// Remove a leaf.
+    pub fn remove(&mut self, proxy: Proxy) {
+        self.remove_leaf(proxy);
+        self.freenode(proxy);
+        self.count = self.count.saturating_sub(1);
+    }
+
+    /// Every payload whose fat box overlaps `q`, in arbitrary (tree) order.
+    pub fn query(&self, q: &Aabb) -> Vec<T> {
+        let mut out = Vec::new();
+        if self.root == DYN_NIL {
+            return out;
+        }
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            let n = &self.nodes[id];
+            if !n.aabb.intersects(q) {
+                continue;
+            }
+            if n.payload.is_some() {
+                out.push(n.payload.clone().unwrap());
+            } else {
+                if n.child1 != DYN_NIL {
+                    stack.push(n.child1);
+                }
+                if n.child2 != DYN_NIL {
+                    stack.push(n.child2);
+                }
+            }
+        }
+        out
+    }
+
+    /// The fat box currently stored for a proxy (for debugging / nested transforms).
+    pub fn proxy_aabb(&self, proxy: Proxy) -> Aabb {
+        self.nodes[proxy].aabb
+    }
+
+    /// Tree height (0 for a single leaf, grows ~log n) — a balance/health metric for tests.
+    pub fn height(&self) -> i32 {
+        if self.root == DYN_NIL { 0 } else { self.nodes[self.root].height }
+    }
+
+    // ---- internal: Box2D-style insert with SAH sibling choice + rotation balancing ----
+
+    fn insert_leaf(&mut self, leaf: usize) {
+        if self.root == DYN_NIL {
+            self.root = leaf;
+            self.nodes[leaf].parent = DYN_NIL;
+            return;
+        }
+        let leaf_aabb = self.nodes[leaf].aabb;
+        // 1) Find the best sibling: descend toward the child that minimises the surface-area cost.
+        let mut index = self.root;
+        while self.nodes[index].payload.is_none() {
+            let c1 = self.nodes[index].child1;
+            let c2 = self.nodes[index].child2;
+            let area = self.nodes[index].aabb.perimeter();
+            let combined = self.nodes[index].aabb.union(&leaf_aabb).perimeter();
+            let cost = 2.0 * combined;
+            let inherit = 2.0 * (combined - area);
+            let cost1 = self.descend_cost(c1, &leaf_aabb) + inherit;
+            let cost2 = self.descend_cost(c2, &leaf_aabb) + inherit;
+            if cost < cost1 && cost < cost2 {
+                break;
+            }
+            index = if cost1 < cost2 { c1 } else { c2 };
+        }
+        let sibling = index;
+
+        // 2) Create a new parent for sibling + leaf.
+        let old_parent = self.nodes[sibling].parent;
+        let new_parent = self.alloc(self.nodes[sibling].aabb.union(&leaf_aabb), None);
+        self.nodes[new_parent].parent = old_parent;
+        self.nodes[new_parent].child1 = sibling;
+        self.nodes[new_parent].child2 = leaf;
+        self.nodes[new_parent].height = self.nodes[sibling].height + 1;
+        self.nodes[sibling].parent = new_parent;
+        self.nodes[leaf].parent = new_parent;
+        if old_parent != DYN_NIL {
+            if self.nodes[old_parent].child1 == sibling {
+                self.nodes[old_parent].child1 = new_parent;
+            } else {
+                self.nodes[old_parent].child2 = new_parent;
+            }
+        } else {
+            self.root = new_parent;
+        }
+
+        // 3) Walk back up, refit boxes and balance.
+        let mut i = self.nodes[leaf].parent;
+        while i != DYN_NIL {
+            i = self.balance(i);
+            let c1 = self.nodes[i].child1;
+            let c2 = self.nodes[i].child2;
+            self.nodes[i].height = 1 + self.nodes[c1].height.max(self.nodes[c2].height);
+            self.nodes[i].aabb = self.nodes[c1].aabb.union(&self.nodes[c2].aabb);
+            i = self.nodes[i].parent;
+        }
+    }
+
+    fn descend_cost(&self, child: usize, leaf_aabb: &Aabb) -> f32 {
+        let combined = self.nodes[child].aabb.union(leaf_aabb).perimeter();
+        if self.nodes[child].payload.is_some() {
+            combined
+        } else {
+            combined - self.nodes[child].aabb.perimeter()
+        }
+    }
+
+    fn remove_leaf(&mut self, leaf: usize) {
+        if leaf == self.root {
+            self.root = DYN_NIL;
+            return;
+        }
+        let parent = self.nodes[leaf].parent;
+        let grand = self.nodes[parent].parent;
+        let sibling = if self.nodes[parent].child1 == leaf {
+            self.nodes[parent].child2
+        } else {
+            self.nodes[parent].child1
+        };
+        if grand != DYN_NIL {
+            if self.nodes[grand].child1 == parent {
+                self.nodes[grand].child1 = sibling;
+            } else {
+                self.nodes[grand].child2 = sibling;
+            }
+            self.nodes[sibling].parent = grand;
+            self.freenode(parent);
+            let mut i = grand;
+            while i != DYN_NIL {
+                i = self.balance(i);
+                let c1 = self.nodes[i].child1;
+                let c2 = self.nodes[i].child2;
+                self.nodes[i].aabb = self.nodes[c1].aabb.union(&self.nodes[c2].aabb);
+                self.nodes[i].height = 1 + self.nodes[c1].height.max(self.nodes[c2].height);
+                i = self.nodes[i].parent;
+            }
+        } else {
+            self.root = sibling;
+            self.nodes[sibling].parent = DYN_NIL;
+            self.freenode(parent);
+        }
+    }
+
+    /// AVL-style rotation to keep the tree balanced (height difference of children <= 1).
+    fn balance(&mut self, a: usize) -> usize {
+        if self.nodes[a].payload.is_some() || self.nodes[a].height < 2 {
+            return a;
+        }
+        let b = self.nodes[a].child1;
+        let c = self.nodes[a].child2;
+        let balance = self.nodes[c].height - self.nodes[b].height;
+        if balance > 1 {
+            self.rotate(a, c, b, true)
+        } else if balance < -1 {
+            self.rotate(a, b, c, false)
+        } else {
+            a
+        }
+    }
+
+    /// Promote `pivot` above `a`, re-parenting the lighter grandchild under `a`. `pivot_is_child2`
+    /// tells which side `pivot` was on. Returns the new subtree root.
+    fn rotate(&mut self, a: usize, pivot: usize, other: usize, pivot_is_child2: bool) -> usize {
+        let f = self.nodes[pivot].child1;
+        let g = self.nodes[pivot].child2;
+        // Swap a and pivot.
+        self.nodes[pivot].child1 = a;
+        self.nodes[pivot].parent = self.nodes[a].parent;
+        self.nodes[a].parent = pivot;
+        // pivot's old parent should now point to pivot.
+        let pp = self.nodes[pivot].parent;
+        if pp != DYN_NIL {
+            if self.nodes[pp].child1 == a {
+                self.nodes[pp].child1 = pivot;
+            } else {
+                self.nodes[pp].child2 = pivot;
+            }
+        } else {
+            self.root = pivot;
+        }
+        // Pick the taller grandchild to keep under pivot; the shorter goes back under a.
+        let (keep, give) = if self.nodes[f].height > self.nodes[g].height { (f, g) } else { (g, f) };
+        self.nodes[pivot].child2 = keep;
+        if pivot_is_child2 {
+            self.nodes[a].child2 = give;
+        } else {
+            self.nodes[a].child1 = give;
+        }
+        self.nodes[give].parent = a;
+        // Refit a then pivot.
+        self.nodes[a].aabb = self.nodes[other].aabb.union(&self.nodes[give].aabb);
+        self.nodes[pivot].aabb = self.nodes[a].aabb.union(&self.nodes[keep].aabb);
+        self.nodes[a].height = 1 + self.nodes[other].height.max(self.nodes[give].height);
+        self.nodes[pivot].height = 1 + self.nodes[a].height.max(self.nodes[keep].height);
+        pivot
+    }
+}
+
+/// A **compound body** — a nested recursive AABB. It is an object that has internal structure (a ship
+/// of modules, an asteroid cluster, a planet with orbiting stations) carried as its *own*
+/// [`DynamicAabbTree`] in local space, plus a [`Transform`] placing it in the world. The world tree
+/// stores compounds as single fat leaves; a deep query descends into the compound's local tree, so a
+/// railgun ray or a collision check can resolve right down to the struck module. This is what lets the
+/// recursive AABBs literally hold other recursive AABBs and follow the parent object as it moves and
+/// rotates.
+#[derive(Debug, Clone)]
+pub struct Compound<T> {
+    pub transform: Transform,
+    pub local: DynamicAabbTree<T>,
+    /// The compound's bound in its own local space (refreshed as parts move); the world leaf box is
+    /// `transform.apply_aabb(local_bounds)`.
+    pub local_bounds: Aabb,
+}
+
+impl<T: Clone> Compound<T> {
+    pub fn new(transform: Transform) -> Self {
+        Compound { transform, local: DynamicAabbTree::new(4.0), local_bounds: Aabb::new(0.0, 0.0, 0.0, 0.0) }
+    }
+
+    /// The world-space fat box of the whole compound (what the parent world tree indexes).
+    pub fn world_bounds(&self) -> Aabb {
+        self.transform.apply_aabb(&self.local_bounds)
+    }
+
+    /// Deep query: parts of this compound whose local box overlaps the world-space query `q`. The
+    /// query is mapped into local space first, so the descent into the nested tree is exact.
+    pub fn query_world(&self, q: &Aabb) -> Vec<T> {
+        // Map the query corners into local space and take their bound (conservative for rotation).
+        let local_q = self.transform.apply_aabb_inverse(q);
+        self.local.query(&local_q)
+    }
+}
+
+impl Transform {
+    /// Map a parent-space AABB back into local space (conservative axis-aligned bound).
+    pub fn apply_aabb_inverse(&self, b: &Aabb) -> Aabb {
+        let corners = [
+            self.inverse_apply(b.min_x, b.min_y),
+            self.inverse_apply(b.max_x, b.min_y),
+            self.inverse_apply(b.min_x, b.max_y),
+            self.inverse_apply(b.max_x, b.max_y),
+        ];
+        let mut out = Aabb { min_x: corners[0].0, min_y: corners[0].1, max_x: corners[0].0, max_y: corners[0].1 };
+        for (x, y) in corners.into_iter().skip(1) {
+            out.min_x = out.min_x.min(x);
+            out.min_y = out.min_y.min(y);
+            out.max_x = out.max_x.max(x);
+            out.max_y = out.max_y.max(y);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
