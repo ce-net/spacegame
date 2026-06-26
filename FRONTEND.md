@@ -6,6 +6,23 @@ there may be a million players online. The backend (`src/`) already provides eve
 this is the contract the client builds on. The small shared tuning lives in
 [`src/client.rs`](src/client.rs); the connection/scale story is here.
 
+## HARD RULE: native and the browser must ALWAYS look the same
+
+Leif's directive: *"native and wasm must look the same."* They do today, and they must stay that way —
+**there is exactly one source of truth for the look: `spacegame_render::build_scene(&Game, w, h)`**, the
+shared `Scene` (geometry, colours, effects). Both frontends render that same Scene:
+
+- **native** (`spacegame-native`): `build_scene` → `spacegame_render::raster::rasterize` → CPU
+  framebuffer (minifb). No GPU.
+- **browser** (`spacegame-wasm`): `build_scene` → `spacegame_render::tessellate` → wgpu/WebGL2 (GPU).
+
+So a visual change is made **once** in `spacegame-render` and both inherit it. **Never** put
+platform-specific visual logic in `spacegame-wasm/src/render.rs` or `spacegame-native/src/main.rs` — those
+are thin shims (surface, input, presentation), not a place for game looks. The only legitimate
+per-platform difference is the rasterizer *backend* (CPU vs GPU), and both MUST render the shared Scene
+faithfully; if they ever drift, the fix is to make the rasterizer match the Scene, not to fork the
+visuals. (The view-model + smoothing also live in `spacegame_render::Game`, so gameplay-feel is shared.)
+
 The thesis in one line: **the client talks only to a CE node over the mesh, predicts locally for zero
 delay, subscribes to a tiny slice of the world, and never needs to know which machine is hosting it.**
 
