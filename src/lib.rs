@@ -93,6 +93,29 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Where to re-admit a transiting ship into *this* sector when its destination neighbour has no live
+/// host (solo / not-yet-autoscaled world): place it just inside the edge it tried to leave, so it
+/// bounces back into play instead of vanishing. `t.ship.x/y` are in the neighbour's local frame; we
+/// flip them back to this sector's boundary based on the crossing direction.
+fn readmit_coords(here: shard::SectorId, t: &sim::Transit) -> (f32, f32) {
+    use sim::{SECTOR_SIZE, SHIP_R};
+    let dsx = t.to.sx - here.sx;
+    let dsy = t.to.sy - here.sy;
+    let mut x = t.ship.x.clamp(0.0, SECTOR_SIZE);
+    let mut y = t.ship.y.clamp(0.0, SECTOR_SIZE);
+    if dsx == 1 {
+        x = SECTOR_SIZE - SHIP_R - 1.0;
+    } else if dsx == -1 {
+        x = SHIP_R + 1.0;
+    }
+    if dsy == 1 {
+        y = SECTOR_SIZE - SHIP_R - 1.0;
+    } else if dsy == -1 {
+        y = SHIP_R + 1.0;
+    }
+    (x, y)
+}
+
 /// Host one sector until `shutdown` resolves.
 ///
 /// The real authoritative loop:
@@ -255,21 +278,62 @@ pub async fn run_sector(
                             }
                         });
                     }
+
+                    // AUTOSCALE: a busy sector pre-warms its neighbours so the seamless map keeps
+                    // spreading load across the mesh instead of crowding one cell.
+                    if cfg.prewarm_every > 0
+                        && sim.tick.is_multiple_of(cfg.prewarm_every)
+                        && sim.player_count() >= director::PREWARM_THRESHOLD
+                    {
+                        let ce2 = ce.clone();
+                        let sector2 = cfg.sector.clone();
+                        let image2 = cfg.image.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = director::prewarm_neighbors(
+                                &ce2, &sector2, &image2, 3600, ce_rs::Amount::from_credits(100), None,
+                            )
+                            .await
+                            {
+                                tracing::debug!(error = %e, "autoscale pre-warm failed (transient)");
+                            }
+                        });
+                    }
                 }
 
-                // Inbound mesh messages: authenticated player inputs.
+                // Inbound mesh messages: player inputs, neighbour transits, and live ruleset updates.
                 item = stream.next() => match item {
                     Some(Ok(m)) => {
-                        if m.topic != in_topic {
-                            continue;
-                        }
                         let payload = match m.payload() {
                             Ok(p) => p,
                             Err(e) => { tracing::debug!(error = %e, "bad payload hex"); continue; }
                         };
-                        match wire::ClientMsg::decode(&payload) {
-                            Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
-                            Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg"),
+                        if m.topic == in_topic {
+                            match wire::ClientMsg::decode(&payload) {
+                                Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
+                                Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg"),
+                            }
+                        } else if m.topic == transit_topic {
+                            // INFINITE MAP: a ship arrived from a neighbouring sector.
+                            match serde_json::from_slice::<sim::Transit>(&payload) {
+                                Ok(t) if t.to == sector_id => sim.accept_transit(t.ship),
+                                Ok(_) => {}
+                                Err(e) => tracing::debug!(error = %e, "undecodable transit"),
+                            }
+                        } else if m.topic == ruleset_topic {
+                            // HOT RELOAD: a newer ruleset was published — fetch and apply it live.
+                            if let Ok(ann) = serde_json::from_slice::<director::RulesetAnnounce>(&payload)
+                                && ann.version > sim.rules.version
+                            {
+                                match director::fetch_ruleset(ce, &ann.cid).await {
+                                    Ok(r) => {
+                                        let v = r.version;
+                                        rules = Arc::new(r);
+                                        sim.apply_ruleset(rules.clone());
+                                        tracing::info!(version = v, sector = %cfg.sector, "hot-applied live ruleset (no restart)");
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "failed to fetch announced ruleset"),
+                                }
+                            }
                         }
                     }
                     Some(Err(e)) => { tracing::warn!(error = %e, "message stream error; reconnecting"); break; }
