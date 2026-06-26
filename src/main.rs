@@ -121,6 +121,10 @@ enum Cmd {
         /// Player count that makes a cell "hot" and split. Lower it to see adaptation at low population.
         #[arg(long)]
         split_players: Option<u32>,
+        /// OPEN WORLD: radius (in sectors) of the seamless play-sector ring hosted in-process around
+        /// genesis, so crossing a sector edge never hits a wall. 0 = one open genesis cell; 1 = 3x3 ring.
+        #[arg(long, default_value_t = 1)]
+        ring: i32,
         /// HOT RELOAD: watch this ruleset file and hot-push edits to the whole galaxy.
         #[arg(long)]
         ruleset: Option<PathBuf>,
@@ -219,7 +223,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Node { gateway, region, hz, max_depth, split_players, ruleset, image, grant }) => {
+        Some(Cmd::Node { gateway, region, hz, max_depth, split_players, ring, ruleset, image, grant }) => {
             // HOT RELOAD watcher (optional), same as `host`: a file save hot-pushes to the whole galaxy.
             if let Some(path) = ruleset.clone() {
                 let ce2 = ce.clone();
@@ -238,6 +242,7 @@ async fn main() -> Result<()> {
                 grant,
                 max_depth,
                 split_players,
+                play_ring: ring,
                 ..Default::default()
             };
             node::run_node(&ce, opts, async { let _ = tokio::signal::ctrl_c().await; }).await

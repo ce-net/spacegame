@@ -62,6 +62,12 @@ pub struct NodeOpts {
     /// Player count that makes a cell "hot" (overrides the default for small/demo deployments so the
     /// adaptive behaviour is reachable at low population). `None` keeps the calibrated default.
     pub split_players: Option<u32>,
+    /// **Open world:** radius (in sectors) of the ring of neighbouring play sectors this gateway hosts
+    /// in-process around the genesis cell, so seamless edge-transit always lands on a LIVE host instead of
+    /// soft-bouncing at the genesis boundary. `0` = genesis only (a single open cell); `1` = the 3x3 ring
+    /// (the immediate neighbours), etc. The galaxy is still unbounded — this just pre-warms the area
+    /// players actually reach on one box; real scale comes from the quadtree splitting onto donor nodes.
+    pub play_ring: i32,
 }
 
 impl Default for NodeOpts {
@@ -76,6 +82,7 @@ impl Default for NodeOpts {
             max_local_cells: 8,
             max_depth: 3,
             split_players: None,
+            play_ring: 1,
         }
     }
 }
@@ -96,6 +103,9 @@ struct Node {
     loads: LoadTable,
     /// Cells hosted in this process → the shutdown switch for each host task.
     local: HashMap<CellId, watch::Sender<bool>>,
+    /// **Open world:** plain play-sector tokens (e.g. `"1_0"`) hosted in-process as the seamless ring
+    /// around genesis, keyed by token → shutdown switch. Disjoint from `local` (quadtree cells).
+    local_play: HashMap<String, watch::Sender<bool>>,
     /// Our position in the shape-commit chain (the CID of the last commit we authored/applied).
     head: String,
     epoch: u64,
@@ -128,6 +138,33 @@ impl Node {
         });
         self.local.insert(cell, tx);
         tracing::info!(cell = %cell.token(), "now hosting cell in-process");
+    }
+
+    /// **Open world:** host a plain play sector (e.g. `"1_0"`) in-process so seamless edge-transit into it
+    /// lands on a live host. These are lean cells (no replication/sealing) — they exist to make the area
+    /// around genesis one continuous, wall-less expanse. Idempotent; the genesis token is never re-hosted.
+    fn host_play_sector(&mut self, token: String) {
+        if token == "0_0" || self.local_play.contains_key(&token) {
+            return;
+        }
+        let (tx, mut rx) = watch::channel(false);
+        let ce = self.ce.clone();
+        let cfg = SectorConfig {
+            sector: token.clone(),
+            hz: self.opts.hz,
+            // Lean: don't replicate/seal the empty ring cells — keep the relay's budget for the action.
+            snapshot_every: 0,
+            seal_every: 0,
+            advertise_every: 200,
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            if let Err(e) = run_sector(&ce, cfg, async move { let _ = rx.changed().await; }).await {
+                tracing::warn!(error = %e, "hosted play sector exited with error");
+            }
+        });
+        self.local_play.insert(token.clone(), tx);
+        tracing::info!(sector = %token, "now hosting play sector in-process (open-world ring)");
     }
 
     /// Stop hosting `cell` here (it stopped being a leaf, or moved). Best-effort.
@@ -448,6 +485,7 @@ pub async fn run_node(
         map: MapModel::new(),
         loads: Arc::new(Mutex::new(HashMap::new())),
         local: HashMap::new(),
+        local_play: HashMap::new(),
         head: String::new(),
         epoch: 0,
     };
@@ -460,6 +498,22 @@ pub async fn run_node(
     if opts.gateway {
         node.host_cell(CellId::ROOT);
         node.commit_shape(ShapeOp::Place { cell: CellId::ROOT, node: me.clone(), from_snapshot: None }).await;
+        // OPEN WORLD: pre-warm the ring of neighbouring play sectors around genesis so crossing a sector
+        // edge transits seamlessly onto a live host instead of soft-bouncing at the boundary. The galaxy
+        // stays unbounded (the quadtree splits onto donor nodes under load); this just removes the visible
+        // wall on the area a single box can hold. `--ring 0` disables it (genesis as one open cell).
+        let r = opts.play_ring.clamp(0, 4);
+        for sx in -r..=r {
+            for sy in -r..=r {
+                if sx == 0 && sy == 0 {
+                    continue;
+                }
+                node.host_play_sector(crate::shard::SectorId::new(sx, sy).token());
+            }
+        }
+        if r > 0 {
+            tracing::info!(ring = r, sectors = (2 * r + 1) * (2 * r + 1) - 1, "open-world ring hosted around genesis");
+        }
     }
 
     if opts.gateway {
@@ -498,6 +552,7 @@ pub async fn run_node(
                     tracing::info!("shutdown requested; stopping all hosted cells");
                     let cells: Vec<CellId> = node.local.keys().copied().collect();
                     for c in cells { node.unhost_cell(&c); }
+                    for (_, tx) in node.local_play.drain() { let _ = tx.send(true); }
                     return Ok(());
                 }
 

@@ -68,19 +68,23 @@ impl ShipRole {
 }
 
 /// Side length of one sector in world units. A sector's local coordinates run `0..SECTOR_SIZE`.
-pub const SECTOR_SIZE: f32 = 3000.0;
+/// A sector is a large open expanse: the galaxy is an unbounded grid of these tiled seamlessly
+/// (see [`Sim::seamless`]), so play never hits a wall — you just cross into the neighbour.
+pub const SECTOR_SIZE: f32 = 9000.0;
 /// Grid cell size for the shared deterministic asteroid field (sector-local).
 pub const ROCK_CELL: f32 = 300.0;
 /// Ship collision / pickup radius.
 pub const SHIP_R: f32 = 18.0;
-/// Legacy default max speed (kept as the reference base; live value comes from [`Tunables`]).
-pub const MAX_SPEED: f32 = 7.0;
-/// Legacy default thrust accel (kept as a reference base).
-pub const THRUST: f32 = 0.55;
-/// Legacy default damping (kept as a reference base).
-pub const DAMPING: f32 = 0.94;
-/// Legacy default turn rate (kept as a reference base).
-pub const TURN_RATE: f32 = 0.16;
+/// Canonical max speed (world units / tick). The single source of truth that both the authoritative
+/// server ([`Tunables::default`]) and the client's local prediction read, so prediction matches.
+/// Tuned for a fast, momentum-carrying "Reassembly" feel — ships are quick and glide.
+pub const MAX_SPEED: f32 = 16.0;
+/// Canonical thrust accel (world units / tick^2) — snappy off-the-line response.
+pub const THRUST: f32 = 0.95;
+/// Canonical per-tick velocity damping. Higher = more glide/momentum (still self-arresting).
+pub const DAMPING: f32 = 0.965;
+/// Canonical turn rate (radians / tick) — tight mouse-aim tracking.
+pub const TURN_RATE: f32 = 0.22;
 /// Base hull / max hull at spawn (reference base; live value from [`Tunables::base_hp`]).
 pub const BASE_HP: i32 = 100;
 /// Max name length the server accepts.
