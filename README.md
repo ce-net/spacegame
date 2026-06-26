@@ -54,20 +54,28 @@ same-origin node bridge (`window.__ceNode` if an in-browser WASM node is present
 
 ```
 src/
-  sim.rs          pure authoritative simulation of ONE sector (ships, thrust, bullets, mining,
-                  upgrades, kills, respawns). Deterministic: same inputs -> same state.
+  sim.rs          pure authoritative simulation of ONE sector: ships, physics, weapons (blaster /
+                  homing missile / railgun / laser), mining, tech tree, kills, respawns, ship<->ship
+                  collision, and cross-sector transit. Deterministic: same inputs -> same state.
+  aabb.rs         recursive AABB tree (loose quadtree): the broad-phase for collision, hitscan, homing
+                  target-acquire and viewport interest queries. Keeps the tick near-linear at scale.
+  ruleset.rs      the hot-reloadable game definition as DATA: weapon catalogue, tech tree, physics
+                  tunables, and an opaque shader/asset blob. Versioned; swapped live with no restart.
   shard.rs        SectorId + rendezvous-hash sharding + latency-first host scoring + interest set.
-  wire.rs         sector-keyed pubsub topics + ClientMsg / Snapshot JSON wire types.
-  room.rs         glue: authenticated mesh msg -> sim intent; sim -> wire Snapshot. Pure.
-  snapshot.rs     SectorSnapshot: faithful capture/restore of a sector for replication/failover.
+  wire.rs         sector-keyed pubsub topics + ClientMsg / Snapshot JSON wire types (weapons, beams).
+  room.rs         glue: authenticated mesh msg -> sim intent; sim -> wire Snapshot (full + viewport-
+                  scoped for bounded per-client bandwidth). Pure.
+  snapshot.rs     SectorSnapshot: faithful capture/restore of a sector (incl. loadout) for failover.
   leaderboard.rs  canonical galaxy leaderboard + cross-sector merge + PoW-anchored Commitment.
-  director.rs     the ONLY mesh-I/O layer: maps the pure modules onto real ce-rs SDK calls.
-  lib.rs          run_sector(): the authoritative tick/publish/replicate/seal loop.
-  main.rs         CLI: host / place / shard / nearest.
+  director.rs     the ONLY mesh-I/O layer: maps the pure modules onto real ce-rs SDK calls —
+                  placement, replication, consensus, transit delivery, ruleset hot-reload, autoscale.
+  lib.rs          run_sector(): the authoritative tick/publish/replicate/seal/transit/hot-reload loop.
+  main.rs         CLI: host / place / ruleset (init|push) / shard / nearest.
 ```
 
-The `sim`, `shard`, `wire`, `room`, `snapshot`, and `leaderboard` modules are **pure and fully
-unit-tested** — no mesh, no network, no clock. `director` and `lib` hold the thin async mesh I/O.
+The `sim`, `aabb`, `ruleset`, `shard`, `wire`, `room`, `snapshot`, and `leaderboard` modules are
+**pure and fully unit-tested** — no mesh, no network, no clock. `director` and `lib` hold the thin
+async mesh I/O.
 
 ---
 
@@ -83,6 +91,9 @@ unit-tested** — no mesh, no network, no clock. `director` and `lib` hold the t
 | **Economy** — pay the host per session | `director::open_host_channel` calls `ce.channel_open(host, capacity, …)` then `ce.sign_receipt(...)`; `pay_host_tick` signs rising receipts for ongoing hosting — the marketplace angle: a player funds the node simulating their region of space. | A player opens a payment channel to its sector host and signs receipts as the session runs; the host redeems the highest to settle. |
 | **Auth** — identity is the player | The player id is the CE NodeId the node authenticates on every pubsub delivery (`AppMessage.from`); `room::hue_for` derives the unspoofable color from it. No central auth server. | Two browsers on two nodes each appear as their own NodeId-derived ship; neither can pick another's id or color. |
 | **Realtime** — SSE, gossipsub | `ce.subscribe` / `ce.publish` on the sector topics; `ce.messages_stream()` (the `/mesh/messages/stream` SSE) drives the authoritative loop and the client render. | Inputs and snapshots flow over libp2p gossipsub with push (SSE) latency, no polling. |
+| **Hot reload** — change the game while it runs | `ruleset.rs` holds weapons/tech/tunables/shaders as versioned data; `director::publish_ruleset` `ce.put_object()`s it and `ce.publish`es `{cid, version}`; hosts `Sim::apply_ruleset` between ticks and clients re-fetch. `spacegame ruleset push` / `host --ruleset live.json` (file-watch). | Edit a weapon stat or a shader and save; within ~1s every running host re-tunes and every client hot-applies it — no restart, no dropped session. |
+| **Scale (latency under load)** — recursive AABB | `aabb.rs` is a recursively subdivided AABB tree; `sim` queries it for bullet/hitscan/homing/ship collision and `room::build_snapshot_view` queries it for per-client viewport scoping. | A sector with thousands of entities still ticks inside its budget, and a client receives only what is on screen — bandwidth and CPU stay bounded as the galaxy fills. See `SCALING.md`. |
+| **Infinite map** — seamless sectors | `Sim::take_transits` emits a `Transit` when a ship crosses a sector edge; `director::publish_transit` delivers it to the neighbour's host, which `accept_transit`s it; `director::prewarm_neighbors` autoscales hosts ahead of demand. | Fly across a sector boundary and keep going — your ship, loadout and minerals appear in the neighbouring region (often on a different node), one continuous galaxy. |
 
 ---
 
