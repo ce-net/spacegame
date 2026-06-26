@@ -203,6 +203,15 @@ pub fn resolve_shape(library: &ShapeLibrary, id: &str) -> Result<Vec<FlatPrim>, 
     Ok(out)
 }
 
+/// Resolve a shape blueprint **value** (e.g. a whole-ship blueprint synthesized from a built craft,
+/// which is not in the library) against the library it references.
+pub fn resolve_shape_design(library: &ShapeLibrary, bp: &ShapeBlueprint) -> Result<Vec<FlatPrim>, String> {
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    resolve_value(library, bp, &Xform::default(), usize::MAX, 0, &mut path, &mut out)?;
+    Ok(out)
+}
+
 fn resolve_into(
     library: &ShapeLibrary,
     id: &str,
@@ -212,16 +221,28 @@ fn resolve_into(
     path: &mut Vec<String>,
     out: &mut Vec<FlatPrim>,
 ) -> Result<(), String> {
-    if depth > MAX_SHAPE_DEPTH {
-        return Err(format!("shape nesting exceeded {MAX_SHAPE_DEPTH} at {id}"));
-    }
-    if path.iter().any(|p| p == id) {
-        return Err(format!("shape cycle: {} -> {id}", path.join(" -> ")));
-    }
     let bp = library.blueprint(id).ok_or_else(|| format!("unknown shape blueprint {id}"))?;
+    resolve_value(library, bp, base, inherited_material, depth, path, out)
+}
+
+fn resolve_value(
+    library: &ShapeLibrary,
+    bp: &ShapeBlueprint,
+    base: &Xform,
+    inherited_material: usize,
+    depth: usize,
+    path: &mut Vec<String>,
+    out: &mut Vec<FlatPrim>,
+) -> Result<(), String> {
+    if depth > MAX_SHAPE_DEPTH {
+        return Err(format!("shape nesting exceeded {MAX_SHAPE_DEPTH} at {}", bp.id));
+    }
+    if path.iter().any(|p| p == &bp.id) {
+        return Err(format!("shape cycle: {} -> {}", path.join(" -> "), bp.id));
+    }
     let bp_material = bp.material.as_deref().and_then(|m| library.material_index(m)).unwrap_or(inherited_material);
 
-    path.push(id.to_string());
+    path.push(bp.id.clone());
     for part in &bp.root {
         let world = base.compose(&part.at);
         let mat = part.material.as_deref().and_then(|m| library.material_index(m)).unwrap_or(bp_material);
@@ -316,7 +337,19 @@ pub struct RawMesh {
 /// (convex fan) into world space, build the material palette, and compute the root AABB.
 pub fn flatten_gpu(library: &ShapeLibrary, id: &str) -> Result<GpuMesh, String> {
     let prims = resolve_shape(library, id)?;
-    let aabb = root_aabb(&prims);
+    Ok(flatten_prims(library, &prims))
+}
+
+/// Flatten a shape blueprint **value** (e.g. a whole ship) into one GPU mesh + root AABB.
+pub fn flatten_gpu_design(library: &ShapeLibrary, bp: &ShapeBlueprint) -> Result<GpuMesh, String> {
+    let prims = resolve_shape_design(library, bp)?;
+    Ok(flatten_prims(library, &prims))
+}
+
+/// Triangulate already-resolved primitives into one GPU mesh: vertices (pos+uv+material), indices, a
+/// compacted material palette, and the root AABB.
+fn flatten_prims(library: &ShapeLibrary, prims: &[FlatPrim]) -> GpuMesh {
+    let aabb = root_aabb(prims);
 
     // Material palette: a default at index 0, then every library material actually used.
     let default = MaterialDef {
@@ -333,7 +366,7 @@ pub fn flatten_gpu(library: &ShapeLibrary, id: &str) -> Result<GpuMesh, String> 
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    for fp in &prims {
+    for fp in prims {
         let mat_idx = if fp.material == usize::MAX {
             0u32
         } else {
@@ -363,7 +396,51 @@ pub fn flatten_gpu(library: &ShapeLibrary, id: &str) -> Result<GpuMesh, String> 
         }
     }
 
-    Ok(GpuMesh { aabb, vertices, indices, materials })
+    GpuMesh { aabb, vertices, indices, materials }
+}
+
+/// A cache of flattened ship meshes (and their root AABBs), keyed by a design key, that **invalidates
+/// itself on a hot reload**. Flattening a whole ship every frame would be wasteful; with this the mesh
+/// + AABB are computed once and reused until either the design or the ruleset changes. Cheap to clone
+/// out (each entry is an `Arc<GpuMesh>`).
+#[derive(Debug, Default)]
+pub struct MeshCache {
+    ruleset_version: u64,
+    entries: std::collections::HashMap<String, std::sync::Arc<GpuMesh>>,
+}
+
+impl MeshCache {
+    pub fn new() -> Self {
+        MeshCache { ruleset_version: 0, entries: std::collections::HashMap::new() }
+    }
+
+    /// Number of cached meshes (for diagnostics/tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Get a cached mesh for `key`, or build + store it. If `ruleset_version` differs from the cached
+    /// one (a hot reload happened), the whole cache is dropped first so stale geometry is never served.
+    pub fn get_or_build(
+        &mut self,
+        ruleset_version: u64,
+        key: &str,
+        build: impl FnOnce() -> Result<GpuMesh, String>,
+    ) -> Result<std::sync::Arc<GpuMesh>, String> {
+        if ruleset_version != self.ruleset_version {
+            self.entries.clear();
+            self.ruleset_version = ruleset_version;
+        }
+        if let Some(m) = self.entries.get(key) {
+            return Ok(m.clone());
+        }
+        let mesh = std::sync::Arc::new(build()?);
+        self.entries.insert(key.to_string(), mesh.clone());
+        Ok(mesh)
+    }
 }
 
 /// Validate the shape libraries before they go live: every blueprint's primitives are sane, every

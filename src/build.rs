@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::shape::Shape2D;
+use crate::shapedef::{ShapeBlueprint, ShapeKind, ShapePart, Xform};
 
 /// What an object is — drives placement rules and how the sim treats a resolved part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +114,28 @@ pub struct ObjectDef {
     pub hp: i32,
     #[serde(default)]
     pub stats: ObjectStats,
+    /// Material id (into the ruleset material palette) for rendering. If absent, a per-category default
+    /// is used ([`default_material`]).
+    #[serde(default)]
+    pub material: Option<String>,
+    /// Optional detailed shape blueprint to draw this object with, instead of its plain `shape`
+    /// (e.g. a panelled, rivetted hull block). Used when the ship is flattened for the GPU.
+    #[serde(default)]
+    pub graphics: Option<String>,
+}
+
+/// The default render material for a category, used when an object doesn't specify one. The ids match
+/// the builtin material palette; a ruleset without them falls back to a neutral material at flatten.
+pub fn default_material(cat: ObjectCategory) -> &'static str {
+    match cat {
+        ObjectCategory::Structure => "hull-steel",
+        ObjectCategory::Armor => "armor-ceramic",
+        ObjectCategory::Weapon | ObjectCategory::Turret | ObjectCategory::Gun => "gold-trim",
+        ObjectCategory::Thruster => "engine-glow",
+        ObjectCategory::CommandCenter | ObjectCategory::Radar | ObjectCategory::Sensor => "canopy-glass",
+        ObjectCategory::StorageTank | ObjectCategory::Container => "hull-steel",
+        ObjectCategory::Upgrade => "gold-trim",
+    }
 }
 
 fn one() -> f32 {
@@ -124,7 +147,17 @@ fn hundred() -> i32 {
 
 impl ObjectDef {
     pub fn new(id: &str, name: &str, category: ObjectCategory, shape: Shape2D) -> Self {
-        ObjectDef { id: id.into(), name: name.into(), category, shape, mass: 1.0, hp: 100, stats: ObjectStats::default() }
+        ObjectDef {
+            id: id.into(),
+            name: name.into(),
+            category,
+            shape,
+            mass: 1.0,
+            hp: 100,
+            stats: ObjectStats::default(),
+            material: None,
+            graphics: None,
+        }
     }
     pub fn mass(mut self, m: f32) -> Self {
         self.mass = m;
@@ -136,6 +169,14 @@ impl ObjectDef {
     }
     pub fn stats(mut self, s: ObjectStats) -> Self {
         self.stats = s;
+        self
+    }
+    pub fn material(mut self, id: &str) -> Self {
+        self.material = Some(id.into());
+        self
+    }
+    pub fn graphics(mut self, id: &str) -> Self {
+        self.graphics = Some(id.into());
         self
     }
 }
@@ -341,6 +382,10 @@ pub struct ResolvedPart {
     pub mass: f32,
     pub hp: i32,
     pub stats: ObjectStats,
+    /// Render material id (from the object, or its category default).
+    pub material: Option<String>,
+    /// Optional detailed graphics shape blueprint for this part.
+    pub graphics: Option<String>,
 }
 
 /// The fully expanded craft: every part plus the aggregate properties the sim/physics need.
@@ -488,6 +533,8 @@ fn resolve_placement(
                     mass: od.mass * area_ratio.max(0.05),
                     hp: ((od.hp as f32) * area_ratio.max(0.1)).round() as i32,
                     stats: od.stats.clone(),
+                    material: od.material.clone().or_else(|| Some(default_material(od.category).to_string())),
+                    graphics: od.graphics.clone(),
                 });
                 // Children placed inside this object (structure/container) are relative to it.
                 for child in &placement.children {
@@ -507,6 +554,28 @@ fn resolve_placement(
         }
     }
     Ok(())
+}
+
+/// Collapse a whole resolved craft into **one** [`ShapeBlueprint`] for rendering: every part becomes a
+/// placed primitive (or its detailed `graphics` shape blueprint) at the part's world transform, with
+/// its material. Flattening this single blueprint draws the entire ship in one pass and yields one root
+/// AABB — which the caller can cache (see [`crate::shapedef::MeshCache`]). This is the bridge from "a
+/// ship is many objects" to "a ship is one shape".
+pub fn craft_to_shape_blueprint(craft: &ResolvedCraft, id: &str) -> ShapeBlueprint {
+    let root = craft
+        .parts
+        .iter()
+        .map(|p| {
+            let at = Xform::new(p.world.x, p.world.y, p.world.rot, 1.0);
+            let kind = match &p.graphics {
+                Some(g) => ShapeKind::Ref { blueprint: g.clone() },
+                None => ShapeKind::Prim { shape: p.shape.clone() },
+            };
+            let material = p.material.clone().or_else(|| Some(default_material(p.category).to_string()));
+            ShapePart { at, kind, material }
+        })
+        .collect();
+    ShapeBlueprint { id: id.to_string(), name: id.to_string(), material: None, root }
 }
 
 fn aggregate(parts: Vec<ResolvedPart>) -> ResolvedCraft {

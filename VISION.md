@@ -80,3 +80,10 @@ paraphrase or "correct" the quotes below.
 ### 16 — recursive shape blueprints, materials, GPU flattening
 
 > So shapes should also have their own shape blueprints and system for defining, saving and making new shapes. Also recursvive and shapes can be complicated with lots of shape details because its recursvie. shapes auto build aabb on root for collision and physics. Shapes will create the graphics eventually and each shape can have  materials. it needs to be easily sent to gpu with proper flatting and memory defining with aabb, material and all shapes.
+
+### 17 — a whole ship collapses to one shape blueprint (render + cached AABB)
+
+> So the entire ship should not be able to be converted into one single shapeblueprint for rendering the entire ship + getting an aabb of it efficently and cashing it
+
+(Read as: the entire ship should now be convertible into one single ShapeBlueprint for rendering the
+whole ship in one pass, getting its AABB efficiently, and caching it.)

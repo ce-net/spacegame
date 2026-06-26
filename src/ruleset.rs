@@ -36,7 +36,9 @@ use crate::build::{
 };
 use crate::procgen::{GeneratedShip, ModuleDef, ShipGrammar, Slot, SlotRule};
 use crate::shape::{NamedShape, Shape2D};
-use crate::shapedef::{MaterialDef, ShapeBlueprint, ShapeKind, ShapeLibrary, ShapePart, Xform};
+use crate::shapedef::{
+    GpuMesh, MaterialDef, MeshCache, ShapeBlueprint, ShapeKind, ShapeLibrary, ShapePart, Xform,
+};
 
 /// How a weapon delivers damage. The authoritative simulation dispatches firing on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,6 +547,59 @@ impl Ruleset {
     /// thrust, weapon mounts, parts) against this ruleset's catalogue.
     pub fn resolve_generated(&self, ship: &GeneratedShip) -> Result<crate::build::ResolvedCraft, String> {
         crate::build::resolve_design(&self.catalog(), &ship.blueprint, &std::collections::BTreeMap::new())
+    }
+
+    /// Collapse a built design (a craft blueprint) into **one** shape blueprint for the whole ship —
+    /// every part as a placed primitive (or its detailed graphics shape) with its material.
+    pub fn ship_shape_blueprint(
+        &self,
+        design_id: &str,
+        args: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<ShapeBlueprint, String> {
+        let craft = self.resolve_craft(design_id, args)?;
+        Ok(crate::build::craft_to_shape_blueprint(&craft, &format!("ship-{design_id}")))
+    }
+
+    /// Flatten a whole built ship into **one** GPU mesh + root AABB in a single pass — the renderer
+    /// draws the entire ship from this, and the AABB is the ship's bound for culling/collision.
+    pub fn ship_mesh(
+        &self,
+        design_id: &str,
+        args: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<GpuMesh, String> {
+        let bp = self.ship_shape_blueprint(design_id, args)?;
+        crate::shapedef::flatten_gpu_design(&self.shape_library(), &bp)
+    }
+
+    /// As [`ship_mesh`](Self::ship_mesh), but **cached**: built once and reused until the design or the
+    /// ruleset changes (the cache keys on this ruleset's `version`, so a hot reload invalidates it).
+    pub fn ship_mesh_cached(
+        &self,
+        cache: &mut MeshCache,
+        design_id: &str,
+        args: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<std::sync::Arc<GpuMesh>, String> {
+        let mut key = format!("design:{design_id}");
+        for (n, v) in args {
+            key.push_str(&format!(":{n}={v}"));
+        }
+        cache.get_or_build(self.version, &key, || self.ship_mesh(design_id, args))
+    }
+
+    /// One GPU mesh + root AABB for a procedurally-generated ship.
+    pub fn generated_ship_mesh(&self, ship: &GeneratedShip) -> Result<GpuMesh, String> {
+        let craft = self.resolve_generated(ship)?;
+        let bp = crate::build::craft_to_shape_blueprint(&craft, &ship.blueprint.id);
+        crate::shapedef::flatten_gpu_design(&self.shape_library(), &bp)
+    }
+
+    /// Cached one-pass mesh for a generated ship (keyed by its seed-bearing blueprint id).
+    pub fn generated_ship_mesh_cached(
+        &self,
+        cache: &mut MeshCache,
+        ship: &GeneratedShip,
+    ) -> Result<std::sync::Arc<GpuMesh>, String> {
+        cache.get_or_build(self.version, &format!("gen:{}", ship.blueprint.id), || self.generated_ship_mesh(ship))
     }
 
     /// The weapon with `id`, if present.
@@ -1076,5 +1131,35 @@ mod tests {
         // And a pointer-free raw form for upload.
         let raw = mesh.to_raw();
         assert_eq!(raw.vertices.len(), mesh.vertices.len() * 5);
+    }
+
+    #[test]
+    fn whole_ship_collapses_to_one_shape_mesh_and_caches() {
+        let r = Ruleset::builtin();
+        // An authored ship becomes ONE shape blueprint with all its parts.
+        let bp = r.ship_shape_blueprint("scout", &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(bp.root.len(), 13, "the whole scout is one shape blueprint of 13 parts");
+        // Flattened in one pass to a single mesh + the ship's root AABB.
+        let mesh = r.ship_mesh("scout", &std::collections::BTreeMap::new()).unwrap();
+        assert!(!mesh.vertices.is_empty() && mesh.indices.len() % 3 == 0, "one triangulated ship mesh");
+        assert!(mesh.aabb[2] > mesh.aabb[0] && mesh.aabb[3] > mesh.aabb[1], "non-degenerate whole-ship AABB");
+
+        // Caching: built once, the same Arc is reused.
+        let mut cache = crate::shapedef::MeshCache::new();
+        let a = r.ship_mesh_cached(&mut cache, "scout", &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(cache.len(), 1);
+        let b = r.ship_mesh_cached(&mut cache, "scout", &std::collections::BTreeMap::new()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "the cached mesh is reused, not rebuilt");
+
+        // A hot reload (new version) invalidates the cache.
+        let mut r2 = Ruleset::builtin();
+        r2.version = 999;
+        let _ = r2.ship_mesh_cached(&mut cache, "scout", &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(cache.len(), 1, "cache was cleared on the version change, then repopulated");
+
+        // A procedurally-generated ship also collapses to one mesh.
+        let ship = r.generate_ship("warship", 7).unwrap();
+        let gm = r.generated_ship_mesh(&ship).unwrap();
+        assert!(!gm.vertices.is_empty() && gm.aabb[2] > gm.aabb[0], "generated ship -> one mesh + AABB");
     }
 }

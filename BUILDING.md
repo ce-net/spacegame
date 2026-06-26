@@ -124,10 +124,30 @@ Modules, grammars, blueprints, objects **and shapes** (a named [`crate::shape::N
 all live in the hot-reloadable ruleset, so editing a module, a slot, a grammar rule or a shape and
 regenerating yields a different fleet — live.
 
+## 5. One ship → one shape (rendering + cached AABB)
+
+A ship is many objects to *design* and *simulate*, but for **rendering and bounding** it should be one
+thing. `craft_to_shape_blueprint` collapses a whole resolved craft into a **single `ShapeBlueprint`**:
+each part becomes a placed primitive (or its detailed `graphics` shape blueprint) carrying its material
+(from the object, or a per-category default). Flattening that one blueprint
+(`Ruleset::ship_mesh` / `generated_ship_mesh`) draws the **entire ship in one pass** and yields **one
+root AABB** for culling/collision — computed efficiently from the flattened primitives.
+
+Because re-flattening every frame is wasteful, `MeshCache` memoizes the mesh + AABB by design key and
+**invalidates on a hot reload** (it keys on the ruleset `version`, so editing a shape, material, object
+or blueprint rebuilds it; otherwise the cached `Arc<GpuMesh>` is reused):
+
+```rust
+let mut cache = MeshCache::new();
+let mesh = ruleset.ship_mesh_cached(&mut cache, "scout", &Default::default())?; // built once, then reused
+let aabb = mesh.aabb;                                                            // the whole-ship bound
+```
+
 ## What's next
 
-The data + resolution layer is complete and tested. Wiring a `ResolvedCraft` into a live ship (its mass
-and moment from the parts, thrust from its thrusters, weapon mounts firing the ruleset weapons, and
-per-part damage so chunks blow off) is the follow-on that makes built craft fly and fight — the
-resolver already outputs exactly those aggregates and per-part shapes/transforms to make it
+The build → shape → GPU path is complete: a design (authored or procedurally generated) resolves to a
+craft, collapses to one shape blueprint, and flattens to one cached mesh + AABB. The remaining follow-on
+is **live simulation**: instantiate a `ResolvedCraft` as an in-world ship — mass and moment from the
+parts, thrust from its thrusters, mounts firing the ruleset weapons, per-part damage so chunks blow off.
+The resolver already outputs exactly those aggregates and per-part shapes/transforms to make it
 straightforward.
