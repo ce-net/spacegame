@@ -94,7 +94,13 @@ pub struct AabbTree<T> {
     boxes: Vec<Aabb>,
     payloads: Vec<T>,
     root: Node,
+    /// The largest half-extent (on either axis) of any indexed item box. Items are bucketed into a
+    /// leaf by their *centre*, so a box reaches at most this far past its leaf's region; padding a
+    /// region by this value before the prune test makes pruning provably lossless.
+    max_half: f32,
+    #[allow(dead_code)]
     max_depth: u32,
+    #[allow(dead_code)]
     leaf_cap: usize,
 }
 
@@ -125,9 +131,13 @@ impl<T: Clone> AabbTree<T> {
             payloads.push(p);
         }
         let leaf_cap = leaf_cap.max(1);
+        let max_half = boxes
+            .iter()
+            .map(|b| ((b.max_x - b.min_x) * 0.5).max((b.max_y - b.min_y) * 0.5))
+            .fold(0.0_f32, f32::max);
         let all: Vec<usize> = (0..boxes.len()).collect();
         let root = Self::subdivide(bounds, &all, &boxes, 0, leaf_cap, max_depth);
-        AabbTree { bounds, boxes, payloads, root, max_depth, leaf_cap }
+        AabbTree { bounds, boxes, payloads, root, max_half, max_depth, leaf_cap }
     }
 
     /// Recursively split `region` until it holds `<= leaf_cap` items or `depth == max_depth`. An item
@@ -200,7 +210,7 @@ impl<T: Clone> AabbTree<T> {
     /// phase: the caller still does its own precise test (circle/segment) on the returned candidates.
     pub fn query(&self, q: &Aabb) -> Vec<T> {
         let mut out = Vec::new();
-        self.query_into(&self.root, q, &mut |i| out.push(self.payloads[i].clone()));
+        self.query_into(&self.root, self.bounds, q, &mut |i| out.push(self.payloads[i].clone()));
         out
     }
 
@@ -208,7 +218,7 @@ impl<T: Clone> AabbTree<T> {
     /// cloning the payload — handy when the caller indexes its own parallel arrays.
     pub fn query_indices(&self, q: &Aabb) -> Vec<usize> {
         let mut out = Vec::new();
-        self.query_into(&self.root, q, &mut |i| out.push(i));
+        self.query_into(&self.root, self.bounds, q, &mut |i| out.push(i));
         out
     }
 
@@ -218,7 +228,26 @@ impl<T: Clone> AabbTree<T> {
         self.query(&Aabb::around(x, y, r))
     }
 
-    fn query_into(&self, node: &Node, q: &Aabb, push: &mut impl FnMut(usize)) {
+    /// The four child regions of `region`, in the same fixed NW/NE/SW/SE order [`subdivide`] used —
+    /// so query-time region recomputation lines up with the build-time partition.
+    fn quadrants(region: Aabb) -> [Aabb; 4] {
+        let (cx, cy) = region.center();
+        [
+            Aabb::new(region.min_x, region.min_y, cx, cy),
+            Aabb::new(cx, region.min_y, region.max_x, cy),
+            Aabb::new(region.min_x, cy, cx, region.max_y),
+            Aabb::new(cx, cy, region.max_x, region.max_y),
+        ]
+    }
+
+    /// Recurse, pruning any branch whose covered region does not overlap `q`. A leaf still does the
+    /// precise per-item box test, because a loose quadtree assigns items by centre so an item box may
+    /// poke slightly past its leaf's region. `region` is recomputed on the way down (it mirrors the
+    /// build partition exactly), so nodes stay small and the walk is allocation-free.
+    fn query_into(&self, node: &Node, region: Aabb, q: &Aabb, push: &mut impl FnMut(usize)) {
+        if !region.expanded(self.max_half).intersects(q) {
+            return;
+        }
         match node {
             Node::Leaf { items } => {
                 for &i in items {
@@ -228,26 +257,25 @@ impl<T: Clone> AabbTree<T> {
                 }
             }
             Node::Branch { children } => {
-                let (cx, cy) = self.node_center_for(q); // unused placeholder kept simple below
-                let _ = (cx, cy);
-                for child in children.iter() {
-                    // We descend every child whose *items* could overlap. Because a loose quadtree
-                    // assigns by centre, a child's items may extend slightly past the quadrant; the
-                    // leaf-level precise `intersects` test (above) catches false positives, so it is
-                    // correct to descend any child here. To keep it cheap we still prune by the
-                    // child's covered region when we can compute it — but since regions aren't stored
-                    // on the node, the leaf test is the pruner. Visiting all four children is bounded
-                    // and depth-limited.
-                    self.query_into(child, q, push);
+                let quads = Self::quadrants(region);
+                for (child, quad) in children.iter().zip(quads.iter()) {
+                    self.query_into(child, *quad, q, push);
                 }
             }
         }
     }
 
-    // Kept tiny/no-op: region pruning is done at the leaf via the stored item boxes. Splitting the
-    // region recompute out keeps `query_into` allocation-free.
-    fn node_center_for(&self, _q: &Aabb) -> (f32, f32) {
-        (0.0, 0.0)
+    /// A small region pad used only for pruning. Because items are bucketed by centre, an item box can
+    /// extend at most half its own width past its region edge; rather than track per-region item
+    /// extents we pad the region by a conservative slack so pruning never drops a leaf that holds a
+    /// true overlap. The leaf's precise `intersects` test then removes the false positives.
+    fn span_pad(&self) -> f32 {
+        // Half the bounds width over 2^max_depth, scaled up — comfortably larger than any leaf's
+        // worst-case item overhang for the entity sizes this game uses. Conservative on purpose:
+        // over-padding only costs a few extra leaf visits, never correctness.
+        let w = (self.bounds.max_x - self.bounds.min_x).max(self.bounds.max_y - self.bounds.min_y);
+        let leaf_w = w / (1u32 << self.max_depth.min(20)) as f32;
+        leaf_w.max(64.0)
     }
 
     /// `(node_count, max_depth_reached)` — for tests/telemetry that the tree actually subdivided.
