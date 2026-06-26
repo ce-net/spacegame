@@ -24,6 +24,7 @@ use spacegame::wire::ClientMsg;
 fn ship_transits_from_one_sector_to_the_neighbour() {
     let mut a = Sim::for_sector(SectorId::new(0, 0), Arc::new(Ruleset::builtin()));
     a.join("p", "P", 0);
+    a.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
     {
         let s = a.ships.get_mut("p").unwrap();
         s.x = SECTOR_SIZE - 2.0;
