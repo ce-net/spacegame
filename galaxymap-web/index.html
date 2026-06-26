@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>CE Spacegame — Live Galaxy Map</title>
+<meta name="theme-color" content="#03060e" />
+<style>
+  :root { --bg:#03060e; --ink:#dfe9f7; --dim:#7f93ad; --line:rgba(120,170,255,.16); --accent:#7af0ff; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
+  #cv { display:block; position:fixed; inset:0; }
+  .panel { position:fixed; background:rgba(7,13,24,.72); border:1px solid var(--line);
+    border-radius:10px; backdrop-filter:blur(6px); padding:10px 12px; font-size:12px; }
+  #hud { top:12px; left:12px; min-width:210px; }
+  #hud h1 { margin:0 0 6px; font-size:13px; letter-spacing:.5px; color:var(--accent); font-weight:600; }
+  #hud .row { display:flex; justify-content:space-between; gap:14px; color:var(--dim); line-height:1.7; }
+  #hud .row b { color:var(--ink); font-weight:600; }
+  #legend { bottom:12px; left:12px; color:var(--dim); }
+  #legend .bar { height:8px; width:160px; border-radius:4px; margin:5px 0 3px;
+    background:linear-gradient(90deg,#1b3b6b,#2f8fd6,#4be0c0,#ffd23f,#ff6b3d,#ffffff); }
+  #legend .ends { display:flex; justify-content:space-between; font-size:10px; }
+  #feed { top:12px; right:12px; width:300px; max-height:46vh; overflow:hidden; }
+  #feed h2 { margin:0 0 6px; font-size:11px; color:var(--dim); letter-spacing:1px; text-transform:uppercase; }
+  #feed .ev { font-size:11px; line-height:1.6; opacity:.95; }
+  #feed .ev .t { color:var(--dim); }
+  #feed .split { color:#7af0ff; } #feed .merge { color:#ffb27a; }
+  #feed .frontier { color:#b9ff7a; } #feed .migrate { color:#c9a8ff; }
+  #ctl { bottom:12px; right:12px; display:flex; gap:8px; align-items:center; color:var(--dim); }
+  #ctl button { font:inherit; font-size:11px; color:var(--ink); background:rgba(20,32,52,.9);
+    border:1px solid var(--line); border-radius:7px; padding:6px 10px; cursor:pointer; }
+  #ctl button:hover { border-color:var(--accent); }
+  #ctl .src { color:var(--accent); }
+  #tip { position:fixed; pointer-events:none; font-size:11px; padding:7px 9px; display:none; z-index:9; }
+  #tip b { color:var(--accent); }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="hud" class="panel">
+  <h1>LIVE GALAXY MAP</h1>
+  <div class="row"><span>leaf cells</span><b id="s-cells">1</b></div>
+  <div class="row"><span>players</span><b id="s-players">0</b></div>
+  <div class="row"><span>host nodes</span><b id="s-hosts">0</b></div>
+  <div class="row"><span>max depth</span><b id="s-depth">0</b></div>
+  <div class="row"><span>frontier ring</span><b id="s-ring">0</b></div>
+</div>
+
+<div id="feed" class="panel"><h2>reshape events</h2><div id="events"></div></div>
+
+<div id="legend" class="panel">
+  cell heat (load → split)
+  <div class="bar"></div>
+  <div class="ends"><span>idle</span><span>splitting</span></div>
+</div>
+
+<div id="ctl" class="panel">
+  source <span class="src" id="src">demo</span>
+  <button id="pause">pause</button>
+  <button id="fit">fit</button>
+</div>
+
+<div id="tip" class="panel"></div>
+
+<!-- ce-serve injects /__ce/mesh-bridge.js, exposing window.__ceNode for the LIVE source. -->
+<script>
+"use strict";
+//=================================================================================================
+// Quadtree math — mirrors spacegame::galaxy (CellId) in normalized [0,1]^2 space (origin at centre).
+//=================================================================================================
+const REF_DEPTH = 12;
+function cellNorm(c){ const s = 1/(2**c.depth); return { x:c.x*s, y:c.y*s, s }; } // unit-square rect
+function children(c){ const d=c.depth+1,x=c.x*2,y=c.y*2;
+  return [{depth:d,x,y},{depth:d,x:x+1,y},{depth:d,x,y:y+1},{depth:d,x:x+1,y:y+1}]; }
+function token(c){ return `${c.depth}.${c.x}.${c.y}`; }
+function parseToken(t){ const [depth,x,y]=t.split(".").map(Number); return {depth,x,y}; }
+function ringDistance(c){
+  let x=c.x, y=c.y;
+  if (c.depth<=REF_DEPTH){ const s=REF_DEPTH-c.depth; x<<=s; y<<=s; } else { const s=c.depth-REF_DEPTH; x>>=s; y>>=s; }
+  const half=1<<(REF_DEPTH-1); return Math.max(Math.abs(x-half),Math.abs(y-half));
+}
+// A flavour-only biome/danger echo of worldgen, for tooltips + base tint (deterministic by token).
+function hash32(str){ let h=2166136261>>>0; for(const ch of str){ h^=ch.charCodeAt(0); h=Math.imul(h,16777619); } return h>>>0; }
+const BIOMES=["Core Cluster","Open Void","Nebula Reach","Asteroid Expanse","Ruin Field","Frontier Dark"];
+function biomeOf(c){ const r=ringDistance(c), edge=Math.min(r/32,1);
+  const roll=(hash32("b"+c.depth+"."+(c.x>>3)+"."+(c.y>>3))%1000)/1000;
+  return roll < 0.4-edge*0.38 ? "Core Cluster" : BIOMES[1+(hash32("b2"+(c.x>>4)+(c.y>>4))%(BIOMES.length-1))]; }
+function danger(c){ return Math.min(ringDistance(c)/64*0.8 + 0.2, 1); }
+
+//=================================================================================================
+// Data model — mirrors spacegame::galaxymap (fold shape commits + load frames; keep a pulse trail).
+//=================================================================================================
+const model = {
+  leaves: new Map(),            // token -> cell
+  hosts: new Map(),             // token -> nodeId
+  loads: new Map(),             // token -> {players,entities,tick,bw}
+  charted: new Set(),           // tokens that are "born" (for the frontier ring)
+  pulses: [],                   // {x,y,s,t0,kind}
+  events: [],
+  add(c){ this.leaves.set(token(c),c); this.charted.add(token(c)); },
+};
+function genesis(){ model.add({depth:0,x:0,y:0}); }
+
+function applyShape(op){
+  const now = performance.now();
+  if(op.op==="Split"){
+    const c=op.cell; const r=cellNorm(c);
+    model.leaves.delete(token(c)); model.loads.delete(token(c));
+    for(let i=0;i<op.children.length;i++){ const k=op.children[i]; model.add(k); if(op.place_on) model.hosts.set(token(k),op.place_on[i]); }
+    model.pulses.push({x:r.x+r.s/2,y:r.y+r.s/2,s:r.s,t0:now,kind:"split"});
+    pushEvent("split", `${biomeOf(c)} ${token(c)} split → 4 cells`);
+  } else if(op.op==="Merge"){
+    const p=op.parent; for(const k of children(p)){ model.leaves.delete(token(k)); model.loads.delete(token(k)); }
+    model.add(p); if(op.place_on) model.hosts.set(token(p),op.place_on);
+    const r=cellNorm(p); model.pulses.push({x:r.x+r.s/2,y:r.y+r.s/2,s:r.s,t0:now,kind:"merge"});
+    pushEvent("merge", `4 cells merged → ${token(p)}`);
+  } else if(op.op==="Place"){ model.add(op.cell); if(op.node) model.hosts.set(token(op.cell),op.node); }
+  else if(op.op==="Migrate"){ if(op.to) model.hosts.set(token(op.cell),op.to);
+    pushEvent("migrate", `${token(op.cell)} migrated → ${shortId(op.to)}`); }
+  else if(op.op==="Frontier"){ model.add(op.cell); pushEvent("frontier", `frontier reached ${token(op.cell)} (ring ${ringDistance(op.cell)})`); }
+}
+function applyLoad(f){ const c=typeof f.cell==="string"?parseToken(f.cell):f.cell;
+  model.loads.set(token(c), {players:f.players|0, entities:f.entities|0, tick:f.tick_p99_us|0, bw:f.bandwidth_bps|0}); }
+
+function heat(tok){
+  const l=model.loads.get(tok); if(!l) return 0;
+  const p=l.players/150, t=l.tick/35000, b=l.bw/12000000;
+  return Math.min(Math.max(p,t,b),1.0);
+}
+function pushEvent(kind,text){ model.events.unshift({kind,text,t:Date.now()}); model.events.length=Math.min(model.events.length,40); renderFeed(); }
+function shortId(s){ return s?String(s).slice(0,8):"?"; }
+
+//=================================================================================================
+// Sources — LIVE (ce-serve bridge / in-tab peer) and DEMO (a believable synthetic galaxy).
+//=================================================================================================
+const TOPIC_SHAPE="ce-game/spacegame/galaxy";
+async function liveSource(){
+  const node=globalThis.__ceNode; if(!node||typeof node.stream!=="function") return false;
+  document.getElementById("src").textContent="live mesh";
+  try{ await node.request("POST","/mesh/subscribe",{body:{topic:TOPIC_SHAPE}}); }catch(_){}
+  (async()=>{ for(;;){ try{ for await (const chunk of node.stream("/mesh/messages/stream")){
+    let m; try{ m=JSON.parse(chunk); }catch(_){ continue; }
+    const payload = decodeHexJson(m.payload_hex); if(!payload) continue;
+    if(m.topic===TOPIC_SHAPE && payload.op){ applyShape(payload.op||payload); }
+    else if(m.topic.endsWith("/load")){ applyLoad(payload.load?{cell:payload.cell,...payload.load}:payload); }
+  } }catch(_){} await sleep(500); } })();
+  return true;
+}
+function decodeHexJson(hex){ if(!hex) return null; try{ const b=new Uint8Array(hex.length/2);
+  for(let i=0;i<b.length;i++) b[i]=parseInt(hex.substr(i*2,2),16);
+  return JSON.parse(new TextDecoder().decode(b)); }catch(_){ return null; } }
+
+// DEMO: grow a galaxy that breathes — hotspots draw crowds (load rises → split), quiet cells cool
+// (→ merge), and explorers push the frontier outward. Same applyShape/applyLoad as the live path.
+let demoHotspots=[];
+function demoStep(){
+  const leaves=[...model.leaves.values()];
+  // Drift a few wandering "crowds" that heat the cells they're over.
+  if(demoHotspots.length<5 && Math.random()<0.04){
+    demoHotspots.push({x:0.5+(Math.random()-0.5)*0.3, y:0.5+(Math.random()-0.5)*0.3,
+      vx:(Math.random()-0.5)*0.004, vy:(Math.random()-0.5)*0.004, life:300+Math.random()*400, pop:40+Math.random()*180});
+  }
+  demoHotspots=demoHotspots.filter(h=>{ h.x+=h.vx; h.y+=h.vy; h.life--;
+    h.x=Math.min(0.98,Math.max(0.02,h.x)); h.y=Math.min(0.98,Math.max(0.02,h.y)); return h.life>0; });
+  // Apply load: a cell's players ≈ sum of nearby hotspots' pop, with jitter.
+  for(const c of leaves){ const r=cellNorm(c); const cx=r.x+r.s/2, cy=r.y+r.s/2;
+    let pop=0; for(const h of demoHotspots){ const d=Math.hypot(h.x-cx,h.y-cy); if(d<r.s*1.5) pop+=h.pop*(1-d/(r.s*1.5)); }
+    pop*= (0.8+Math.random()*0.4);
+    applyLoad({cell:c, players:Math.round(pop), entities:Math.round(pop*22), tick_p99_us:Math.round(pop*240), bandwidth_bps:Math.round(pop*90000)});
+  }
+  // Split the hottest over-threshold leaf; merge a cold sibling-set; advance the frontier occasionally.
+  let hottest=null,hv=0; for(const c of leaves){ const h=heat(token(c)); if(h>hv){hv=h; hottest=c;} }
+  if(hottest && hv>0.85 && hottest.depth<14 && Math.random()<0.5){
+    const kids=children(hottest); applyShape({op:"Split", cell:hottest, children:kids,
+      place_on:kids.map(()=>"node"+(1+Math.floor(Math.random()*8)))}); }
+  if(Math.random()<0.03){ // merge a cold quartet
+    for(const c of leaves){ if(c.depth>0){ const sibs=children(c.depth>0?{depth:c.depth-1,x:c.x>>1,y:c.y>>1}:c);
+      if(sibs.every(s=>model.leaves.has(token(s)) && heat(token(s))<0.12)){ applyShape({op:"Merge", parent:{depth:c.depth-1,x:c.x>>1,y:c.y>>1}, place_on:"node"+(1+Math.floor(Math.random()*8))}); break; } } } }
+  if(Math.random()<0.06){ // frontier push: chart a new edge cell near an existing one
+    const c=leaves[Math.floor(Math.random()*leaves.length)]; if(c){ const k=children(c)[Math.floor(Math.random()*4)];
+      if(!model.leaves.has(token(k))) applyShape({op:"Frontier", cell:k}); } }
+  // seed hosts for cells that lack one
+  for(const c of leaves){ const t=token(c); if(!model.hosts.has(t)) model.hosts.set(t,"node"+(1+(hash32(t)%8))); }
+}
+
+//=================================================================================================
+// Render — the starfield, the breathing quadtree, split/merge pulses, the frontier glow.
+//=================================================================================================
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+let W=0,H=0,DPR=1; function resize(){ DPR=Math.min(devicePixelRatio||1,2); W=cv.width=innerWidth*DPR; H=cv.height=innerHeight*DPR; }
+addEventListener("resize",resize); resize();
+
+// Camera maps a square sub-region of [0,1]^2 to the screen; auto-follows the active region.
+const cam={cx:0.5,cy:0.5,scale:Math.min(W,H)*0.82, tcx:0.5,tcy:0.5,tscale:Math.min(W,H)*0.82};
+function worldToScreen(x,y){ return [ (x-cam.cx)*cam.scale + W/2, (y-cam.cy)*cam.scale + H/2 ]; }
+let userMoved=false;
+function autoFit(){ if(userMoved) return; const ls=[...model.leaves.values()]; if(!ls.length) return;
+  let minx=1,miny=1,maxx=0,maxy=0; for(const c of ls){ const r=cellNorm(c); minx=Math.min(minx,r.x); miny=Math.min(miny,r.y); maxx=Math.max(maxx,r.x+r.s); maxy=Math.max(maxy,r.y+r.s); }
+  const pad=0.12, w=(maxx-minx)*(1+pad), h=(maxy-miny)*(1+pad);
+  cam.tcx=(minx+maxx)/2; cam.tcy=(miny+maxy)/2; cam.tscale=Math.min(W/Math.max(w,1e-3),H/Math.max(h,1e-3))*0.92; }
+
+const stars=[...Array(280)].map(()=>({x:Math.random(),y:Math.random(),z:Math.random()*0.7+0.3}));
+function heatColor(h){ // cool blue → cyan → gold → hot white
+  const stops=[[27,59,107],[47,143,214],[75,224,192],[255,210,63],[255,107,61],[255,255,255]];
+  const t=Math.min(Math.max(h,0),1)*(stops.length-1); const i=Math.floor(t), f=t-i;
+  const a=stops[i], b=stops[Math.min(i+1,stops.length-1)];
+  return `rgb(${a[0]+(b[0]-a[0])*f|0},${a[1]+(b[1]-a[1])*f|0},${a[2]+(b[2]-a[2])*f|0})`;
+}
+
+function draw(){
+  cam.cx+=(cam.tcx-cam.cx)*0.08; cam.cy+=(cam.tcy-cam.cy)*0.08; cam.scale+=(cam.tscale-cam.scale)*0.08;
+  ctx.fillStyle="#03060e"; ctx.fillRect(0,0,W,H);
+  // starfield (parallax to camera)
+  for(const s of stars){ const sx=((s.x-cam.cx*0.03)%1+1)%1*W, sy=((s.y-cam.cy*0.03)%1+1)%1*H;
+    ctx.fillStyle=`rgba(150,180,230,${0.12+s.z*0.25})`; ctx.fillRect(sx,sy,DPR*s.z,DPR*s.z); }
+
+  const now=performance.now();
+  // cells
+  for(const c of model.leaves.values()){ const r=cellNorm(c); const [sx,sy]=worldToScreen(r.x,r.y); const sw=r.s*cam.scale;
+    if(sx+sw<0||sy+sw<0||sx>W||sy>H||sw<1.2) continue;
+    const tok=token(c); const h=heat(tok); const base=danger(c);
+    // fill: faint danger tint, brighter with heat
+    ctx.fillStyle = h>0.02 ? heatColor(h) : `rgba(${30+base*40|0},${50},${90-base*30|0},0.10)`;
+    ctx.globalAlpha = h>0.02 ? 0.10+h*0.5 : 1; ctx.fillRect(sx,sy,sw,sw); ctx.globalAlpha=1;
+    // border glow scales with heat
+    ctx.lineWidth=DPR*(0.5+h*1.5); ctx.strokeStyle = h>0.3?heatColor(h):"rgba(120,170,255,0.22)";
+    ctx.shadowColor=heatColor(h); ctx.shadowBlur=h>0.4? h*16*DPR:0; ctx.strokeRect(sx,sy,sw,sw); ctx.shadowBlur=0;
+    // frontier edge: a charted cell bordering the void glows green on those edges
+    if(sw>14){ ctx.strokeStyle="rgba(185,255,122,0.5)"; ctx.lineWidth=DPR;
+      for(const [nx,ny,ex,ey,ox,oy] of edges(c)){ if(!neighborCharted(c,ox,oy)){ const [a,b]=worldToScreen(nx,ny),[d,e]=worldToScreen(ex,ey);
+        ctx.beginPath(); ctx.moveTo(a,b); ctx.lineTo(d,e); ctx.stroke(); } } }
+    // label host + players when zoomed in
+    if(sw>54){ const l=model.loads.get(tok); ctx.fillStyle="rgba(220,233,247,0.8)"; ctx.font=`${10*DPR}px ui-monospace,monospace`;
+      ctx.fillText(`${shortId(model.hosts.get(tok))}`, sx+4*DPR, sy+13*DPR);
+      if(l&&l.players) ctx.fillText(`${l.players}p`, sx+4*DPR, sy+25*DPR); }
+  }
+  // pulses (split = expanding ring, merge = imploding)
+  model.pulses=model.pulses.filter(p=>now-p.t0<900);
+  for(const p of model.pulses){ const k=(now-p.t0)/900; const [cx,cy]=worldToScreen(p.x,p.y);
+    const rad = p.kind==="split" ? p.s*cam.scale*(0.4+k*1.3) : p.s*cam.scale*(1.2-k);
+    ctx.strokeStyle = p.kind==="split" ? `rgba(122,240,255,${(1-k)*0.9})` : `rgba(255,178,122,${(1-k)*0.9})`;
+    ctx.lineWidth=DPR*2*(1-k); ctx.beginPath(); ctx.arc(cx,cy,Math.max(rad,1),0,7); ctx.stroke(); }
+
+  updateHud();
+  requestAnimationFrame(draw);
+}
+function edges(c){ const r=cellNorm(c); return [
+  [r.x,r.y,r.x+r.s,r.y, 0,-1],[r.x,r.y+r.s,r.x+r.s,r.y+r.s, 0,1],
+  [r.x,r.y,r.x,r.y+r.s, -1,0],[r.x+r.s,r.y,r.x+r.s,r.y+r.s, 1,0]]; }
+function neighborCharted(c,ox,oy){ const max=1<<c.depth; const nx=c.x+ox, ny=c.y+oy;
+  if(nx<0||ny<0||nx>=max||ny>=max) return true; // edge of addressable space = not frontier
+  // charted if that neighbour (or any ancestor) is a live leaf
+  let d=c.depth,x=nx,y=ny; while(d>=0){ if(model.leaves.has(`${d}.${x}.${y}`)) return true; d--; x>>=1; y>>=1; } return false; }
+
+function updateHud(){
+  const cells=[...model.leaves.values()];
+  let players=0,maxd=0,maxring=0; const hosts=new Set();
+  for(const c of cells){ const l=model.loads.get(token(c)); if(l) players+=l.players; maxd=Math.max(maxd,c.depth);
+    maxring=Math.max(maxring,ringDistance(c)); const hh=model.hosts.get(token(c)); if(hh) hosts.add(hh); }
+  set("s-cells",cells.length); set("s-players",players.toLocaleString()); set("s-hosts",hosts.size);
+  set("s-depth",maxd); set("s-ring",maxring);
+}
+function set(id,v){ document.getElementById(id).textContent=v; }
+function renderFeed(){ const el=document.getElementById("events");
+  el.innerHTML=model.events.slice(0,14).map(e=>`<div class="ev"><span class="t">${ago(e.t)}</span> <span class="${e.kind}">${e.text}</span></div>`).join(""); }
+function ago(t){ const s=((Date.now()-t)/1000)|0; return s<1?"now":s+"s"; }
+
+//=================================================================================================
+// Interaction + boot.
+//=================================================================================================
+let paused=false, drag=null;
+cv.addEventListener("wheel",e=>{ e.preventDefault(); userMoved=true; const f=Math.exp(-e.deltaY*0.001);
+  cam.tscale*=f; cam.scale*=f; },{passive:false});
+cv.addEventListener("pointerdown",e=>{ drag={x:e.clientX,y:e.clientY}; userMoved=true; });
+addEventListener("pointermove",e=>{ if(drag){ cam.tcx-=(e.clientX-drag.x)*DPR/cam.scale; cam.tcy-=(e.clientY-drag.y)*DPR/cam.scale;
+    cam.cx=cam.tcx; cam.cy=cam.tcy; drag={x:e.clientX,y:e.clientY}; }
+  const t=document.getElementById("tip"); const wx=(e.clientX*DPR-W/2)/cam.scale+cam.cx, wy=(e.clientY*DPR-H/2)/cam.scale+cam.cy;
+  const c=leafAt(wx,wy); if(c){ const tok=token(c),l=model.loads.get(tok);
+    t.style.display="block"; t.style.left=(e.clientX+14)+"px"; t.style.top=(e.clientY+14)+"px";
+    t.innerHTML=`<b>${tok}</b> · ${biomeOf(c)}<br>host ${shortId(model.hosts.get(tok))} · ring ${ringDistance(c)}<br>`+
+      `players ${l?l.players:0} · danger ${(danger(c)*100|0)}%`; } else t.style.display="none"; });
+addEventListener("pointerup",()=>drag=null);
+function leafAt(wx,wy){ for(const c of model.leaves.values()){ const r=cellNorm(c);
+  if(wx>=r.x&&wx<r.x+r.s&&wy>=r.y&&wy<r.y+r.s) return c; } return null; }
+document.getElementById("pause").onclick=e=>{ paused=!paused; e.target.textContent=paused?"play":"pause"; };
+document.getElementById("fit").onclick=()=>{ userMoved=false; autoFit(); };
+
+(async function boot(){
+  genesis();
+  const live = await liveSource().catch(()=>false);
+  if(!live){ // demo galaxy
+    setInterval(()=>{ if(!paused) demoStep(); }, 220);
+    // a couple of immediate splits so it opens mid-bloom
+    for(let i=0;i<3;i++) demoStep();
+  }
+  setInterval(autoFit, 600);
+  setInterval(renderFeed, 1000);
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>

@@ -44,7 +44,21 @@ desktop-browser / mobile-browser clients connect efficiently across all of it.
   **beam**, gated **pulse**, fan-firing **scatter**, and long-range **beam lance**. Hitscan weapons
   honour count/spread, so new fan/multi-shot variants are pure ruleset data. Add or re-balance weapons
   by editing the ruleset — no redeploy.
-- **Tech tree** unlocks weapons and upgrades (hull / thrusters / guns), server-priced and gated.
+  Newer ordnance is pure ruleset data too: **proximity mines** and a **mine layer** (real drifting
+  entities that arm then detonate on a nearing enemy), a **flak cannon** (bursting AoE point defence),
+  an **arc coil** (chain lightning that forks between clustered enemies), an **EMP torpedo**, a
+  **cluster missile** (splits into submunitions), a **tractor beam** (pins/slows) and a **disruptor**.
+- **Shields, energy and status effects:** ships carry a regenerating **shield** that soaks damage before
+  hull and an **energy capacitor** that gates heavy weapons; weapons can stamp **EMP / burn / slow /
+  stasis / overcharge** effects. Shields/energy are unlock-gated (the classic arena is unchanged until
+  you buy the tech) and snapshot-/hash-safe.
+- **Living galaxy:** every sector grows deterministic **gravity wells** (planets, stars, black holes
+  with lethal event horizons) and **nebula** cover that bend ships and shots — each sector its own solar
+  system. The home sector `(0,0)` is a calm spawn.
+- **Loot:** a destroyed player drops a powerup (repair / shield / energy / overcharge / minerals) worth
+  diving for.
+- **Tech tree** unlocks weapons and upgrades (hull / thrusters / guns / **shields** / **energy**),
+  server-priced and gated.
 - **Infinite map:** a ship that crosses a sector edge is *handed off* to the neighbouring sector
   (cross-sector transit), carrying its full loadout — one continuous galaxy, not walled arenas.
 - **Ship↔ship collision physics** keep ships from stacking.
@@ -55,9 +69,12 @@ desktop-browser / mobile-browser clients connect efficiently across all of it.
 - **Hot reload:** weapons, items, tech tree, tunables and even **frontend shaders** can be changed
   *while people are playing* and the change reaches every host and client across the mesh instantly.
 
-The frontend (`web/demos/spacegame/`) talks to these backends **only over the CE mesh**, through the
+The frontends (the sibling crates `../spacegame-render` shared renderer, `../spacegame-wasm` browser
+client, `../spacegame-native` desktop app) talk to these backends **only over the CE mesh**, through the
 same-origin node bridge (`window.__ceNode` if an in-browser WASM node is present, else the same-origin
-`/ce` proxy). It never contacts `ce-net.com`, `/db`, `/rt`, or any remote origin.
+`/ce` proxy). It never contacts `ce-net.com`, `/db`, `/rt`, or any remote origin. Spacegame ships as its
+own first-class app — backend host + browser client deployed via [`deploy/`](deploy/) and served at
+`spacegame.ce-net.com`, not as a `web/demos/` page.
 
 ---
 
@@ -74,6 +91,11 @@ src/
   physics.rs      advanced 2D rigid-body engine (mass, inertia, restitution, friction, angular impulse)
                   with level-of-detail precision: high framerate near players, coarse far away. GPU/SoA-
                   friendly so replicas stay bit-identical across CPU and GPU.
+  effects.rs      status effects (EMP / burn / slow / stasis / overcharge) as a per-ship StatusStack:
+                  deterministic stacking (stronger+longer wins), tick-based expiry, hashed for agreement.
+  hazard.rs       deterministic per-sector environmental field: gravity wells (planet/star/black hole)
+                  that bend ships AND projectiles + lethal event horizons, plus nebula drag/cover. Grown
+                  from the sector coordinate (zero shared state); the home sector (0,0) is calm.
   faction.rs      your always-alive faction: factories, resources, tech, an autonomous build policy that
                   spends your resources for you, and a roster that becomes a real NPC fleet (drones/
                   fighters/haulers) you command (sim drives their AI; FactionView tracks them).
@@ -121,7 +143,7 @@ cargo build                           # the full mesh backend + `spacegame` bina
 The pure SDK + integration suite (`tests/physics.rs`, `tests/combat.rs`, `tests/systems.rs`) is **green**
 (153 tests: rigid-body physics, all weapons, missile AoE/destruction, NPC fleets, transit, hot reload,
 replica agreement, snapshot determinism, build/procgen/one-ship-mesh). A frontend embeds the SDK with
-`default-features = false` (see `web/spacegame-wasm/`).
+`default-features = false` (see `../spacegame-wasm/`).
 
 ---
 

@@ -105,6 +105,20 @@ pub struct ShipView {
     pub a: i32,
     pub hp: i32,
     pub max_hp: i32,
+    /// Shield buffer + capacity (`max_shield == 0` => an unshielded ship; the HUD hides the bar).
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    /// Energy capacitor charge + capacity (rounded to ints for the wire).
+    #[serde(default)]
+    pub energy: i32,
+    #[serde(default)]
+    pub max_energy: i32,
+    /// Codes of the status effects currently active on this ship (see [`crate::effects::StatusKind::code`]):
+    /// `0 = emp, 1 = burn, 2 = slow, 3 = stasis, 4 = overcharge`. The HUD draws an icon per code.
+    #[serde(default)]
+    pub effects: Vec<u8>,
     pub minerals: u32,
     pub kills: u32,
     pub guns: u32,
@@ -159,7 +173,8 @@ pub struct BulletView {
     pub homing: bool,
 }
 
-/// One beam a hitscan weapon emitted this tick (railgun shot / laser sweep), for the renderer.
+/// One beam a hitscan weapon emitted this tick (railgun shot / laser sweep / lightning arc), for the
+/// renderer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BeamView {
     pub x0: i32,
@@ -167,7 +182,30 @@ pub struct BeamView {
     pub x1: i32,
     pub y1: i32,
     pub hue: u32,
-    /// `0` = railgun, `1` = laser.
+    /// `0` = railgun, `1` = laser, `2` = arc / chain lightning.
+    pub kind: u8,
+}
+
+/// One deployed proximity mine in a snapshot, for the renderer to draw (and pulse once armed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MineView {
+    pub x: i32,
+    pub y: i32,
+    pub hue: u32,
+    /// Trigger radius (so the client can hint the danger zone).
+    pub r: i32,
+    /// Whether the mine is live (armed) yet.
+    pub armed: bool,
+}
+
+/// One floating pickup in a snapshot, for the renderer to draw a loot icon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PickupView {
+    pub x: i32,
+    pub y: i32,
+    pub hue: u32,
+    /// Pickup kind code (see [`crate::sim::PickupKind::code`]):
+    /// `0 = repair, 1 = shield, 2 = energy, 3 = overcharge, 4 = minerals`.
     pub kind: u8,
 }
 
@@ -219,6 +257,12 @@ pub struct Snapshot {
     /// Missile detonations this tick.
     #[serde(default)]
     pub explosions: Vec<ExplosionView>,
+    /// Deployed proximity mines in this sector.
+    #[serde(default)]
+    pub mines: Vec<MineView>,
+    /// Floating powerup pickups in this sector.
+    #[serde(default)]
+    pub pickups: Vec<PickupView>,
     /// Rigid-body wreckage drifting in this sector.
     #[serde(default)]
     pub debris: Vec<DebrisView>,
@@ -332,6 +376,11 @@ mod tests {
                 a: 157,
                 hp: 80,
                 max_hp: 100,
+                shield: 40,
+                max_shield: 60,
+                energy: 72,
+                max_energy: 100,
+                effects: vec![2, 4],
                 minerals: 35,
                 kills: 2,
                 guns: 3,
@@ -344,6 +393,8 @@ mod tests {
             bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],
             beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
             explosions: vec![ExplosionView { x: 50, y: 50, r: 80, hue: 20 }],
+            mines: vec![MineView { x: 700, y: 700, hue: 40, r: 150, armed: true }],
+            pickups: vec![PickupView { x: 900, y: 200, hue: 200, kind: 1 }],
             debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
             factions: vec![FactionView {
                 owner: "p1".into(),

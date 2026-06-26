@@ -138,6 +138,11 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         a: (s.a * 100.0).round() as i32,
         hp: s.hp,
         max_hp: s.max_hp,
+        shield: s.shield,
+        max_shield: s.max_shield,
+        energy: s.energy.round() as i32,
+        max_energy: s.max_energy.round() as i32,
+        effects: s.effects.effects.iter().map(|e| e.kind.code()).collect(),
         minerals: s.minerals,
         kills: s.kills,
         guns: s.guns,
@@ -147,6 +152,35 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         role: role_str(s.role).to_string(),
         alive: s.alive,
     }
+}
+
+/// Mine views for a snapshot (optionally filtered to a viewport).
+fn mine_views(sim: &crate::sim::Sim, filter: Option<&Aabb>) -> Vec<crate::wire::MineView> {
+    sim.mines
+        .iter()
+        .filter(|m| filter.map(|f| f.contains_point(m.x, m.y)).unwrap_or(true))
+        .map(|m| crate::wire::MineView {
+            x: m.x.round() as i32,
+            y: m.y.round() as i32,
+            hue: m.hue,
+            r: m.trigger.round() as i32,
+            armed: sim.tick >= m.arm_at,
+        })
+        .collect()
+}
+
+/// Pickup views for a snapshot (optionally filtered to a viewport).
+fn pickup_views(sim: &crate::sim::Sim, filter: Option<&Aabb>) -> Vec<crate::wire::PickupView> {
+    sim.pickups
+        .iter()
+        .filter(|p| filter.map(|f| f.contains_point(p.x, p.y)).unwrap_or(true))
+        .map(|p| crate::wire::PickupView {
+            x: p.x.round() as i32,
+            y: p.y.round() as i32,
+            hue: p.hue,
+            kind: p.kind.code(),
+        })
+        .collect()
 }
 
 /// Build the full wire snapshot for a sector's current authoritative state (every entity). Used for
@@ -199,6 +233,9 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         })
         .collect();
 
+    let mines = mine_views(sim, None);
+    let pickups = pickup_views(sim, None);
+
     let depleted = sim.depleted_cells().into_iter().map(|(cx, cy, _)| [cx, cy]).collect();
 
     let kills = sim
@@ -216,6 +253,8 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         bullets,
         beams,
         explosions,
+        mines,
+        pickups,
         debris,
         factions: faction_views(sim),
         depleted,
@@ -304,6 +343,9 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         .map(|(cx, cy, _)| [cx, cy])
         .collect();
 
+    let mines = mine_views(sim, Some(&pad));
+    let pickups = pickup_views(sim, Some(&pad));
+
     let kills = sim
         .kill_feed
         .iter()
@@ -319,6 +361,8 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         bullets,
         beams,
         explosions,
+        mines,
+        pickups,
         debris,
         factions: faction_views(sim),
         depleted,

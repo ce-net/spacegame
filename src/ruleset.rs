@@ -31,6 +31,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::effects::StatusKind;
 use crate::build::{
     Blueprint, BpParam, Catalog, ObjectCategory, ObjectDef, ObjectStats, Placement, Repeat, Transform2D,
 };
@@ -58,6 +59,18 @@ pub enum WeaponKind {
     /// first ship within `range` along the heading and emits a short beam. Low per-tick damage, near-
     /// zero `cooldown` — a sustained DPS weapon.
     Laser,
+    /// **Proximity mine layer.** Each pull deploys `count` mines *behind* the ship that arm after
+    /// `arm_ticks` and then detonate (AoE, `damage`, radius from the payload) when an enemy enters
+    /// `range`. Area denial — drop a field and lead a chaser into it.
+    Mine,
+    /// **Flak burst.** Fires `count` shells along the heading that detonate in mid-air after `ttl`
+    /// (or on contact), each bursting into an area blast. Point-defence: walks a wall of shrapnel into
+    /// a missile swarm or a fleet of drones.
+    Flak,
+    /// **Arc / chain lightning.** An instant bolt that strikes the nearest enemy within `range`, then
+    /// *chains* to up to `chain` further enemies within `range` of each previous hit, the damage
+    /// decaying each jump. A lightning beam (`kind = 2`) is drawn for every segment.
+    Arc,
 }
 
 /// One weapon in the catalogue. All combat numbers are data so they can be tuned live.
@@ -86,6 +99,38 @@ pub struct WeaponDef {
     pub turn_rate: f32,
     /// Visual hue offset the frontend may apply to this weapon's shots/beam.
     pub hue_shift: i32,
+    /// **Energy** drawn from the ship's capacitor per trigger pull. `0` (the default) = a free weapon
+    /// that anyone can fire forever (the classic blaster). Heavy weapons gate on the capacitor, so a
+    /// ship can't fire its railgun and its lance at the same instant. Defaults to `0` so a hand-edited
+    /// or legacy ruleset plays unchanged.
+    #[serde(default)]
+    pub energy_cost: f32,
+    /// An optional **status effect applied to every ship this weapon hits** (EMP, burn, slow, stasis).
+    /// `None` (the default) = a plain-damage weapon. This is how an EMP torpedo or a disruptor is pure
+    /// hot-reloadable data.
+    #[serde(default)]
+    pub effect: Option<OnHitEffect>,
+    /// **Cluster submunitions.** If `> 0`, when this weapon's round detonates it spawns this many
+    /// child blast rounds in a ring — a cluster missile. `0` (default) = no split.
+    #[serde(default)]
+    pub submunitions: u32,
+    /// **Mine arming delay**, ticks before a deployed mine becomes live ([`WeaponKind::Mine`]).
+    #[serde(default)]
+    pub arm_ticks: u64,
+    /// **Chain jumps** for [`WeaponKind::Arc`] — how many additional enemies the bolt leaps to.
+    #[serde(default)]
+    pub chain: u32,
+}
+
+/// A status effect a weapon stamps onto everything it hits — the hot-reloadable data form of "this gun
+/// also EMPs / burns / slows / locks the target". Resolved against [`crate::effects`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OnHitEffect {
+    pub kind: StatusKind,
+    /// Duration in ticks the effect lasts on a hit target.
+    pub ticks: u64,
+    /// Effect strength (burn dmg/tick, slow fraction, stasis bleed, overcharge bonus).
+    pub magnitude: f32,
 }
 
 impl WeaponDef {
@@ -106,6 +151,11 @@ impl WeaponDef {
             spread: 0.0,
             turn_rate: 0.0,
             hue_shift: 0,
+            energy_cost: 0.0,
+            effect: None,
+            submunitions: 0,
+            arm_ticks: 0,
+            chain: 0,
         }
     }
 }
@@ -122,6 +172,13 @@ pub enum TechEffect {
     AddThruster { levels: u32 },
     /// Add blaster barrels (the legacy multi-gun spread), capped by [`Tunables::max_guns`].
     AddGun { count: u32 },
+    /// **Install / reinforce a shield capacitor** — adds to the ship's max shield and tops it off. A
+    /// ship with no shield tech takes damage straight to hull (classic feel); buying this grants a
+    /// regenerating buffer that soaks fire and then recharges out of combat.
+    AddShield { amount: i32 },
+    /// **Expand the energy capacitor** — raises max energy (and refills it), so a ship can sustain its
+    /// heavy weapons (railgun, lance, arc, torpedoes) longer between lulls.
+    AddEnergy { amount: f32 },
 }
 
 /// One node of the **tech tree**. A node is buyable with minerals once its `requires` prerequisites
@@ -169,10 +226,38 @@ pub struct Tunables {
     /// faction can impose; excess roster units wait until a slot frees).
     #[serde(default = "default_max_fleet")]
     pub max_fleet: u32,
+    /// **Shield** buffer a ship spawns with, before any shield tech. `0` (the default) preserves the
+    /// classic damage-to-hull arena; raise it for a shielded meta.
+    #[serde(default)]
+    pub base_shield: i32,
+    /// Shield points regenerated per tick once regen resumes.
+    #[serde(default = "default_shield_regen")]
+    pub shield_regen: f32,
+    /// Ticks a ship's shield must go un-hit before it begins regenerating.
+    #[serde(default = "default_shield_delay")]
+    pub shield_delay: u64,
+    /// **Energy** capacitor a ship spawns with — the pool heavy weapons draw from.
+    #[serde(default = "default_base_energy")]
+    pub base_energy: f32,
+    /// Energy regenerated per tick.
+    #[serde(default = "default_energy_regen")]
+    pub energy_regen: f32,
 }
 
 fn default_max_fleet() -> u32 {
     24
+}
+fn default_shield_regen() -> f32 {
+    0.8
+}
+fn default_shield_delay() -> u64 {
+    90
+}
+fn default_base_energy() -> f32 {
+    100.0
+}
+fn default_energy_regen() -> f32 {
+    1.5
 }
 
 impl Default for Tunables {
@@ -190,6 +275,11 @@ impl Default for Tunables {
             max_guns: 5,
             ship_push: 0.5,
             max_fleet: 24,
+            base_shield: 0,
+            shield_regen: 0.8,
+            shield_delay: 90,
+            base_energy: 100.0,
+            energy_regen: 1.5,
         }
     }
 }
@@ -273,6 +363,7 @@ impl Ruleset {
                     spread: 0.12,
                     turn_rate: 0.0,
                     hue_shift: 0,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     id: "missile".into(),
@@ -287,6 +378,7 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.08,
                     hue_shift: 20,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     id: "railgun".into(),
@@ -301,6 +393,8 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 200,
+                    energy_cost: 34.0,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     id: "laser".into(),
@@ -315,6 +409,8 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 320,
+                    energy_cost: 1.5,
+                    ..WeaponDef::fallback()
                 },
                 // --- homing missile launchers ---
                 WeaponDef {
@@ -331,6 +427,7 @@ impl Ruleset {
                     spread: 0.5,
                     turn_rate: 0.09,
                     hue_shift: 12,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     // A single heavy seeker: slow, hard-turning, hits like a truck.
@@ -346,6 +443,7 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.13,
                     hue_shift: 350,
+                    ..WeaponDef::fallback()
                 },
                 // --- laser weapon types ---
                 WeaponDef {
@@ -362,6 +460,8 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 290,
+                    energy_cost: 8.0,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     // Scatter laser: a fan of short beams — devastating up close, weak at range.
@@ -377,6 +477,8 @@ impl Ruleset {
                     spread: 0.32,
                     turn_rate: 0.0,
                     hue_shift: 260,
+                    energy_cost: 4.0,
+                    ..WeaponDef::fallback()
                 },
                 WeaponDef {
                     // Lance: a long, slow, high-damage focused beam pulse.
@@ -392,6 +494,160 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 180,
+                    energy_cost: 30.0,
+                    ..WeaponDef::fallback()
+                },
+                // --- proximity mines ---
+                WeaponDef {
+                    // Drops a single armed proximity mine behind the ship. Detonates on an enemy nearing
+                    // it; great for shaking a pursuer or seeding a choke point.
+                    id: "mine".into(),
+                    name: "Proximity Mine".into(),
+                    kind: WeaponKind::Mine,
+                    cooldown: 22,
+                    damage: 60,
+                    speed: 4.0,   // small drift away from the ship as it's dropped
+                    ttl: 900,     // mines linger ~45s at 20Hz before going inert
+                    range: 150.0, // proximity trigger radius
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.0,
+                    hue_shift: 40,
+                    energy_cost: 12.0,
+                    arm_ticks: 16,
+                    ..WeaponDef::fallback()
+                },
+                WeaponDef {
+                    // A wider, cheaper field: three mines fanned out behind the ship — area denial.
+                    id: "mine-field".into(),
+                    name: "Mine Layer".into(),
+                    kind: WeaponKind::Mine,
+                    cooldown: 50,
+                    damage: 42,
+                    speed: 5.0,
+                    ttl: 1100,
+                    range: 130.0,
+                    count: 3,
+                    spread: 0.9,
+                    turn_rate: 0.0,
+                    hue_shift: 50,
+                    energy_cost: 24.0,
+                    arm_ticks: 16,
+                    ..WeaponDef::fallback()
+                },
+                // --- flak / point defence ---
+                WeaponDef {
+                    // A burst of shells that detonate downrange into AoE shrapnel — clears drones and
+                    // catches missiles. Honours count/spread for a wide curtain.
+                    id: "flak".into(),
+                    name: "Flak Cannon".into(),
+                    kind: WeaponKind::Flak,
+                    cooldown: 14,
+                    damage: 22,
+                    speed: 20.0,
+                    ttl: 24,   // detonates ~480 units downrange
+                    range: 0.0,
+                    count: 3,
+                    spread: 0.22,
+                    turn_rate: 0.0,
+                    hue_shift: 30,
+                    energy_cost: 9.0,
+                    ..WeaponDef::fallback()
+                },
+                // --- arc / chain lightning ---
+                WeaponDef {
+                    // An instant bolt that forks between clustered enemies, decaying each jump. Murders
+                    // a tight fleet; wasteful on a lone target.
+                    id: "arc".into(),
+                    name: "Arc Coil".into(),
+                    kind: WeaponKind::Arc,
+                    cooldown: 26,
+                    damage: 30,
+                    speed: 0.0,
+                    ttl: 0,
+                    range: 460.0, // acquire + per-jump reach
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.0,
+                    hue_shift: 210,
+                    energy_cost: 22.0,
+                    chain: 3,
+                    ..WeaponDef::fallback()
+                },
+                // --- effect ordnance (status weapons, pure ruleset data) ---
+                WeaponDef {
+                    // EMP torpedo: a slow seeker whose blast EMPs everything caught — disables drives,
+                    // triggers and shield regen for a few seconds. Low direct damage; huge control.
+                    id: "emp-torpedo".into(),
+                    name: "EMP Torpedo".into(),
+                    kind: WeaponKind::Homing,
+                    cooldown: 80,
+                    damage: 12,
+                    speed: 12.0,
+                    ttl: 150,
+                    range: 0.0,
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.07,
+                    hue_shift: 150,
+                    energy_cost: 40.0,
+                    effect: Some(OnHitEffect { kind: StatusKind::Emp, ticks: 90, magnitude: 1.0 }),
+                    ..WeaponDef::fallback()
+                },
+                WeaponDef {
+                    // Cluster missile: a seeker that splits into a ring of submunition blasts on impact.
+                    id: "cluster-missile".into(),
+                    name: "Cluster Missile".into(),
+                    kind: WeaponKind::Homing,
+                    cooldown: 60,
+                    damage: 26,
+                    speed: 14.0,
+                    ttl: 120,
+                    range: 0.0,
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.06,
+                    hue_shift: 5,
+                    energy_cost: 36.0,
+                    submunitions: 6,
+                    ..WeaponDef::fallback()
+                },
+                WeaponDef {
+                    // Tractor beam: a continuous beam that pins and slows whatever it touches (no kill
+                    // power of its own). Hold a target in a teammate's firing line.
+                    id: "tractor".into(),
+                    name: "Tractor Beam".into(),
+                    kind: WeaponKind::Laser,
+                    cooldown: 1,
+                    damage: 1,
+                    speed: 0.0,
+                    ttl: 0,
+                    range: 700.0,
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.0,
+                    hue_shift: 100,
+                    energy_cost: 3.0,
+                    effect: Some(OnHitEffect { kind: StatusKind::Stasis, ticks: 6, magnitude: 0.5 }),
+                    ..WeaponDef::fallback()
+                },
+                WeaponDef {
+                    // Disruptor: a fast pulse that slows what it hits — a kiting / zoning sidearm.
+                    id: "disruptor".into(),
+                    name: "Disruptor".into(),
+                    kind: WeaponKind::Projectile,
+                    cooldown: 18,
+                    damage: 8,
+                    speed: 24.0,
+                    ttl: 30,
+                    range: 0.0,
+                    count: 1,
+                    spread: 0.0,
+                    turn_rate: 0.0,
+                    hue_shift: 270,
+                    energy_cost: 10.0,
+                    effect: Some(OnHitEffect { kind: StatusKind::Slow, ticks: 50, magnitude: 0.45 }),
+                    ..WeaponDef::fallback()
                 },
             ],
             tech: vec![
@@ -474,6 +730,85 @@ impl Ruleset {
                     requires: vec!["tech-laser".into(), "tech-railgun".into()],
                     effect: TechEffect::UnlockWeapon { weapon: "lance".into() },
                 },
+                // --- defensive systems: shields + energy (gate the heavy weapons) ---
+                TechNode {
+                    id: "shield-cap".into(),
+                    name: "Shield Capacitor".into(),
+                    cost: 90,
+                    requires: vec![],
+                    effect: TechEffect::AddShield { amount: 60 },
+                },
+                TechNode {
+                    id: "shield-cap-2".into(),
+                    name: "Reinforced Shields".into(),
+                    cost: 160,
+                    requires: vec!["shield-cap".into()],
+                    effect: TechEffect::AddShield { amount: 80 },
+                },
+                TechNode {
+                    id: "energy-cell".into(),
+                    name: "Energy Cell".into(),
+                    cost: 70,
+                    requires: vec![],
+                    effect: TechEffect::AddEnergy { amount: 60.0 },
+                },
+                // --- new weapon unlocks ---
+                TechNode {
+                    id: "tech-mine".into(),
+                    name: "Mine Bay".into(),
+                    cost: 150,
+                    requires: vec![],
+                    effect: TechEffect::UnlockWeapon { weapon: "mine".into() },
+                },
+                TechNode {
+                    id: "tech-mine-field".into(),
+                    name: "Mine Layer".into(),
+                    cost: 260,
+                    requires: vec!["tech-mine".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "mine-field".into() },
+                },
+                TechNode {
+                    id: "tech-flak".into(),
+                    name: "Flak Cannon".into(),
+                    cost: 170,
+                    requires: vec!["twin-guns".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "flak".into() },
+                },
+                TechNode {
+                    id: "tech-arc".into(),
+                    name: "Arc Coil".into(),
+                    cost: 300,
+                    requires: vec!["energy-cell".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "arc".into() },
+                },
+                TechNode {
+                    id: "tech-disruptor".into(),
+                    name: "Disruptor".into(),
+                    cost: 140,
+                    requires: vec![],
+                    effect: TechEffect::UnlockWeapon { weapon: "disruptor".into() },
+                },
+                TechNode {
+                    id: "tech-tractor".into(),
+                    name: "Tractor Beam".into(),
+                    cost: 200,
+                    requires: vec!["tech-laser".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "tractor".into() },
+                },
+                TechNode {
+                    id: "tech-emp-torpedo".into(),
+                    name: "EMP Torpedo".into(),
+                    cost: 340,
+                    requires: vec!["tech-missile".into(), "energy-cell".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "emp-torpedo".into() },
+                },
+                TechNode {
+                    id: "tech-cluster-missile".into(),
+                    name: "Cluster Missile".into(),
+                    cost: 360,
+                    requires: vec!["tech-missile".into()],
+                    effect: TechEffect::UnlockWeapon { weapon: "cluster-missile".into() },
+                },
             ],
             shapes: builtin_shapes(),
             materials: builtin_materials(),
@@ -482,7 +817,11 @@ impl Ruleset {
             blueprints: builtin_blueprints(),
             modules: builtin_modules(),
             grammars: builtin_grammars(),
-            assets: Assets::default(),
+            // Ship a COMPLETE renderer out of the box: the full hot-reloadable WGSL suite (ship PBR,
+            // starfield, nebula, beams, shields, particles, bloom, post) plus the visual-tuning params.
+            // A fresh host therefore serves a finished-looking game with zero extra asset fetches, and
+            // every shader stays live-editable through the same ruleset hot-reload path.
+            assets: crate::shaders::builtin_assets(),
         }
     }
 

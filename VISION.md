@@ -103,3 +103,7 @@ whole ship in one pass, getting its AABB efficiently, and caching it.)
 > using the rust spacegame backend skd
 
 > sdk
+
+### 20 — visual verification + screenshots + native app, web/native coexisting
+
+> Make a system so that you can visually verify it and take screenshots and drive design development. Write a native app to access spacegame locally also - web and browser should coexist and work together seamlessly.

@@ -39,13 +39,16 @@
 pub mod aabb;
 pub mod build;
 pub mod client;
+pub mod effects;
 pub mod faction;
+pub mod hazard;
 pub mod leaderboard;
 pub mod physics;
 pub mod procgen;
 pub mod replication;
 pub mod room;
 pub mod ruleset;
+pub mod shaders;
 pub mod shape;
 pub mod shapedef;
 pub mod shard;
@@ -53,9 +56,35 @@ pub mod sim;
 pub mod snapshot;
 pub mod wire;
 
+// --- The adaptive galaxy: a planet-scale, self-subdividing quadtree of authoritative cells. ---
+// These are pure too (deterministic topology, load verdicts, world generation, elastic-fleet bookkeeping,
+// the leaderless control-plane math). They carry no mesh deps — the live mesh I/O that drives them is in
+// `node` (behind the `mesh` feature). Wiring them here makes the design real, compiled, and unit-tested.
+pub mod autoscale;
+pub mod cell;
+pub mod cloud_hetzner;
+pub mod cosmos;
+pub mod fleet;
+pub mod frontier;
+pub mod galaxy;
+pub mod galaxymap;
+pub mod galaxywire;
+pub mod gateway;
+pub mod orchestrator;
+pub mod partition;
+pub mod spawn;
+pub mod treasury;
+pub mod verify;
+pub mod worldgen;
+
 // --- Mesh I/O (behind the default `mesh` feature; pulls ce-rs/tokio) ---
 #[cfg(feature = "mesh")]
 pub mod director;
+// The live adaptive-galaxy daemon: hosts assigned cells, runs the leaderless controller (observe load →
+// split/merge/place over real `mesh_deploy` + gossiped shape commits), heartbeats the control plane, and
+// serves the browser gateway directory. This is what makes `cosmos`/`orchestrator`/`autoscale` actually run.
+#[cfg(feature = "mesh")]
+pub mod node;
 
 #[cfg(feature = "mesh")]
 use anyhow::{anyhow, Result};
@@ -90,6 +119,17 @@ pub struct SectorConfig {
     pub prewarm_every: u64,
     /// Container image used when this host autoscale-deploys a neighbouring sector cell.
     pub image: String,
+    /// **Adaptive galaxy:** when set, every advertise interval the host writes its measured [`CellLoad`]
+    /// for this cell into the shared sink — so a co-located controller ([`node`]) reads it with no
+    /// round-trip — AND gossips a [`galaxywire::LoadFrame`] on the cell's `/load` topic for remote
+    /// controllers. `None` for the classic fixed-sector path. The cell is parsed from the token
+    /// (`depth.x.y`); ignored when the token isn't a quadtree cell.
+    pub load_sink: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<crate::galaxy::CellId, crate::galaxy::CellLoad>>>>,
+    /// **Adaptive galaxy:** the quadtree cell this host *is*, used for load reporting when it differs from
+    /// (or can't be parsed out of) the play token. The genesis cell, for instance, hosts on the legacy
+    /// `"0_0"` play token (so the shipped client connects unchanged) but reports load as [`CellId::ROOT`].
+    /// `None` falls back to parsing the token (`depth.x.y`).
+    pub cell: Option<crate::galaxy::CellId>,
 }
 #[cfg(feature = "mesh")]
 
@@ -103,6 +143,8 @@ impl Default for SectorConfig {
             seal_every: 600,
             prewarm_every: 0,
             image: "ce-net/spacegame:latest".into(),
+            load_sink: None,
+            cell: None,
         }
     }
 }
@@ -226,6 +268,13 @@ pub async fn run_sector(
 
     let hz = cfg.hz.max(1);
 
+    // ADAPTIVE GALAXY: if this token is a quadtree cell, measure and report its load every advertise
+    // interval — into the shared sink for a co-located controller, and on the cell `/load` topic for
+    // remote ones. This is the only input the autoscaler needs to decide split/merge.
+    let cell_id = cfg.cell.or_else(|| crate::galaxy::CellId::parse(&cfg.sector));
+    let load_topic = cell_id.map(|c| crate::galaxywire::topics::load(&c.token()));
+    let mut tickmeter = crate::cell::TickMeter::new();
+
     // HOT RELOAD: start from the latest published ruleset if one exists, else the built-in default.
     let mut rules: Arc<Ruleset> = match director::adopt_latest_ruleset(ce).await {
         Ok(Some(r)) => {
@@ -248,8 +297,10 @@ pub async fn run_sector(
             sim::Sim::for_sector(sector_id, rules.clone())
         }
     };
-    // Make sure the restored/fresh sim runs the current sector + live ruleset.
+    // Make sure the restored/fresh sim runs the current sector + live ruleset, with this sector's
+    // deterministic hazard field (gravity wells + nebulae) in force.
     sim.sector = sector_id;
+    sim.hazards = crate::hazard::Hazards::for_sector(sector_id);
     sim.apply_ruleset(rules.clone());
     let mut tick_timer = tokio::time::interval(Duration::from_millis((1000 / hz as u64).max(1)));
     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -284,7 +335,9 @@ pub async fn run_sector(
 
                 // Fixed-rate authoritative tick + snapshot broadcast.
                 _ = tick_timer.tick() => {
+                    let tick_t0 = std::time::Instant::now();
                     sim.tick(1.0);
+                    tickmeter.record(tick_t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
 
                     // INFINITE MAP: hand off ships that crossed an edge to their destination sector. If
                     // no host runs that neighbour yet, re-admit the ship at our edge so a solo / not-yet-
@@ -323,6 +376,41 @@ pub async fn run_sector(
                         && let Err(e) = ce.advertise_service(&service).await
                     {
                         tracing::debug!(error = %e, "re-advertise failed (transient)");
+                    }
+
+                    // ADAPTIVE GALAXY: report this cell's honest measured load (players, entity count,
+                    // p99 tick time, outbound bandwidth) so its controller can decide split/merge.
+                    if let Some(cell) = cell_id
+                        && sim.tick.is_multiple_of(cfg.advertise_every)
+                    {
+                        let entities = (snap.ships.len()
+                            + snap.bullets.len()
+                            + snap.beams.len()
+                            + snap.explosions.len()
+                            + snap.mines.len()
+                            + snap.pickups.len()
+                            + snap.debris.len()) as u32;
+                        let load = crate::galaxy::CellLoad {
+                            players: snap.ships.len() as u32,
+                            entities,
+                            tick_p99_us: tickmeter.p99(),
+                            bandwidth_bps: (snap.ships.len() as u64 + 1) * 256 * hz as u64,
+                            epoch: sim.tick,
+                        };
+                        if let Some(sink) = &cfg.load_sink
+                            && let Ok(mut m) = sink.lock()
+                        {
+                            m.insert(cell, load);
+                        }
+                        if let Some(lt) = &load_topic
+                            && let Ok(b) = serde_json::to_vec(&crate::galaxywire::LoadFrame {
+                                cell,
+                                host: host_id.clone(),
+                                load,
+                            })
+                        {
+                            let _ = ce.publish(lt, &b).await;
+                        }
                     }
 
                     // REPLICATION: snapshot off the tick on a clone so blob I/O never stalls the loop.

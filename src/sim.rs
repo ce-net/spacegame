@@ -30,9 +30,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::aabb::{Aabb, AabbTree};
+use crate::effects::{StatusKind, StatusStack};
 use crate::faction::{Faction, FactionCommand, UnitKind};
+use crate::hazard::Hazards;
 use crate::physics::{self, RigidBody, Shape, Vec2};
-use crate::ruleset::{Ruleset, RulesetHandle, TechEffect, Tunables, WeaponKind};
+use crate::ruleset::{OnHitEffect, Ruleset, RulesetHandle, TechEffect, Tunables, WeaponKind};
 use crate::shard::SectorId;
 use crate::snapshot::ShipSnap;
 
@@ -147,6 +149,20 @@ pub struct Ship {
     pub a: f32,
     pub hp: i32,
     pub max_hp: i32,
+    /// Current shield buffer — damage is soaked here before it reaches `hp`, and it regenerates out of
+    /// combat. `0`/`max_shield == 0` means an unshielded ship (classic feel) until shield tech is bought.
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    /// Energy capacitor — the pool heavy weapons draw from (see [`crate::ruleset::WeaponDef::energy_cost`]).
+    #[serde(default)]
+    pub energy: f32,
+    #[serde(default)]
+    pub max_energy: f32,
+    /// Active status effects (EMP, burn, slow, stasis, overcharge). Persistent across failover/transit.
+    #[serde(default)]
+    pub effects: StatusStack,
     pub minerals: u32,
     pub kills: u32,
     /// Thruster upgrade level (raises max speed & accel).
@@ -169,6 +185,13 @@ pub struct Ship {
     pub alive: bool,
     #[serde(skip)]
     pub dead_at: u64,
+    /// Tick until which shield regen is paused (set when the shield/hull is hit). Transient.
+    #[serde(skip)]
+    pub shield_block: u64,
+    /// Sub-point shield-regen accumulator, so a fractional regen rate is deterministic without a float
+    /// shield value. Transient (resets to 0 on snapshot restore — harmless, it is sub-1 point).
+    #[serde(skip)]
+    pub shield_frac: f32,
     #[serde(skip)]
     pub last_fire: u64,
     #[serde(skip)]
@@ -194,6 +217,11 @@ impl Ship {
             a: -std::f32::consts::FRAC_PI_2,
             hp: base_hp,
             max_hp: base_hp,
+            shield: 0,
+            max_shield: 0,
+            energy: 0.0,
+            max_energy: 0.0,
+            effects: StatusStack::new(),
             minerals: 0,
             kills: 0,
             speed_lv: 0,
@@ -205,6 +233,8 @@ impl Ship {
             role: ShipRole::Player,
             alive: true,
             dead_at: 0,
+            shield_block: 0,
+            shield_frac: 0.0,
             last_fire: 0,
             want_thrust: false,
             want_turn: 0,
@@ -242,6 +272,11 @@ impl Ship {
             a: snap.a,
             hp: snap.hp,
             max_hp: snap.max_hp,
+            shield: snap.shield,
+            max_shield: snap.max_shield,
+            energy: snap.energy,
+            max_energy: snap.max_energy,
+            effects: snap.effects.clone(),
             minerals: snap.minerals,
             kills: snap.kills,
             speed_lv: snap.speed_lv,
@@ -253,6 +288,8 @@ impl Ship {
             role: snap.role,
             alive: snap.alive,
             dead_at: 0,
+            shield_block: 0,
+            shield_frac: 0.0,
             last_fire: 0,
             want_thrust: false,
             want_turn: 0,
@@ -290,6 +327,11 @@ impl Ship {
             a: self.a,
             hp: self.hp,
             max_hp: self.max_hp,
+            shield: self.shield,
+            max_shield: self.max_shield,
+            energy: self.energy,
+            max_energy: self.max_energy,
+            effects: self.effects.clone(),
             minerals: self.minerals,
             kills: self.kills,
             speed_lv: self.speed_lv,
@@ -301,6 +343,15 @@ impl Ship {
             role: self.role,
             alive: self.alive,
         }
+    }
+
+    /// Fit a freshly-spawned ship with its base shield + energy capacity from the live tunables. Called
+    /// on join, respawn and NPC spawn (after [`new`](Self::new)); shield/energy techs add on top later.
+    pub fn outfit(&mut self, tun: &Tunables) {
+        self.max_shield = tun.base_shield.max(0);
+        self.shield = self.max_shield;
+        self.max_energy = tun.base_energy.max(0.0);
+        self.energy = self.max_energy;
     }
 
     /// The faction this ship belongs to: its owner for an NPC, else the player's own id.
@@ -329,6 +380,81 @@ pub struct Bullet {
     /// [`Explosion`]. `0.0` = an ordinary bullet that deals point damage and vanishes.
     #[serde(default)]
     pub explode_radius: f32,
+    /// A status effect this round stamps onto every ship it damages (EMP/burn/slow/stasis). Carried
+    /// from the firing [`crate::ruleset::WeaponDef`]. `None` = plain damage.
+    #[serde(default)]
+    pub effect: Option<OnHitEffect>,
+    /// **Cluster submunitions:** when this round detonates, spawn this many child blast rounds in a
+    /// ring (a cluster missile). `0` = no split.
+    #[serde(default)]
+    pub submunitions: u32,
+}
+
+/// A deployed **proximity mine** — a real, persistent entity (snapshotted and replicated) that drifts
+/// where it was dropped, **arms** after a delay, then **detonates** with an area blast when an enemy of
+/// another faction enters its trigger radius (or when it finally times out). Area-denial ordnance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Mine {
+    pub owner: String,
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub dmg: i32,
+    /// Blast radius on detonation.
+    pub blast: f32,
+    /// Proximity trigger radius — an enemy this close sets it off.
+    pub trigger: f32,
+    pub hue: u32,
+    /// Tick at which the mine becomes live (before this it cannot trigger — armed-after-drop safety).
+    pub arm_at: u64,
+    /// Tick at which the mine goes inert and quietly vanishes.
+    pub die_at: u64,
+    /// Optional on-detonation status effect (e.g. an EMP mine), carried from the weapon.
+    #[serde(default)]
+    pub effect: Option<OnHitEffect>,
+}
+
+/// What a dropped **pickup** grants when a ship flies over it. Powerups drop where a player is
+/// destroyed, turning every kill into loot worth contesting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickupKind {
+    /// Instantly repairs hull.
+    Repair,
+    /// Instantly refills (and over-fills, capped) the shield.
+    ShieldCell,
+    /// Tops up the energy capacitor.
+    EnergyCell,
+    /// Applies a timed Overcharge buff (rate of fire + damage).
+    Overcharge,
+    /// A cache of salvaged minerals.
+    Minerals,
+}
+
+impl PickupKind {
+    pub fn code(self) -> u8 {
+        match self {
+            PickupKind::Repair => 0,
+            PickupKind::ShieldCell => 1,
+            PickupKind::EnergyCell => 2,
+            PickupKind::Overcharge => 3,
+            PickupKind::Minerals => 4,
+        }
+    }
+}
+
+/// A floating powerup in the world: collected by overlapping it, expires if left too long.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Pickup {
+    pub kind: PickupKind,
+    pub x: f32,
+    pub y: f32,
+    /// Effect-specific magnitude (hull/shield/energy points, overcharge fraction, mineral count).
+    pub value: f32,
+    pub hue: u32,
+    /// Tick at which the pickup despawns if uncollected.
+    pub die_at: u64,
 }
 
 /// A one-tick explosion (a missile detonation) for the renderer to flash and shake.
@@ -349,7 +475,7 @@ pub struct BeamEvent {
     pub x1: f32,
     pub y1: f32,
     pub hue: u32,
-    /// `0` = railgun, `1` = laser.
+    /// `0` = railgun, `1` = laser, `2` = arc / chain lightning.
     pub kind: u8,
 }
 
@@ -403,6 +529,13 @@ pub struct Sim {
     pub rules: RulesetHandle,
     pub ships: HashMap<String, Ship>,
     pub bullets: Vec<Bullet>,
+    /// Deployed proximity mines drifting in this sector (persistent, replicated).
+    pub mines: Vec<Mine>,
+    /// Floating powerup pickups (dropped on kills).
+    pub pickups: Vec<Pickup>,
+    /// The deterministic environmental hazard field of this sector (gravity wells + nebulae), derived
+    /// from the sector coordinate. Empty for the calm home sector `(0,0)` and for `Sim::new()`.
+    pub hazards: Hazards,
     mined: HashMap<(i32, i32), u64>,
     pub kill_feed: Vec<KillEvent>,
     /// Beams emitted this tick (railgun/laser) for the wire snapshot. Cleared each tick.
@@ -428,6 +561,9 @@ impl Default for Sim {
             rules: std::sync::Arc::new(Ruleset::builtin()),
             ships: HashMap::new(),
             bullets: Vec::new(),
+            mines: Vec::new(),
+            pickups: Vec::new(),
+            hazards: Hazards::empty(),
             mined: HashMap::new(),
             kill_feed: Vec::new(),
             beams: Vec::new(),
@@ -444,9 +580,10 @@ impl Sim {
         Self::default()
     }
 
-    /// A sim for a specific sector with a specific ruleset.
+    /// A sim for a specific sector with a specific ruleset. The sector's deterministic hazard field
+    /// (gravity wells + nebulae) is grown from its coordinate — the home sector `(0,0)` is calm.
     pub fn for_sector(sector: SectorId, rules: RulesetHandle) -> Self {
-        Sim { sector, rules, ..Self::default() }
+        Sim { sector, rules, hazards: Hazards::for_sector(sector), ..Self::default() }
     }
 
     /// **Hot reload:** swap the live ruleset between ticks. Ships in flight keep their state; the new
@@ -495,7 +632,9 @@ impl Sim {
                 s.last_input_tick = tick;
             }
             None => {
-                self.ships.insert(id.to_string(), Ship::new(name, hue, tick, dw, base_hp));
+                let mut s = Ship::new(name, hue, tick, dw, base_hp);
+                s.outfit(&self.rules.tunables);
+                self.ships.insert(id.to_string(), s);
             }
         }
     }
@@ -537,8 +676,9 @@ impl Sim {
         let turn_rate = self.rules.tunables.turn_rate;
         if !self.ships.contains_key(id) {
             let name = intent.name.clone().unwrap_or_else(|| "pilot".into());
-            self.ships
-                .insert(id.to_string(), Ship::new(sanitize_name(&name), hue_fallback, tick, dw, base_hp));
+            let mut s = Ship::new(sanitize_name(&name), hue_fallback, tick, dw, base_hp);
+            s.outfit(&self.rules.tunables);
+            self.ships.insert(id.to_string(), s);
         }
         if let Some(s) = self.ships.get_mut(id) {
             if let Some(n) = intent.name {
@@ -593,6 +733,14 @@ impl Sim {
                 }
                 (node.cost + node.cost * s.guns.saturating_sub(1), true)
             }
+            TechEffect::AddShield { .. } => {
+                let lv = s.owned.iter().filter(|o| *o == node_id).count() as u32;
+                (node.cost + node.cost * lv / 2, true)
+            }
+            TechEffect::AddEnergy { .. } => {
+                let lv = s.owned.iter().filter(|o| *o == node_id).count() as u32;
+                (node.cost + node.cost * lv / 2, true)
+            }
         };
         if s.minerals < cost {
             return false;
@@ -612,6 +760,14 @@ impl Sim {
             TechEffect::AddGun { count } => {
                 s.guns = (s.guns + *count).min(max_guns);
             }
+            TechEffect::AddShield { amount } => {
+                s.max_shield += *amount;
+                s.shield = s.max_shield;
+            }
+            TechEffect::AddEnergy { amount } => {
+                s.max_energy += *amount;
+                s.energy = s.max_energy;
+            }
         }
         if repeatable {
             // Record an ownership marker for repeatables too (so `requires` can reference them and the
@@ -629,6 +785,7 @@ impl Sim {
         let respawn_ticks = self.rules.tunables.respawn_ticks;
         let dw = self.rules.default_weapon();
         let base_hp = self.rules.tunables.base_hp;
+        let tun = self.rules.tunables.clone();
         let Some(s) = self.ships.get_mut(id) else { return false };
         if s.alive {
             return false;
@@ -643,6 +800,7 @@ impl Sim {
         let weapons = s.weapons.clone();
         let owned: Vec<String> = s.owned.iter().filter(|o| o.starts_with("tech-")).cloned().collect();
         let mut fresh = Ship::new(name, hue, now, dw, base_hp);
+        fresh.outfit(&tun);
         fresh.kills = kills;
         fresh.weapons = weapons;
         fresh.owned = owned;
@@ -686,19 +844,60 @@ impl Sim {
                 if !s.alive {
                     continue;
                 }
+                // STATUS EFFECTS: drop expired effects, then read the live gates for this tick.
+                s.effects.expire(now);
+                let can_thrust = s.effects.can_thrust(); // EMP fries the drive
+                let mobility = s.effects.mobility_mult(); // Slow scales top speed/accel
+                let stasis_retain = s.effects.stasis_retain(); // tractor lock bleeds velocity
+
+                // ENERGY + SHIELD regen: energy refills every tick; the shield only after a quiet spell
+                // (no hit for `shield_delay` ticks) and never while EMP-suppressed.
+                if s.max_energy > 0.0 {
+                    s.energy = (s.energy + tun.energy_regen).clamp(0.0, s.max_energy);
+                }
+                if s.max_shield > 0
+                    && s.shield < s.max_shield
+                    && now >= s.shield_block
+                    && s.effects.shield_regenerates()
+                {
+                    s.shield_frac += tun.shield_regen;
+                    let whole = s.shield_frac.floor();
+                    if whole >= 1.0 {
+                        s.shield_frac -= whole;
+                        s.shield = (s.shield + whole as i32).min(s.max_shield);
+                    }
+                }
+
                 // Turn (button steering; mouse-aim already applied in apply_intent).
                 s.a = (s.a + s.want_turn as f32 * tun.turn_rate).rem_euclid(std::f32::consts::TAU);
-                // Thrust.
-                if s.want_thrust {
-                    let acc = s.accel_t(&tun) * dt_scale;
+                // Thrust (gated by EMP).
+                if s.want_thrust && can_thrust {
+                    let acc = s.accel_t(&tun) * mobility * dt_scale;
                     s.vx += s.a.cos() * acc;
                     s.vy += s.a.sin() * acc;
                 }
-                // Damping + clamp to max speed.
+                // ENVIRONMENTAL HAZARDS: gravity wells pull the ship inward; nebula clouds add drag.
+                // Read from the sector's deterministic field (a disjoint borrow from `ships`).
+                if !self.hazards.is_empty() {
+                    let g = self.hazards.accel_at(s.x, s.y);
+                    s.vx += g.x * dt_scale;
+                    s.vy += g.y * dt_scale;
+                    let drag = self.hazards.drag_at(s.x, s.y);
+                    if drag > 0.0 {
+                        s.vx *= 1.0 - drag;
+                        s.vy *= 1.0 - drag;
+                    }
+                }
+                // STASIS: a tractor lock bleeds velocity toward zero.
+                if stasis_retain < 1.0 {
+                    s.vx *= stasis_retain;
+                    s.vy *= stasis_retain;
+                }
+                // Damping + clamp to the (Slow-scaled) max speed.
                 s.vx *= tun.damping;
                 s.vy *= tun.damping;
                 let spd = (s.vx * s.vx + s.vy * s.vy).sqrt();
-                let max = s.max_speed_t(&tun);
+                let max = s.max_speed_t(&tun) * mobility;
                 if spd > max {
                     let k = max / spd;
                     s.vx *= k;
@@ -800,15 +999,52 @@ impl Sim {
             }
         }
 
+        // --- Pass 1b: damage-over-time (Burn) and lethal hazards (black-hole event horizons). Collect
+        // first, then apply, so the borrow on `ships` is released before `apply_damage` mutates. ---
+        {
+            let mut burns: Vec<(String, i32, String)> = Vec::new();
+            let mut swallowed: Vec<String> = Vec::new();
+            let lethal = !self.hazards.is_empty();
+            let mut ids2: Vec<&String> = self.ships.keys().collect();
+            ids2.sort();
+            for id in ids2 {
+                let s = &self.ships[id];
+                if !s.alive {
+                    continue;
+                }
+                if let Some(b) = s.effects.get(StatusKind::Burn) {
+                    let dmg = b.magnitude.round().max(0.0) as i32;
+                    if dmg > 0 {
+                        burns.push((id.clone(), dmg, b.source.clone()));
+                    }
+                }
+                if lethal && self.hazards.lethal_at(s.x, s.y) {
+                    swallowed.push(id.clone());
+                }
+            }
+            // Burn bypasses shields — it is a hull fire — so apply it straight to hp via a dedicated path.
+            for (victim, dmg, source) in burns {
+                self.apply_hull_damage(&victim, dmg, &source, now);
+            }
+            // A ship that crossed an event horizon is destroyed outright (credited to the void).
+            for victim in swallowed {
+                self.apply_hull_damage(&victim, i32::MAX, "", now);
+            }
+        }
+
         // --- Build the per-tick AABB broad-phase over alive ships (final positions). ---
         let tree = self.build_ship_tree();
+
+        // MINES + PICKUPS: arm/trigger drifting proximity mines and let ships collect dropped loot.
+        self.tick_mines(now, &tree);
+        self.tick_pickups(now);
 
         // --- Pass 2: weapon firing (projectile/homing spawn bullets; railgun/laser hitscan). ---
         let firing: Vec<String> = {
             let mut v: Vec<String> = self
                 .ships
                 .iter()
-                .filter(|(_, s)| s.alive && s.want_fire)
+                .filter(|(_, s)| s.alive && s.want_fire && s.effects.can_fire()) // EMP fries the triggers
                 .map(|(id, _)| id.clone())
                 .collect();
             v.sort();
@@ -1095,7 +1331,9 @@ impl Sim {
             }
         }
         for (id, owner, role, x, y, hp, hue) in spawns {
-            self.ships.insert(id, Ship::npc(role, owner, x, y, hp, hue, now));
+            let mut s = Ship::npc(role, owner, x, y, hp, hue, now);
+            s.outfit(tun);
+            self.ships.insert(id, s);
         }
     }
 
@@ -1103,37 +1341,54 @@ impl Sim {
     /// reload changes weapon behaviour on the next shot.
     fn fire_weapon(&mut self, id: &str, now: u64, tree: &AabbTree<String>) {
         let rules = self.rules.clone();
-        let (wx, wy, wa, wvx, wvy, hue0, guns, weapon) = {
+        let (wx, wy, wa, wvx, wvy, hue0, guns, weapon, energy, oc) = {
             let Some(s) = self.ships.get(id) else { return };
-            (s.x, s.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone())
+            (s.x, s.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone(), s.energy, s.effects.overcharge_mult())
         };
         let def = rules.weapon(&weapon).cloned().unwrap_or_else(crate::ruleset::WeaponDef::fallback);
 
         // Cooldown: the blaster fires faster with more barrels; other weapons use their own cooldown.
-        let cooldown = if def.kind == WeaponKind::Projectile && def.id == "blaster" {
+        // Overcharge shortens it.
+        let base_cd = if def.kind == WeaponKind::Projectile && def.id == "blaster" {
             def.cooldown.saturating_sub(guns.saturating_sub(1) as u64).max(2)
         } else {
             def.cooldown.max(1)
         };
+        let cooldown = ((base_cd as f32) / oc).round().max(1.0) as u64;
         {
             let s = self.ships.get(id).expect("present");
             if !(s.last_fire == 0 || now.saturating_sub(s.last_fire) >= cooldown) {
                 return;
             }
         }
+        // ENERGY gate: heavy weapons draw from the capacitor. Free weapons (cost 0) always fire; a
+        // ship that can't pay simply doesn't fire this tick and tries again as the capacitor refills.
+        if def.energy_cost > 0.0 && energy < def.energy_cost {
+            return;
+        }
         if let Some(s) = self.ships.get_mut(id) {
             s.last_fire = now;
+            if def.energy_cost > 0.0 {
+                s.energy = (s.energy - def.energy_cost).max(0.0);
+            }
         }
         let hue = ((hue0 as i32 + def.hue_shift).rem_euclid(360)) as u32;
+        let dmg_mult = oc; // Overcharge boosts damage as well as rate of fire.
 
         match def.kind {
-            WeaponKind::Projectile | WeaponKind::Homing => {
+            WeaponKind::Projectile | WeaponKind::Homing | WeaponKind::Flak => {
                 let count = if def.id == "blaster" { guns.max(1) } else { def.count.max(1) };
                 let spread = def.spread;
                 let homing = if def.kind == WeaponKind::Homing { def.turn_rate } else { 0.0 };
-                let dmg = def.damage + if def.id == "blaster" { (guns.saturating_sub(1) as i32) * 2 } else { 0 };
-                // Homing rounds are missiles: they detonate with an AoE blast scaled to their payload.
-                let explode_radius = if def.kind == WeaponKind::Homing { def.damage as f32 * 1.4 + 45.0 } else { 0.0 };
+                let base_dmg = def.damage + if def.id == "blaster" { (guns.saturating_sub(1) as i32) * 2 } else { 0 };
+                let dmg = ((base_dmg as f32) * dmg_mult).round() as i32;
+                // Homing rounds and flak shells are missiles: they detonate with an AoE blast scaled to
+                // their payload. A plain projectile (blaster/disruptor) does point damage and vanishes.
+                let explode_radius = match def.kind {
+                    WeaponKind::Homing => def.damage as f32 * 1.4 + 45.0,
+                    WeaponKind::Flak => def.damage as f32 * 1.2 + 30.0,
+                    _ => 0.0,
+                };
                 for g in 0..count {
                     let off = if count > 1 { (g as f32 - (count as f32 - 1.0) / 2.0) * spread } else { 0.0 };
                     let a = wa + off;
@@ -1148,13 +1403,15 @@ impl Sim {
                         die_at: now + def.ttl,
                         homing,
                         explode_radius,
+                        effect: def.effect,
+                        submunitions: def.submunitions,
                     });
                 }
             }
             WeaponKind::Railgun | WeaponKind::Laser => {
                 // Hitscan weapons honour `count`/`spread`, so a weapon can fire a fan of beams: a
                 // scatter laser, a twin-lance railgun, etc. Each ray emits its own beam and hits the
-                // first ship it crosses.
+                // first ship it crosses, stamping any on-hit effect (a tractor beam's stasis, etc.).
                 let beam_kind: u8 = if def.kind == WeaponKind::Railgun { 0 } else { 1 };
                 let count = def.count.max(1);
                 let spread = def.spread;
@@ -1172,11 +1429,132 @@ impl Sim {
                         kind: beam_kind,
                     });
                     if let Some(victim) = hit {
-                        self.apply_damage(&victim, def.damage, id, now);
+                        let dmg = ((def.damage as f32) * dmg_mult).round() as i32;
+                        self.apply_damage(&victim, dmg, id, now);
+                        if let Some(e) = def.effect {
+                            self.apply_effect(&victim, &e, id, now);
+                        }
                     }
                 }
             }
+            WeaponKind::Mine => {
+                // Deploy `count` proximity mines *behind* the ship, fanned by `spread`. They arm after
+                // `arm_ticks` and then detonate on a nearing enemy (or on timeout). A soft cap bounds
+                // the field so the sector's mine count (and snapshot size) can't grow without limit.
+                if self.mines.len() >= 512 {
+                    return;
+                }
+                let count = def.count.max(1);
+                let blast = def.damage as f32 * 1.3 + 40.0;
+                let back = wa + std::f32::consts::PI;
+                for g in 0..count {
+                    let off = if count > 1 { (g as f32 - (count as f32 - 1.0) / 2.0) * def.spread } else { 0.0 };
+                    let a = back + off;
+                    self.mines.push(Mine {
+                        owner: id.to_string(),
+                        x: wx + a.cos() * (SHIP_R + 6.0),
+                        y: wy + a.sin() * (SHIP_R + 6.0),
+                        vx: a.cos() * def.speed,
+                        vy: a.sin() * def.speed,
+                        dmg: ((def.damage as f32) * dmg_mult).round() as i32,
+                        blast,
+                        trigger: def.range.max(40.0),
+                        hue,
+                        arm_at: now + def.arm_ticks,
+                        die_at: now + def.ttl.max(1),
+                        effect: def.effect,
+                    });
+                }
+            }
+            WeaponKind::Arc => {
+                self.fire_arc(id, wx, wy, &def, hue, dmg_mult, now, tree);
+            }
         }
+    }
+
+    /// Stamp a weapon's on-hit status effect onto a still-alive `victim` (EMP/burn/slow/stasis), keyed
+    /// from `now` so it expires by tick. No-op if the victim is gone or already dead.
+    fn apply_effect(&mut self, victim: &str, e: &OnHitEffect, source: &str, now: u64) {
+        if let Some(v) = self.ships.get_mut(victim)
+            && v.alive
+        {
+            v.effects.apply(e.kind, now + e.ticks, e.magnitude, source);
+        }
+    }
+
+    /// **Arc / chain lightning:** strike the nearest enemy of another faction within range, then leap to
+    /// successive nearest un-struck enemies (up to `chain` extra jumps), the damage decaying each hop.
+    /// Each segment emits a lightning beam (`kind = 2`). Deterministic via the sorted AABB query.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_arc(
+        &mut self,
+        owner: &str,
+        ox: f32,
+        oy: f32,
+        def: &crate::ruleset::WeaponDef,
+        hue: u32,
+        dmg_mult: f32,
+        now: u64,
+        tree: &AabbTree<String>,
+    ) {
+        let faction = self
+            .ships
+            .get(owner)
+            .map(|s| s.faction_id(owner).to_string())
+            .unwrap_or_else(|| owner.to_string());
+        let max_links = def.chain + 1; // the initial strike plus `chain` jumps
+        let mut from = (ox, oy);
+        let mut dmg = def.damage as f32 * dmg_mult;
+        let mut struck: Vec<String> = Vec::new();
+        let mut next = self.nearest_enemy_excluding(&faction, ox, oy, def.range, tree, &struck);
+        while let Some(target) = next.take() {
+            if struck.len() as u32 >= max_links {
+                break;
+            }
+            let (tx, ty) = match self.ships.get(&target) {
+                Some(s) if s.alive => (s.x, s.y),
+                _ => break,
+            };
+            self.beams.push(BeamEvent { owner: owner.to_string(), x0: from.0, y0: from.1, x1: tx, y1: ty, hue, kind: 2 });
+            self.apply_damage(&target, dmg.round() as i32, owner, now);
+            if let Some(e) = def.effect {
+                self.apply_effect(&target, &e, owner, now);
+            }
+            struck.push(target);
+            from = (tx, ty);
+            dmg *= 0.7; // decay each hop
+            next = self.nearest_enemy_excluding(&faction, tx, ty, def.range, tree, &struck);
+        }
+    }
+
+    /// Nearest alive ship of a *different faction* than `faction` within `radius`, skipping any id in
+    /// `exclude` — the chain-lightning hop primitive.
+    fn nearest_enemy_excluding(
+        &self,
+        faction: &str,
+        x: f32,
+        y: f32,
+        radius: f32,
+        tree: &AabbTree<String>,
+        exclude: &[String],
+    ) -> Option<String> {
+        let mut cands = tree.query(&Aabb::around(x, y, radius));
+        cands.sort();
+        let mut best: Option<(f32, String)> = None;
+        for cid in cands {
+            if exclude.iter().any(|e| e == &cid) {
+                continue;
+            }
+            let Some(s) = self.ships.get(&cid) else { continue };
+            if !s.alive || s.faction_id(&cid) == faction {
+                continue;
+            }
+            let d2 = (s.x - x).powi(2) + (s.y - y).powi(2);
+            if d2 <= radius * radius && best.as_ref().map(|(b, _)| d2 < *b).unwrap_or(true) {
+                best = Some((d2, cid));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Cast a ray from `(ox, oy)` along heading `a` up to `range`, returning the nearest hit ship id
@@ -1254,6 +1632,13 @@ impl Sim {
                 b.vx = na.cos() * speed;
                 b.vy = na.sin() * speed;
             }
+            // ENVIRONMENTAL HAZARDS: gravity wells curve projectiles too — missiles fall inward, shots
+            // arc past a planet. (Nebula drag is ship-only; light rounds aren't slowed by gas.)
+            if !self.hazards.is_empty() {
+                let g = self.hazards.accel_at(b.x, b.y);
+                b.vx += g.x * dt_scale;
+                b.vy += g.y * dt_scale;
+            }
             b.x += b.vx * dt_scale;
             b.y += b.vy * dt_scale;
             if b.x < 0.0 || b.y < 0.0 || b.x > SECTOR_SIZE || b.y > SECTOR_SIZE {
@@ -1286,6 +1671,10 @@ impl Sim {
                     self.detonate(&b, now, tree); // AoE — the direct target is inside the blast too
                 } else {
                     self.apply_damage(&victim, b.dmg, &b.owner, now);
+                    // A non-exploding round (disruptor, etc.) stamps its on-hit effect on the target.
+                    if let Some(e) = b.effect {
+                        self.apply_effect(&victim, &e, &b.owner, now);
+                    }
                 }
                 continue; // round consumed
             }
@@ -1324,6 +1713,35 @@ impl Sim {
             let falloff = (1.0 - d / radius).max(0.25);
             let dmg = ((b.dmg as f32) * falloff).round() as i32;
             self.apply_damage(&cid, dmg, &b.owner, now);
+            // The blast also stamps the warhead's on-hit effect (an EMP torpedo disables the cluster
+            // it catches). Applied at full strength inside the radius.
+            if let Some(e) = b.effect {
+                self.apply_effect(&cid, &e, &b.owner, now);
+            }
+        }
+        // CLUSTER: spawn a ring of submunition blast rounds that fan out and detonate shortly after.
+        if b.submunitions > 0 {
+            let n = b.submunitions.min(12);
+            let child_dmg = (b.dmg / 2).max(4);
+            let child_blast = (radius * 0.6).max(30.0);
+            for k in 0..n {
+                let a = (k as f32 / n as f32) * std::f32::consts::TAU;
+                let spd = 8.0;
+                self.bullets.push(Bullet {
+                    owner: b.owner.clone(),
+                    x: b.x + a.cos() * 6.0,
+                    y: b.y + a.sin() * 6.0,
+                    vx: a.cos() * spd,
+                    vy: a.sin() * spd,
+                    dmg: child_dmg,
+                    hue: b.hue,
+                    die_at: now + 10,
+                    homing: 0.0,
+                    explode_radius: child_blast,
+                    effect: None, // children are pure shrapnel — no recursive status/cluster
+                    submunitions: 0,
+                });
+            }
         }
         // A little debris kicked out by the blast (deterministic from position + tick).
         let seed = fnv1a(&b.owner) ^ (b.x as u32).wrapping_mul(2654435761) ^ now as u32;
@@ -1336,6 +1754,155 @@ impl Sim {
             body.restitution = 0.5;
             body.tag = now;
             self.debris.add(body);
+        }
+    }
+
+    /// Synthesize the equivalent blast round for a detonating mine, so a mine reuses the exact missile
+    /// detonation path (AoE falloff, on-hit effect, wreckage).
+    fn mine_blast(m: &Mine) -> Bullet {
+        Bullet {
+            owner: m.owner.clone(),
+            x: m.x,
+            y: m.y,
+            vx: 0.0,
+            vy: 0.0,
+            dmg: m.dmg,
+            hue: m.hue,
+            die_at: 0,
+            homing: 0.0,
+            explode_radius: m.blast,
+            effect: m.effect,
+            submunitions: 0,
+        }
+    }
+
+    /// **Mines:** drift each deployed mine, arm it after its delay, and detonate it when an enemy of
+    /// another faction enters its trigger radius (or when it times out). Detonation reuses the missile
+    /// blast path. Deterministic (sorted broad-phase queries).
+    fn tick_mines(&mut self, now: u64, tree: &AabbTree<String>) {
+        if self.mines.is_empty() {
+            return;
+        }
+        let mines = std::mem::take(&mut self.mines);
+        let mut surviving: Vec<Mine> = Vec::with_capacity(mines.len());
+        let mut blasts: Vec<Bullet> = Vec::new();
+        for mut m in mines {
+            if now >= m.die_at {
+                blasts.push(Self::mine_blast(&m)); // a timed-out mine clears itself with a blast
+                continue;
+            }
+            // Drift to rest where it was dropped.
+            m.x += m.vx;
+            m.y += m.vy;
+            m.vx *= 0.92;
+            m.vy *= 0.92;
+            if m.x < 0.0 || m.y < 0.0 || m.x > SECTOR_SIZE || m.y > SECTOR_SIZE {
+                continue; // drifted out of the sector — gone
+            }
+            let mut triggered = false;
+            if now >= m.arm_at {
+                let own_fac = self
+                    .ships
+                    .get(&m.owner)
+                    .map(|s| s.faction_id(&m.owner).to_string())
+                    .unwrap_or_else(|| m.owner.clone());
+                let mut cands = tree.query(&Aabb::around(m.x, m.y, m.trigger));
+                cands.sort();
+                for cid in cands {
+                    let Some(s) = self.ships.get(&cid) else { continue };
+                    if !s.alive || s.faction_id(&cid) == own_fac {
+                        continue;
+                    }
+                    let dx = s.x - m.x;
+                    let dy = s.y - m.y;
+                    if dx * dx + dy * dy <= m.trigger * m.trigger {
+                        triggered = true;
+                        break;
+                    }
+                }
+            }
+            if triggered {
+                blasts.push(Self::mine_blast(&m));
+            } else {
+                surviving.push(m);
+            }
+        }
+        self.mines = surviving;
+        for b in blasts {
+            self.detonate(&b, now, tree);
+        }
+    }
+
+    /// **Pickups:** expire stale loot and let any alive *player* ship overlapping a pickup collect it.
+    /// NPC fleet ships don't vacuum loot. Deterministic: pickups and players are scanned in sorted order.
+    fn tick_pickups(&mut self, now: u64) {
+        if self.pickups.is_empty() {
+            return;
+        }
+        let pickups = std::mem::take(&mut self.pickups);
+        let mut player_ids: Vec<String> = self
+            .ships
+            .iter()
+            .filter(|(_, s)| s.alive && s.owner.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        player_ids.sort();
+        let mut surviving: Vec<Pickup> = Vec::with_capacity(pickups.len());
+        let mut collected: Vec<(String, Pickup)> = Vec::new();
+        let reach = SHIP_R + 10.0;
+        'outer: for p in pickups {
+            if now >= p.die_at {
+                continue; // expired uncollected
+            }
+            for id in &player_ids {
+                let s = &self.ships[id];
+                let dx = s.x - p.x;
+                let dy = s.y - p.y;
+                if dx * dx + dy * dy <= reach * reach {
+                    collected.push((id.clone(), p));
+                    continue 'outer;
+                }
+            }
+            surviving.push(p);
+        }
+        self.pickups = surviving;
+        for (id, p) in collected {
+            self.collect_pickup(&id, &p, now);
+        }
+    }
+
+    /// Apply a collected pickup's grant to ship `id`.
+    fn collect_pickup(&mut self, id: &str, p: &Pickup, now: u64) {
+        let fid = self.ships.get(id).map(|s| s.faction_id(id).to_string()).unwrap_or_else(|| id.to_string());
+        if let Some(s) = self.ships.get_mut(id) {
+            match p.kind {
+                PickupKind::Repair => {
+                    s.hp = (s.hp + p.value as i32).min(s.max_hp);
+                }
+                PickupKind::ShieldCell => {
+                    if s.max_shield > 0 {
+                        s.shield = (s.shield + p.value as i32).min(s.max_shield);
+                    } else {
+                        // No shield system yet? Convert the cell into a partial hull patch instead.
+                        s.hp = (s.hp + (p.value * 0.5) as i32).min(s.max_hp);
+                    }
+                }
+                PickupKind::EnergyCell => {
+                    let cap = s.max_energy.max(p.value);
+                    s.energy = (s.energy + p.value).min(cap);
+                }
+                PickupKind::Overcharge => {
+                    s.effects.apply(StatusKind::Overcharge, now + 300, p.value, id);
+                }
+                PickupKind::Minerals => {
+                    s.minerals = s.minerals.saturating_add(p.value as u32);
+                }
+            }
+        }
+        if let PickupKind::Minerals = p.kind
+            && let Some(f) = self.factions.get_mut(&fid)
+        {
+            f.deposit_minerals(p.value as u64);
         }
     }
 
@@ -1360,19 +1927,64 @@ impl Sim {
         best.map(|(_, id)| id)
     }
 
-    /// Apply `dmg` from `attacker` to `victim`, handling kill, mineral drop, kill credit and feed.
+    /// Apply `dmg` from `attacker` to `victim` — soaked by the shield first (which then pauses its
+    /// regen), the overflow reaching hull. A kill is routed into [`on_death`] (wreckage, feed, loot).
     fn apply_damage(&mut self, victim: &str, dmg: i32, attacker: &str, now: u64) {
-        let (killed, victim_name) = {
+        if dmg <= 0 {
+            return;
+        }
+        let delay = self.rules.tunables.shield_delay;
+        let killed = {
             let Some(v) = self.ships.get_mut(victim) else { return };
             if !v.alive {
                 return;
             }
-            v.hp -= dmg;
-            (v.hp <= 0, v.name.clone())
+            // SHIELDS absorb first; only the overflow reaches hull. Any hit pauses shield regen.
+            let mut rem = dmg;
+            if v.max_shield > 0 && v.shield > 0 {
+                let absorbed = rem.min(v.shield);
+                v.shield -= absorbed;
+                rem -= absorbed;
+            }
+            if rem > 0 {
+                v.hp -= rem;
+            }
+            v.shield_block = now + delay;
+            v.hp <= 0
         };
-        if !killed {
+        if killed {
+            self.on_death(victim, attacker, now);
+        }
+    }
+
+    /// Apply `dmg` **straight to hull**, bypassing shields — used by Burn (a hull fire) and by a black
+    /// hole's event horizon (`i32::MAX` = an instant kill). Routes a kill into [`on_death`].
+    fn apply_hull_damage(&mut self, victim: &str, dmg: i32, attacker: &str, now: u64) {
+        if dmg <= 0 {
             return;
         }
+        let delay = self.rules.tunables.shield_delay;
+        let killed = {
+            let Some(v) = self.ships.get_mut(victim) else { return };
+            if !v.alive {
+                return;
+            }
+            v.hp = v.hp.saturating_sub(dmg);
+            v.shield_block = now + delay;
+            v.hp <= 0
+        };
+        if killed {
+            self.on_death(victim, attacker, now);
+        }
+    }
+
+    /// Destroy `victim`, crediting `attacker`: scatter wreckage, file the kill, maybe drop loot, and
+    /// either remove an NPC from its roster or leave a player dead-but-present for the respawn timer.
+    fn on_death(&mut self, victim: &str, attacker: &str, now: u64) {
+        let victim_name = match self.ships.get(victim) {
+            Some(v) if v.alive => v.name.clone(),
+            _ => return,
+        };
         let (vx, vy) = {
             let v = self.ships.get_mut(victim).expect("present");
             v.alive = false;
@@ -1411,6 +2023,13 @@ impl Sim {
             tick: now,
         });
 
+        // LOOT: a destroyed *human player* drops a powerup where they died — every kill becomes a prize
+        // worth diving for. (NPC wrecks don't drop, so a player can't farm their own fleet for loot.)
+        let is_player = self.ships.get(victim).map(|v| v.owner.is_none()).unwrap_or(false);
+        if is_player {
+            self.spawn_pickup(victim, vx, vy, now);
+        }
+
         // An NPC fleet ship does not respawn: it is removed from the world and struck from its
         // faction's roster (you lose a ship and must build another). Player ships stay dead-but-present
         // for the respawn cooldown.
@@ -1422,6 +2041,25 @@ impl Sim {
                 f.lose_unit(unit);
             }
             self.ships.remove(victim);
+        }
+    }
+
+    /// Drop a deterministic powerup at `(x, y)` when a player is destroyed. The kind and value are a
+    /// pure function of the victim id + tick, so every replica spawns the identical pickup.
+    fn spawn_pickup(&mut self, victim: &str, x: f32, y: f32, now: u64) {
+        let seed = fnv1a(victim) ^ (now as u32).wrapping_mul(0x9e3779b1);
+        let (kind, value, hue) = match seed % 5 {
+            0 => (PickupKind::Repair, 50.0, 130),
+            1 => (PickupKind::ShieldCell, 60.0, 200),
+            2 => (PickupKind::EnergyCell, 60.0, 50),
+            3 => (PickupKind::Overcharge, 0.35, 300),
+            _ => (PickupKind::Minerals, 20.0 + (seed % 30) as f32, 40),
+        };
+        let x = x.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+        let y = y.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+        // Cap the field so a brawl can't flood the snapshot with loot.
+        if self.pickups.len() < 256 {
+            self.pickups.push(Pickup { kind, x, y, value, hue, die_at: now + 1800 });
         }
     }
 
@@ -1518,6 +2156,11 @@ impl Sim {
             mix(&mut h, s.role as u64);
             mix(&mut h, fnv1a(&s.weapon) as u64);
             mix(&mut h, fnv1a(s.owner.as_deref().unwrap_or("")) as u64);
+            // Defensive + status layer (shields, energy capacitor, active effects).
+            mix(&mut h, s.shield as i64 as u64);
+            mix(&mut h, s.max_shield as i64 as u64);
+            mix(&mut h, q(s.energy));
+            mix(&mut h, s.effects.hash());
         }
 
         // Bullets: order-independent (XOR fold), since the Vec order is an implementation detail.
@@ -1532,6 +2175,33 @@ impl Sim {
             bsum ^= bh;
         }
         mix(&mut h, bsum);
+
+        // Mines: order-independent (XOR fold) — a deployed minefield is part of authoritative state.
+        let mut msum: u64 = 0;
+        for m in &self.mines {
+            let mut mh: u64 = 0x517cc1b727220a95;
+            mix(&mut mh, fnv1a(&m.owner) as u64);
+            mix(&mut mh, q(m.x));
+            mix(&mut mh, q(m.y));
+            mix(&mut mh, m.dmg as i64 as u64);
+            mix(&mut mh, m.arm_at);
+            mix(&mut mh, m.die_at);
+            msum ^= mh;
+        }
+        mix(&mut h, msum);
+
+        // Pickups: order-independent (XOR fold).
+        let mut psum: u64 = 0;
+        for p in &self.pickups {
+            let mut ph: u64 = 0xff51afd7ed558ccd;
+            mix(&mut ph, p.kind.code() as u64);
+            mix(&mut ph, q(p.x));
+            mix(&mut ph, q(p.y));
+            mix(&mut ph, q(p.value));
+            mix(&mut ph, p.die_at);
+            psum ^= ph;
+        }
+        mix(&mut h, psum);
 
         // Factions: sorted by owner.
         let mut owners: Vec<&String> = self.factions.keys().collect();
@@ -2048,5 +2718,303 @@ mod tests {
             s.tick(1.0);
         }
         assert_eq!(s.player_count(), 0);
+    }
+
+    // ---- Living-galaxy expansion: shields, energy, status effects, hazards, mines, pickups ----
+
+    #[test]
+    fn shields_absorb_before_hull_then_overflow() {
+        let mut s = arena();
+        s.join("v", "V", 0);
+        {
+            let v = s.ships.get_mut("v").unwrap();
+            v.max_shield = 50;
+            v.shield = 50;
+            v.hp = 100;
+            v.max_hp = 100;
+        }
+        // 30 damage is fully soaked by the shield; hull untouched.
+        s.apply_damage("v", 30, "a", s.tick);
+        assert_eq!(s.ships["v"].shield, 20);
+        assert_eq!(s.ships["v"].hp, 100, "shield soaked it all");
+        // 40 more: 20 finishes the shield, 20 overflows to hull.
+        s.apply_damage("v", 40, "a", s.tick);
+        assert_eq!(s.ships["v"].shield, 0);
+        assert_eq!(s.ships["v"].hp, 80, "overflow reached hull");
+    }
+
+    #[test]
+    fn shield_regenerates_after_a_quiet_spell() {
+        let mut s = arena();
+        s.join("v", "V", 0);
+        {
+            let v = s.ships.get_mut("v").unwrap();
+            v.max_shield = 50;
+            v.shield = 10;
+        }
+        // A hit pauses regen for shield_delay ticks; before that the shield stays put.
+        s.apply_damage("v", 1, "a", s.tick); // overflows 0 shield? no — shield 10 absorbs 1 -> 9
+        let after_hit = s.ships["v"].shield;
+        s.tick(1.0);
+        assert_eq!(s.ships["v"].shield, after_hit, "no regen during the post-hit delay");
+        // After the delay elapses, the shield climbs back toward max.
+        for _ in 0..(Tunables::default().shield_delay + 60) {
+            s.tick(1.0);
+        }
+        assert!(s.ships["v"].shield > after_hit, "shield regenerated out of combat");
+        assert!(s.ships["v"].shield <= 50, "never past max");
+    }
+
+    #[test]
+    fn energy_gates_a_heavy_weapon_until_it_recharges() {
+        let mut s = arena();
+        s.join("g", "G", 0);
+        s.join("t", "T", 200);
+        solo(&mut s);
+        {
+            let g = s.ships.get_mut("g").unwrap();
+            g.weapons.push("railgun".into());
+            g.weapon = "railgun".into();
+            g.x = 500.0;
+            g.y = 500.0;
+            g.a = 0.0;
+            g.energy = 10.0; // below the railgun's 34 cost
+            g.max_energy = 100.0;
+        }
+        {
+            let t = s.ships.get_mut("t").unwrap();
+            t.x = 900.0;
+            t.y = 500.0;
+            t.hp = 5;
+        }
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
+        s.tick(1.0);
+        assert!(s.beams.is_empty(), "not enough energy: the railgun did not fire");
+        // Charge up, then it fires.
+        s.ships.get_mut("g").unwrap().energy = 100.0;
+        s.ships.get_mut("g").unwrap().last_fire = 0;
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
+        s.tick(1.0);
+        assert_eq!(s.beams.len(), 1, "charged: the railgun fired");
+        assert!(s.ships["g"].energy < 100.0, "firing drew energy from the capacitor");
+    }
+
+    #[test]
+    fn emp_disables_thrust_and_fire() {
+        let mut s = arena();
+        s.join("n", "p", 0);
+        solo(&mut s);
+        {
+            let p = s.ships.get_mut("n").unwrap();
+            p.x = 1000.0;
+            p.y = 1000.0;
+            p.vx = 0.0;
+            p.vy = 0.0;
+            p.effects.apply(StatusKind::Emp, s.tick + 50, 1.0, "z");
+        }
+        for _ in 0..5 {
+            s.apply_intent("n", Intent { thrust: true, fire: true, ..Default::default() }, 0);
+            s.tick(1.0);
+        }
+        let spd = {
+            let p = &s.ships["n"];
+            (p.vx * p.vx + p.vy * p.vy).sqrt()
+        };
+        assert!(spd < 0.1, "EMP fried the drive: the ship never accelerated, spd={spd}");
+        assert!(s.bullets.is_empty(), "EMP fried the triggers: no shots");
+    }
+
+    #[test]
+    fn slow_reduces_top_speed() {
+        let mut fast = arena();
+        let mut slow = arena();
+        for (sim, slowed) in [(&mut fast, false), (&mut slow, true)] {
+            sim.join("n", "p", 0);
+            solo(sim);
+            if slowed {
+                sim.ships.get_mut("n").unwrap().effects.apply(StatusKind::Slow, 10_000, 0.5, "z");
+            }
+            for _ in 0..200 {
+                sim.apply_intent("n", Intent { thrust: true, aim: Some(0.0), ..Default::default() }, 0);
+                sim.tick(1.0);
+            }
+        }
+        let v = |s: &Sim| {
+            let p = &s.ships["n"];
+            (p.vx * p.vx + p.vy * p.vy).sqrt()
+        };
+        assert!(v(&slow) < v(&fast) * 0.7, "Slow caps a ship well below full speed");
+    }
+
+    #[test]
+    fn a_proximity_mine_arms_and_detonates_on_an_enemy() {
+        let mut s = arena();
+        s.join("a", "A", 0);
+        s.join("e", "E", 200);
+        solo(&mut s);
+        // An already-armed mine owned by A, with enemy E sitting inside its trigger radius.
+        s.mines.push(Mine {
+            owner: "a".into(),
+            x: 1500.0,
+            y: 1500.0,
+            vx: 0.0,
+            vy: 0.0,
+            dmg: 60,
+            blast: 120.0,
+            trigger: 150.0,
+            hue: 40,
+            arm_at: 0,
+            die_at: s.tick + 1000,
+            effect: None,
+        });
+        {
+            let e = s.ships.get_mut("e").unwrap();
+            e.x = 1540.0; // within trigger
+            e.y = 1500.0;
+            e.hp = 300;
+            e.max_hp = 300;
+        }
+        s.tick(1.0);
+        assert!(s.mines.is_empty(), "the mine triggered and was consumed");
+        assert!(!s.explosions.is_empty(), "it detonated with a blast");
+        assert!(s.ships["e"].hp < 300, "the blast damaged the enemy");
+    }
+
+    #[test]
+    fn a_mine_does_not_trigger_on_its_owners_faction() {
+        let mut s = arena();
+        s.join("a", "A", 0);
+        solo(&mut s);
+        s.mines.push(Mine {
+            owner: "a".into(),
+            x: 1500.0,
+            y: 1500.0,
+            vx: 0.0,
+            vy: 0.0,
+            dmg: 60,
+            blast: 120.0,
+            trigger: 150.0,
+            hue: 40,
+            arm_at: 0,
+            die_at: s.tick + 1000,
+            effect: None,
+        });
+        s.ships.get_mut("a").unwrap().x = 1500.0;
+        s.ships.get_mut("a").unwrap().y = 1500.0;
+        s.tick(1.0);
+        assert_eq!(s.mines.len(), 1, "a mine ignores its own faction");
+    }
+
+    #[test]
+    fn a_player_kill_drops_loot_that_a_pilot_collects() {
+        let mut s = arena();
+        s.join("victim", "V", 0);
+        s.join("looter", "L", 200);
+        solo(&mut s);
+        {
+            let v = s.ships.get_mut("victim").unwrap();
+            v.x = 1500.0;
+            v.y = 1500.0;
+        }
+        // Destroy the player: a pickup drops where they died.
+        s.apply_damage("victim", 9999, "looter", s.tick);
+        assert_eq!(s.pickups.len(), 1, "a destroyed player dropped loot");
+        let (px, py) = (s.pickups[0].x, s.pickups[0].y);
+        // Fly the looter onto the pickup; it gets collected on the next tick.
+        {
+            let l = s.ships.get_mut("looter").unwrap();
+            l.x = px;
+            l.y = py;
+        }
+        s.tick(1.0);
+        assert!(s.pickups.is_empty(), "the looter collected the pickup");
+    }
+
+    #[test]
+    fn a_gravity_well_curves_a_ships_path() {
+        use crate::hazard::{Hazards, Well, WellKind};
+        let mut s = arena();
+        s.hazards = Hazards {
+            wells: vec![Well { x: 1400.0, y: 1000.0, radius: 800.0, core_radius: 60.0, mass: 3.0, kind: WellKind::Planet }],
+            nebulae: vec![],
+        };
+        s.join("n", "p", 0);
+        solo(&mut s);
+        {
+            let p = s.ships.get_mut("n").unwrap();
+            p.x = 1000.0;
+            p.y = 1000.0;
+            p.vx = 0.0;
+            p.vy = 0.0;
+        }
+        // No thrust at all — only gravity acts. The ship is pulled toward the well (+x).
+        for _ in 0..5 {
+            s.apply_intent("n", Intent::default(), 0);
+            s.tick(1.0);
+        }
+        assert!(s.ships["n"].vx > 0.0, "gravity pulled the ship toward the well");
+        assert!(s.ships["n"].x > 1000.0, "and moved it inward");
+    }
+
+    #[test]
+    fn a_black_hole_event_horizon_destroys_a_ship() {
+        use crate::hazard::{Hazards, Well, WellKind};
+        let mut s = arena();
+        s.hazards = Hazards {
+            wells: vec![Well { x: 1000.0, y: 1000.0, radius: 900.0, core_radius: 60.0, mass: 4.0, kind: WellKind::BlackHole }],
+            nebulae: vec![],
+        };
+        s.join("doomed", "D", 0);
+        solo(&mut s);
+        {
+            let d = s.ships.get_mut("doomed").unwrap();
+            d.x = 1010.0; // inside the event horizon
+            d.y = 1000.0;
+        }
+        s.tick(1.0);
+        assert!(!s.ships["doomed"].alive, "the event horizon destroyed the ship");
+    }
+
+    #[test]
+    fn arc_chains_between_clustered_enemies() {
+        let mut s = arena();
+        s.join("g", "G", 0);
+        {
+            let g = s.ships.get_mut("g").unwrap();
+            g.weapons.push("arc".into());
+            g.weapon = "arc".into();
+            g.x = 500.0;
+            g.y = 500.0;
+            g.energy = 100.0;
+            g.max_energy = 100.0;
+        }
+        // Three enemies in a chain, each within arc range (460) of the previous.
+        for (i, id) in ["e1", "e2", "e3"].iter().enumerate() {
+            s.join(id, id, 200 + i as u32);
+            let e = s.ships.get_mut(*id).unwrap();
+            e.x = 700.0 + i as f32 * 200.0;
+            e.y = 500.0;
+            e.hp = 300;
+            e.max_hp = 300;
+            e.owner = None;
+        }
+        // Clear all NPC fleets AFTER every join so no stray drones intercept the bolt; each distinct
+        // player id is already its own faction, so the enemies read as hostile.
+        solo(&mut s);
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
+        s.tick(1.0);
+        let arcs = s.beams.iter().filter(|b| b.kind == 2).count();
+        assert!(arcs >= 2, "the bolt forked across multiple enemies, segments={arcs}");
+        let hurt = ["e1", "e2", "e3"].iter().filter(|id| s.ships[**id].hp < 300).count();
+        assert!(hurt >= 2, "at least two clustered enemies took arc damage");
+    }
+
+    #[test]
+    fn overcharge_pickup_buffs_rate_of_fire() {
+        let mut s = arena();
+        s.join("n", "p", 0);
+        solo(&mut s);
+        s.ships.get_mut("n").unwrap().effects.apply(StatusKind::Overcharge, 10_000, 0.5, "self");
+        assert!(s.ships["n"].effects.overcharge_mult() > 1.0, "overcharge is an active buff");
     }
 }

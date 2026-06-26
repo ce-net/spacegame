@@ -1,0 +1,40 @@
+[Unit]
+Description=spacegame adaptive-galaxy node (genesis host + leaderless controller + browser gateway)
+# The galaxy's control plane and authoritative sim run INSIDE this process and reach the mesh through the
+# relay's own CE node, so it must come up after the node (ce-relay) and the hub are live.
+After=network.target ce-relay.service ce-hub.service
+Wants=ce-relay.service
+
+[Service]
+Type=simple
+# Runtime artifacts (binary + live ruleset) live OUTSIDE the synced source tree (/opt/ce-build/spacegame),
+# so a `deploy.sh frontend` re-sync of the sources (rsync --delete) can never clobber the running binary.
+WorkingDirectory=/opt/ce-build/spacegame-run
+# This is the planet-scale server in one command (see spacegame/GALAXY-SCALE.md). It:
+#   - hosts the GENESIS cell here (on the legacy "0_0" play token, so the shipped browser/native client
+#     connects unchanged), reporting its measured load as the quadtree root;
+#   - runs the LEADERLESS CONTROLLER: each epoch it folds per-cell load + the capacity atlas, and for the
+#     cells it owns (rendezvous HRW) splits a hot leaf into four children — hosting the ones assigned here
+#     in-process across its cores and `mesh_deploy`-ing the rest onto other nodes as they join — then
+#     gossips the shape commit so the whole mesh converges. Cold siblings merge back.
+#   - serves as a browser GATEWAY entry point and heartbeats the control plane.
+#   - watches live.json: editing weapons / tech / tunables / SHADERS hot-reloads the whole galaxy live.
+#
+# --max-depth bounds how finely this single relay box subdivides a hot cell across its own cores (it grows
+# wider as real donor nodes join). --split-players sets the "hot" threshold low enough that adaptation is
+# reachable under real load without firing on an empty galaxy.
+ExecStart=/opt/ce-build/spacegame-run/spacegame node \
+  --gateway --region eu-central --hz 20 --max-depth 3 --split-players 60 \
+  --ruleset /opt/ce-build/spacegame-run/live.json
+Restart=always
+RestartSec=3
+# The node holds no secrets and only reaches the local CE node. Keep the box locked down; it only needs to
+# read its own working dir (the binary + the live ruleset file the watcher reads).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ce-build/spacegame-run
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

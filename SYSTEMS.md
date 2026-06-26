@@ -139,3 +139,59 @@ hot state as plain `Copy` arrays stepped by fixed-iteration kernels (no heap, no
 floating shortcuts), which is exactly the layout a GPU wants. **Fault tolerance and GPU
 cross-compatibility are the same requirement seen from two sides: every replica must agree, on any
 device.** Spacegame is the project that keeps us honest about both at once.
+
+---
+
+## 8. Living galaxy: shields, energy, status effects, hazards, mines, loot
+
+The combat and world layers are deepened by five additive systems, all built on the same two
+invariants as everything above — **deterministic** (so replicas agree and failover is seamless) and
+**hot-reloadable data** (so they tune live). They live in `sim.rs` plus two new pure modules,
+`effects.rs` and `hazard.rs`.
+
+### Shields + energy capacitor (`sim.rs`, `ruleset::Tunables`)
+
+Every ship now has a **shield** buffer and an **energy** capacitor on top of hull. Damage is soaked by
+the shield first and only the overflow reaches hull; the shield pauses regenerating for
+`shield_delay` ticks after any hit, then recharges out of combat. Heavy weapons cost **energy**
+(`WeaponDef::energy_cost`) drawn from the capacitor, so a ship cannot fire its railgun, lance and arc
+all at once — it must manage charge. Both are **unlock-gated**: `Tunables::base_shield` defaults to `0`,
+so the classic arena plays damage-to-hull exactly as before until a pilot buys the `shield-cap` /
+`energy-cell` tech (or grabs a cell pickup). Shields/energy are persistent (carried through snapshot
+failover and cross-sector transit) and folded into `Sim::state_hash`, so they are part of the
+anti-cheat agreement.
+
+### Status effects (`effects.rs`)
+
+A weapon can stamp a `StatusEffect` onto what it hits (`WeaponDef::effect`, pure ruleset data): **EMP**
+disables a ship's drive, triggers and shield regen; **Burn** ticks hull damage (bypassing shields)
+credited to the source; **Slow** caps top speed; **Stasis** pins velocity (a tractor lock);
+**Overcharge** is the one *buff* — faster fire and more damage, from a salvaged cell. The `StatusStack`
+keeps at most one effect per kind and on re-application takes the *stronger and longer* of the two, so
+two replicas applying the same hits converge regardless of order. Effects expire by tick number and
+fold into the state hash.
+
+### Environmental hazards (`hazard.rs`)
+
+Each sector grows its own **gravity wells** (planets, stars, black holes) and **nebula clouds** the
+same deterministic way it grows its asteroid field — a pure function of the sector coordinate, so host,
+replicas and renderer agree with zero shared state. Wells bend the path of ships *and* projectiles
+(missiles fall inward, shots arc past a planet); a black hole's core is a **lethal event horizon**;
+nebulae add drag and hide ships from long-range sensors. The home sector `(0,0)` is deliberately calm
+(safe spawn), which also keeps the single-sector arena identical to before. Each sector is effectively
+its own little solar system, simulated on whichever mesh node hosts it.
+
+### New weapon kinds (`ruleset::WeaponKind`, `sim.rs`)
+
+Beyond the original blaster/missile/railgun/laser families: **proximity mines** (`Mine`) — real
+persistent entities that drift, arm after a delay, and detonate on a nearing enemy (snapshotted and
+replicated); **flak** (`Flak`) — shells that burst into AoE shrapnel for point defence; **arc / chain
+lightning** (`Arc`) — an instant bolt that forks between clustered enemies, decaying each hop; plus
+pure-data effect ordnance (EMP torpedo, disruptor, tractor beam) and **cluster** submunitions. All are
+hot-reloadable ruleset entries with tech-tree unlocks; adding more is data, not code.
+
+### Loot / pickups (`sim.rs`)
+
+A destroyed *player* drops a deterministic powerup where they died — Repair, Shield Cell, Energy Cell,
+Overcharge or a Minerals cache — collected by flying over it. Every kill becomes a prize worth
+contesting. Pickups are snapshotted (failover-safe) and folded into the state hash.

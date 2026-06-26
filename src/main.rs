@@ -22,6 +22,8 @@
 use anyhow::{anyhow, Result};
 use ce_rs::{Amount, CeClient};
 use clap::{Parser, Subcommand};
+use spacegame::galaxy::ScalePolicy;
+use spacegame::node::{self, NodeOpts};
 use spacegame::ruleset::Ruleset;
 use spacegame::{director, run_sector, SectorConfig};
 use std::path::PathBuf;
@@ -98,6 +100,42 @@ enum Cmd {
     Nearest {
         #[arg(long, default_value = "0_0")]
         sector: String,
+    },
+    /// PLANET SCALE: run the adaptive-galaxy node daemon. Hosts the cells the galaxy assigns this node,
+    /// runs the leaderless controller (a hot leaf splits into four children placed over the mesh; cold
+    /// siblings merge back), heartbeats the control plane, and — with `--gateway` — advertises as a
+    /// browser entry point. One command per machine; a thousand of them self-organise into one galaxy.
+    Node {
+        /// Accept browser sessions / advertise as a gateway entry point.
+        #[arg(long, default_value_t = false)]
+        gateway: bool,
+        /// Coarse region label for placement (latency clustering is a follow-up; this seeds it).
+        #[arg(long, default_value = "unknown")]
+        region: String,
+        /// Authoritative tick rate of each hosted cell.
+        #[arg(long, default_value_t = 20)]
+        hz: u32,
+        /// Soft quadtree depth cap — guards a weak single host from fragmenting a hot cell forever.
+        #[arg(long, default_value_t = 3)]
+        max_depth: u8,
+        /// Player count that makes a cell "hot" and split. Lower it to see adaptation at low population.
+        #[arg(long)]
+        split_players: Option<u32>,
+        /// HOT RELOAD: watch this ruleset file and hot-push edits to the whole galaxy.
+        #[arg(long)]
+        ruleset: Option<PathBuf>,
+        /// Image `mesh_deploy` runs as a remote child-cell host when placing a cell on another node.
+        #[arg(long, default_value = "ce-net/spacegame:latest")]
+        image: String,
+        /// CE capability token authorizing remote deploys on target hosts.
+        #[arg(long)]
+        grant: Option<String>,
+    },
+    /// Print the live galaxy shape — leaf cells, their hosts, and load heat. The breathing quadtree.
+    Galaxy {
+        /// Seconds to listen to the shape/control gossip before rendering.
+        #[arg(long, default_value_t = 4)]
+        window: u64,
     },
 }
 
@@ -179,6 +217,42 @@ async fn main() -> Result<()> {
                 Some(host) => println!("sector {sector}: nearest live host {host}"),
                 None => println!("sector {sector}: no live host advertising the sector"),
             }
+            Ok(())
+        }
+        Some(Cmd::Node { gateway, region, hz, max_depth, split_players, ruleset, image, grant }) => {
+            // HOT RELOAD watcher (optional), same as `host`: a file save hot-pushes to the whole galaxy.
+            if let Some(path) = ruleset.clone() {
+                let ce2 = ce.clone();
+                let mut sd = tokio_shutdown();
+                tokio::spawn(async move {
+                    if let Err(e) = watch_ruleset(&ce2, &path, &mut sd).await {
+                        tracing::error!(error = %e, "ruleset watcher exited");
+                    }
+                });
+            }
+            let opts = NodeOpts {
+                gateway,
+                region,
+                hz,
+                cell_image: image,
+                grant,
+                max_depth,
+                split_players,
+                ..Default::default()
+            };
+            node::run_node(&ce, opts, async { let _ = tokio::signal::ctrl_c().await; }).await
+        }
+        Some(Cmd::Galaxy { window }) => {
+            let (_galaxy, control, map) =
+                node::observe_galaxy(&ce, Duration::from_secs(window.max(1))).await?;
+            let p = ScalePolicy::default();
+            let s = map.summary();
+            println!(
+                "galaxy: {} leaf cells | {} players | {} host nodes | max depth {}",
+                s.leaf_cells, s.players, s.host_nodes, s.max_depth
+            );
+            println!("live control plane: {} node(s)", control.live_count());
+            println!("{}", map.ascii(p.split_players, p.split_tick_us, p.split_bandwidth_bps));
             Ok(())
         }
     }

@@ -24,8 +24,10 @@ use crate::faction::Faction;
 use crate::shard::SectorId;
 use crate::sim::{Bullet, Sim};
 
-/// Format version, so a future field change can be migrated rather than mis-read.
-pub const SNAPSHOT_VERSION: u32 = 3;
+/// Format version, so a future field change can be migrated rather than mis-read. v4 adds the shield/
+/// energy/status-effect ship fields plus deployed mines and dropped pickups (all `#[serde(default)]`,
+/// so a v3 snapshot still decodes — its ships come back unshielded with full energy and no effects).
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 /// A serializable capture of one ship's authoritative, persistent state. The newer loadout/tech fields
 /// carry `#[serde(default)]` so a v1 snapshot (pre-weapons) still decodes — the ship simply comes back
@@ -42,6 +44,19 @@ pub struct ShipSnap {
     pub a: f32,
     pub hp: i32,
     pub max_hp: i32,
+    /// Shield buffer + capacity (carried so a shielded ship survives failover/transit shielded).
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    /// Energy capacitor charge + capacity.
+    #[serde(default)]
+    pub energy: f32,
+    #[serde(default)]
+    pub max_energy: f32,
+    /// Active status effects (EMP/burn/slow/stasis/overcharge), preserved across failover/transit.
+    #[serde(default)]
+    pub effects: crate::effects::StatusStack,
     pub minerals: u32,
     pub kills: u32,
     pub speed_lv: u32,
@@ -81,6 +96,12 @@ pub struct SectorSnapshot {
     pub tick: u64,
     pub ships: Vec<ShipSnap>,
     pub bullets: Vec<Bullet>,
+    /// Deployed proximity mines drifting in the sector (persistent ordnance — survives failover).
+    #[serde(default)]
+    pub mines: Vec<crate::sim::Mine>,
+    /// Dropped powerup pickups floating in the sector.
+    #[serde(default)]
+    pub pickups: Vec<crate::sim::Pickup>,
     /// Asteroid cells depleted: `(cx, cy, mined_at_tick)`.
     pub mined: Vec<(i32, i32, u64)>,
     /// Always-alive player factions, so a host taking over keeps everyone's economy building without
@@ -111,6 +132,8 @@ impl SectorSnapshot {
             tick: sim.tick,
             ships,
             bullets: sim.bullets.clone(),
+            mines: sim.mines.clone(),
+            pickups: sim.pickups.clone(),
             mined,
             factions,
         }
@@ -124,6 +147,8 @@ impl SectorSnapshot {
         let mut sim = Sim::for_sector(SectorId::new(self.sx, self.sy), std::sync::Arc::new(crate::ruleset::Ruleset::builtin()));
         sim.tick = self.tick;
         sim.bullets = self.bullets.clone();
+        sim.mines = self.mines.clone();
+        sim.pickups = self.pickups.clone();
         for s in &self.ships {
             sim.ships.insert(s.id.clone(), crate::sim::Ship::from_snap(s, self.tick));
         }
