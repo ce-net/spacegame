@@ -91,6 +91,7 @@ pub struct SectorConfig {
     /// Container image used when this host autoscale-deploys a neighbouring sector cell.
     pub image: String,
 }
+#[cfg(feature = "mesh")]
 
 impl Default for SectorConfig {
     fn default() -> Self {
@@ -105,10 +106,12 @@ impl Default for SectorConfig {
         }
     }
 }
+#[cfg(feature = "mesh")]
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
+#[cfg(feature = "mesh")]
 
 /// Compare the replicas' state proofs collected for one checkpoint `tick` and log the verdict — the
 /// anti-cheat agreement step. `votes` maps node id -> state hash. If a strict majority agrees and this
@@ -136,6 +139,7 @@ fn judge_proofs(host_id: &str, region: &str, tick: u64, votes: &std::collections
         tracing::warn!(region, tick, suspects = ?a.dissent, "replica(s) disagree with the quorum — faulty or cheating, will be re-synced/excluded");
     }
 }
+#[cfg(feature = "mesh")]
 
 /// Where to re-admit a transiting ship into *this* sector when its destination neighbour has no live
 /// host (solo / not-yet-autoscaled world): place it just inside the edge it tried to leave, so it
@@ -159,6 +163,7 @@ fn readmit_coords(here: shard::SectorId, t: &sim::Transit) -> (f32, f32) {
     }
     (x, y)
 }
+#[cfg(feature = "mesh")]
 
 /// Host one sector until `shutdown` resolves.
 ///
@@ -484,12 +489,14 @@ pub async fn run_sector(
         }
     }
 }
+#[cfg(feature = "mesh")]
 
 /// Discover the NodeId of a backend currently hosting `sector`, if any (via the DHT service record).
 pub async fn discover_host(ce: &CeClient, sector: &str) -> Result<Option<String>> {
     let providers = ce.find_service(&topics::service(sector)).await?;
     Ok(providers.into_iter().next())
 }
+#[cfg(feature = "mesh")]
 
 /// **Replication / failover:** find the freshest replicated snapshot for `sector` and restore its
 /// [`Sim`], or `None` if none is available right now. Subscribes to the sector's snapshot topic, waits
@@ -524,6 +531,7 @@ pub async fn adopt_latest_snapshot(ce: &CeClient, sector: &str) -> Result<Option
         None => Ok(None),
     }
 }
+#[cfg(feature = "mesh")]
 
 /// Convenience: connect to the local node and host `sector` forever (until ctrl-c).
 pub async fn host_local(sector: &str, hz: u32) -> Result<()> {
@@ -541,7 +549,7 @@ pub async fn host_local(sector: &str, hz: u32) -> Result<()> {
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mesh"))]
 mod tests {
     use super::*;
 

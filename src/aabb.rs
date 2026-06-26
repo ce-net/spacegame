@@ -265,18 +265,6 @@ impl<T: Clone> AabbTree<T> {
         }
     }
 
-    /// A small region pad used only for pruning. Because items are bucketed by centre, an item box can
-    /// extend at most half its own width past its region edge; rather than track per-region item
-    /// extents we pad the region by a conservative slack so pruning never drops a leaf that holds a
-    /// true overlap. The leaf's precise `intersects` test then removes the false positives.
-    fn span_pad(&self) -> f32 {
-        // Half the bounds width over 2^max_depth, scaled up — comfortably larger than any leaf's
-        // worst-case item overhang for the entity sizes this game uses. Conservative on purpose:
-        // over-padding only costs a few extra leaf visits, never correctness.
-        let w = (self.bounds.max_x - self.bounds.min_x).max(self.bounds.max_y - self.bounds.min_y);
-        let leaf_w = w / (1u32 << self.max_depth.min(20)) as f32;
-        leaf_w.max(64.0)
-    }
 
     /// `(node_count, max_depth_reached)` — for tests/telemetry that the tree actually subdivided.
     pub fn stats(&self) -> (usize, u32) {
