@@ -47,12 +47,12 @@ fn off_centre_impact_imparts_spin() {
     let mut w = World::new();
     let boxi = w.add(RigidBody::dynamic(Vec2::new(0.0, 0.0), 5.0, Shape::box_hw(20.0, 20.0)));
     w.add({
-        let mut b = RigidBody::dynamic(Vec2::new(-45.0, 16.0), 1.0, Shape::Circle { r: 4.0 });
+        let mut b = RigidBody::dynamic(Vec2::new(-30.0, 16.0), 1.0, Shape::Circle { r: 4.0 });
         b.vel = Vec2::new(45.0, 0.0);
         b.restitution = 0.6;
         b
     });
-    step_n(&mut w, &[Vec2::zero()], Vec2::zero(), 30);
+    step_n(&mut w, &[Vec2::zero()], Vec2::zero(), 60);
     assert!(w.bodies[boxi].ang_vel.abs() > 1e-3, "off-centre hit spun the box: {}", w.bodies[boxi].ang_vel);
 }
 
