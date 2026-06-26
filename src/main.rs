@@ -1,26 +1,26 @@
-//! game-spacegame binary — host CE Spacegame **sectors** over the mesh, or **place** a sector's
+//! spacegame binary — host CE Spacegame **sectors** over the mesh, or **place** a sector's
 //! authoritative cell on the best mesh node.
 //!
 //! Connects to the local CE node (`http://127.0.0.1:8844`) which is the libp2p mesh.
 //!
 //! ```text
 //! ce start                                     # the local node must be running
-//! game-spacegame host --sector 0_0             # host the origin sector here
-//! game-spacegame host --sector 0_0 --sector 1_0 --sector 0_1
+//! spacegame host --sector 0_0             # host the origin sector here
+//! spacegame host --sector 0_0 --sector 1_0 --sector 0_1
 //!                                              # host several sectors (independent cells) from one process
-//! game-spacegame place --sector 1_0 --image ce-net/game-spacegame:latest
+//! spacegame place --sector 1_0 --image ce-net/spacegame:latest
 //!                                              # atlas-guided: pick the best host and deploy the cell there
-//! game-spacegame shard --sector 1_0            # which node rendezvous-hash assigns this sector to
-//! game-spacegame nearest --sector 1_0          # nearest live host of this sector (client view)
+//! spacegame shard --sector 1_0            # which node rendezvous-hash assigns this sector to
+//! spacegame nearest --sector 1_0          # nearest live host of this sector (client view)
 //! ```
 
 use anyhow::{anyhow, Result};
 use ce_rs::{Amount, CeClient};
 use clap::{Parser, Subcommand};
-use game_spacegame::{director, run_sector, SectorConfig};
+use spacegame::{director, run_sector, SectorConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "game-spacegame", about = "Authoritative, sector-sharded mesh backend for CE Spacegame")]
+#[command(name = "spacegame", about = "Authoritative, sector-sharded mesh backend for CE Spacegame")]
 struct Args {
     /// Override the local node base URL (defaults to the SDK's 127.0.0.1:8844).
     #[arg(long, env = "CE_BASE_URL", global = true)]
@@ -29,7 +29,7 @@ struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
-    /// Back-compat: `game-spacegame --sector X` with no subcommand hosts sector(s) locally.
+    /// Back-compat: `spacegame --sector X` with no subcommand hosts sector(s) locally.
     #[arg(long = "sector", global = true)]
     sectors: Vec<String>,
 
@@ -55,8 +55,8 @@ enum Cmd {
     Place {
         #[arg(long, default_value = "0_0")]
         sector: String,
-        /// Container image carrying the `game-spacegame` binary to run as the cell.
-        #[arg(long, default_value = "ce-net/game-spacegame:latest")]
+        /// Container image carrying the `spacegame` binary to run as the cell.
+        #[arg(long, default_value = "ce-net/spacegame:latest")]
         image: String,
         #[arg(long, default_value_t = 3600)]
         duration_secs: u64,

@@ -1,4 +1,4 @@
-# game-spacegame
+# spacegame
 
 Authoritative, **sector-sharded** mesh backend for **CE Spacegame** — a real-time multiplayer space
 arena, built as a flagship demonstration that **CE is a global supercomputer**, not a single shallow
@@ -17,12 +17,12 @@ another, and even the ship's color (derived from the NodeId) is unspoofable.
 
 ```
 ce start                                       # the local node must be running (this is the mesh)
-game-spacegame host --sector 0_0               # host the origin sector here
-game-spacegame host --sector 0_0 --sector 1_0  # host several sectors (independent cells) at once
-game-spacegame place --sector 1_0 --image ce-net/game-spacegame:latest
+spacegame host --sector 0_0               # host the origin sector here
+spacegame host --sector 0_0 --sector 1_0  # host several sectors (independent cells) at once
+spacegame place --sector 1_0 --image ce-net/spacegame:latest
                                                # atlas-guided: pick the best host, deploy the cell there
-game-spacegame shard   --sector 1_0            # which node rendezvous-hash assigns this sector to
-game-spacegame nearest --sector 1_0            # nearest live host of this sector (client view)
+spacegame shard   --sector 1_0            # which node rendezvous-hash assigns this sector to
+spacegame nearest --sector 1_0            # nearest live host of this sector (client view)
 ```
 
 The frontend (`web/demos/spacegame/`) talks to these backends **only over the CE mesh**, through the
@@ -56,8 +56,8 @@ unit-tested** — no mesh, no network, no clock. `director` and `lib` hold the t
 
 | Capability | Where it is wired (real `ce-rs` SDK calls) | What a live multi-node mesh shows |
 |---|---|---|
-| **Distribution** — run logic on the best *other* node | `director::choose_host` reads `ce.atlas()`; `director::deploy_sector_cell` calls `ce.mesh_deploy(node_id, spec, grant)` to place a sector cell on a chosen node; the cell runs this very binary (`game-spacegame host --sector …`). | Run `game-spacegame place --sector 1_0` on node A; the authoritative sim for that region appears on node B (the latency-optimal capable host), not on A. |
-| **Concurrency** — many independent cells at once | The galaxy is a grid of sectors; `shard::shard_for` rendezvous-hashes each `SectorId` to a host with no coordinator; `host_sectors` runs each sector in its own `tokio` task. | `game-spacegame shard --sector …` over many sectors shows them spread evenly across nodes; each sector ticks independently and concurrently. |
+| **Distribution** — run logic on the best *other* node | `director::choose_host` reads `ce.atlas()`; `director::deploy_sector_cell` calls `ce.mesh_deploy(node_id, spec, grant)` to place a sector cell on a chosen node; the cell runs this very binary (`spacegame host --sector …`). | Run `spacegame place --sector 1_0` on node A; the authoritative sim for that region appears on node B (the latency-optimal capable host), not on A. |
+| **Concurrency** — many independent cells at once | The galaxy is a grid of sectors; `shard::shard_for` rendezvous-hashes each `SectorId` to a host with no coordinator; `host_sectors` runs each sector in its own `tokio` task. | `spacegame shard --sector …` over many sectors shows them spread evenly across nodes; each sector ticks independently and concurrently. |
 | **Latency** — pick the lowest-latency host; bound bandwidth | `director::gather_candidates` joins `ce.atlas()` with `ce.netgraph()` (measured RTT); `shard::best_host` scores latency-first; the client uses `director::nearest_sector_host` + `ce.find_service`; **interest management** via `SectorId::neighbors` limits a client to its 9-sector neighbourhood; realtime is the `/mesh/messages/stream` **SSE** push, never polling. | A client near node B is handed B as its sector host; a far-away galaxy region's state never reaches it (bounded per-client bandwidth at any world size). |
 | **Replication** — snapshot + failover | `director::replicate_snapshot` serializes a `SectorSnapshot` and `ce.put_object()`s it (content-addressed, chunked), `ce.advertise_service`s + `ce.publish`es the CID; `adopt_latest_snapshot` + `director::restore_snapshot` (`ce.get_object`) restore it on a new host. Every node that fetches the object caches it — every node is a CDN edge. | Kill a sector host; a standby host adopts the latest snapshot CID and resumes that region with at most one snapshot-interval (~5s) of loss, instead of an empty sector. |
 | **Consensus** — tamper-proof leaderboard | `leaderboard` builds a canonical, order-independent galaxy board (cross-sector `merge`); `director::seal_leaderboard` `ce.put_object()`s the canonical bytes (the CID is a tamper-evident fingerprint), binds it to `ce.beacon()` (PoW tip height + hash) into a `Commitment`, and `ce.publish`es it on the seal topic. | Any stranger re-fetches the board by CID, recomputes the digest, and checks the height/hash against the chain — a final score is verifiable and a dishonest host that edits a sealed board produces a different CID, breaking its own commitment. (CRDTs provably cannot do this.) |
@@ -94,7 +94,7 @@ store, and seals against its own chain tip — the same code paths, just not yet
 Build and test on Hetzner (never locally — the dev laptop disk is tiny):
 
 ```
-cd ~/ce-net && tools/remote-test.sh game-spacegame --clippy
+cd ~/ce-net && tools/remote-test.sh spacegame --clippy
 ```
 
 All deterministic logic is covered by `#[cfg(test)]` unit tests in each pure module.

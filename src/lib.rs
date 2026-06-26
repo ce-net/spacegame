@@ -1,4 +1,4 @@
-//! game-spacegame — an authoritative, **sector-sharded** mesh backend for **CE Spacegame**, a
+//! spacegame — an authoritative, **sector-sharded** mesh backend for **CE Spacegame**, a
 //! real-time multiplayer space arena, built as a flagship demonstration that CE is a global
 //! supercomputer.
 //!

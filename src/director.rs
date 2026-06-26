@@ -85,7 +85,7 @@ pub async fn shard_owner(ce: &CeClient, sector: &str) -> Result<Option<String>> 
 }
 
 /// **Distribution:** place the cell that hosts `sector` on `node_id` over the mesh (`mesh_deploy`).
-/// The deployed cell runs `game-spacegame host --sector <sector>` — the very binary this crate builds
+/// The deployed cell runs `spacegame host --sector <sector>` — the very binary this crate builds
 /// — so the authoritative simulation of that region of space runs on the chosen node. Returns the
 /// host-assigned job id.
 pub async fn deploy_sector_cell(
@@ -99,7 +99,7 @@ pub async fn deploy_sector_cell(
 ) -> Result<String> {
     let spec = BidSpec {
         image: image.to_string(),
-        cmd: vec!["game-spacegame".into(), "host".into(), "--sector".into(), sector.to_string()],
+        cmd: vec!["spacegame".into(), "host".into(), "--sector".into(), sector.to_string()],
         cpu_cores: MIN_CORES,
         mem_mb: MIN_MEM_MB as u64,
         duration_secs,
