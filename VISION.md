@@ -52,3 +52,7 @@ paraphrase or "correct" the quotes below.
 ### 9 — this document
 
 > document everything ive said, raw
+
+### 10 — factions are NPC ships you command
+
+> Yeah we need to keep track of factions. Factions are actual npc ships under your command.

@@ -1707,6 +1707,76 @@ mod tests {
     }
 
     #[test]
+    fn faction_roster_becomes_npc_fleet_ships_under_command() {
+        let mut s = arena();
+        s.join("A", "Ace", 10);
+        // Put a fighter and an extra drone on A's roster; reconciliation must field them as ships.
+        {
+            let f = s.factions.get_mut("A").unwrap();
+            f.units.push(crate::faction::Unit { kind: UnitKind::Fighter, hp: 90 });
+        }
+        s.tick(1.0);
+        let fleet: Vec<String> = s
+            .ships
+            .iter()
+            .filter(|(_, sh)| sh.owner.as_deref() == Some("A"))
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert!(fleet.iter().any(|id| id.starts_with("npc:A:")), "faction fielded NPC ships: {fleet:?}");
+        assert!(s.ships.values().any(|sh| sh.role == ShipRole::Fighter && sh.owner.as_deref() == Some("A")));
+
+        // Commanding the fleet sets the standing order every NPC obeys.
+        s.command_faction("A", FactionCommand::AttackNearest);
+        assert_eq!(s.factions["A"].command, FactionCommand::AttackNearest);
+    }
+
+    #[test]
+    fn npc_fighter_engages_an_enemy_and_death_strikes_the_roster() {
+        let mut s = arena();
+        s.join("A", "Ace", 10);
+        s.join("B", "Bee", 200);
+        // A fighter for A, parked next to enemy B; ordered to attack.
+        s.factions.get_mut("A").unwrap().units.push(crate::faction::Unit { kind: UnitKind::Fighter, hp: 90 });
+        s.command_faction("A", FactionCommand::AttackNearest);
+        s.tick(1.0); // spawn the fighter
+        let fid = s
+            .ships
+            .iter()
+            .find(|(_, sh)| sh.role == ShipRole::Fighter && sh.owner.as_deref() == Some("A"))
+            .map(|(id, _)| id.clone())
+            .expect("a fighter exists");
+        // Place fighter right on top of B and run; the NPC should shoot B.
+        {
+            let b = s.ships.get_mut("B").unwrap();
+            b.x = 1500.0;
+            b.y = 1500.0;
+            b.hp = 12;
+        }
+        {
+            let g = s.ships.get_mut(&fid).unwrap();
+            g.x = 1500.0 - 60.0;
+            g.y = 1500.0;
+        }
+        let before = s.factions["A"].unit_count(UnitKind::Fighter);
+        for _ in 0..60 {
+            // keep B in place (don't let it drift) so the fighter has a stationary target
+            if let Some(b) = s.ships.get_mut("B") {
+                b.x = 1500.0;
+                b.y = 1500.0;
+            }
+            s.tick(1.0);
+        }
+        // The enemy should have taken fire (dead or damaged).
+        let b_dead_or_hurt = s.ships.get("B").map(|b| !b.alive || b.hp < 12).unwrap_or(true);
+        assert!(b_dead_or_hurt, "the NPC fighter engaged the enemy");
+
+        // Now kill the fighter and confirm the roster shrinks and the ship is gone (no respawn).
+        s.apply_damage(&fid, 9999, "B", s.tick);
+        assert!(!s.ships.contains_key(&fid), "destroyed NPC is removed from the world");
+        assert!(s.factions["A"].unit_count(UnitKind::Fighter) < before, "the loss struck the faction roster");
+    }
+
+    #[test]
     fn a_ship_cannot_shoot_itself() {
         let mut s = arena();
         s.join("n", "p", 0);

@@ -202,7 +202,12 @@ pub async fn seal_leaderboard(ce: &CeClient, board: &Leaderboard, host: &str) ->
 /// Reduce one sector's sim to its `(id, name, kills)` standings as a [`Leaderboard`] — the per-shard
 /// contribution the binary folds across sectors before sealing.
 pub fn board_for_sector(sim: &Sim) -> Leaderboard {
-    let rows = sim.ships.iter().map(|(id, s)| (id.clone(), s.name.clone(), s.kills));
+    // Only human players are ranked; NPC fleet ships (owner = Some) are excluded.
+    let rows = sim
+        .ships
+        .iter()
+        .filter(|(_, s)| s.owner.is_none())
+        .map(|(id, s)| (id.clone(), s.name.clone(), s.kills));
     Leaderboard::from_scores(GALAXY, sim.tick, rows)
 }
 

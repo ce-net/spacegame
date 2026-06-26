@@ -65,8 +65,9 @@ src/
   physics.rs      advanced 2D rigid-body engine (mass, inertia, restitution, friction, angular impulse)
                   with level-of-detail precision: high framerate near players, coarse far away. GPU/SoA-
                   friendly so replicas stay bit-identical across CPU and GPU.
-  faction.rs      your always-alive faction: factories, swarm, resources, tech, and an autonomous build
-                  policy that spends your resources for you every tick, online or not.
+  faction.rs      your always-alive faction: factories, resources, tech, an autonomous build policy that
+                  spends your resources for you, and a roster that becomes a real NPC fleet (drones/
+                  fighters/haulers) you command (sim drives their AI; FactionView tracks them).
   replication.rs  proximity-replica fault tolerance: K high-precision replicas on nearby players' nodes,
                   heartbeat failure detection, deterministic takeover, re-replicate to the next best.
   ruleset.rs      the hot-reloadable game definition as DATA: weapon catalogue, tech tree, physics

@@ -53,22 +53,33 @@ follows the parent as it translates and rotates.
 
 ---
 
-## 3. Always-alive factions / factories / swarm (`faction.rs`)
+## 3. Always-alive factions — an NPC fleet under your command (`faction.rs` + `sim.rs`)
 
 Every player owns a [`Faction`]: harvesters, refineries, solar, factories, shipyards and turrets; a
-swarm of drones/fighters/haulers; a resource stockpile; a tech list. It runs a deterministic economy
+roster of drones/fighters/haulers; a resource stockpile; a tech list. It runs a deterministic economy
 **every tick, online or offline**:
 
 1. buildings generate and refine resources;
 2. the build queue advances and completes;
-3. when idle, the [`AutoPolicy`] **spends your resources for you** — it keeps the economy growing toward
-   target ratios, then expands the military, then upgrades — so you return to a bigger base and a larger
-   swarm you never had to micromanage.
+3. when idle, the [`AutoPolicy`] **spends your resources for you** — it grows the economy toward target
+   ratios, then expands the military, then upgrades — so you return to a bigger base and a larger fleet
+   you never had to micromanage.
 
-Live mining in the arena deposits straight into your faction stockpile, bridging the twitch game to the
-persistent industrial layer. Factions are serialized into the sector snapshot and replicated (§4), so a
-host handover never costs you a tick of production. "Your faction is always alive" is literal: the
-faction ticks independently of whether your ship is even in the sector.
+**The roster is not abstract — it is real ships in the world.** Each unit the economy builds is
+reconciled into an actual NPC ship (`sim::reconcile_fleets`): drones, fighters and haulers spawn near
+you, fly, collide and fight with the same authoritative simulation as players. They obey a standing
+**[`FactionCommand`]** you set over the wire (`defend` / `follow` / `mine` / `hold` / `attack_nearest` /
+`attack_move`): the fleet AI (`sim::drive_npcs`) makes fighters hunt enemy ships (any ship of another
+faction), drones seek and mine asteroids (banking minerals straight to your stockpile), and haulers
+escort. A fleet ship that dies is removed and **struck from the roster** — you lose a ship and must
+build another; NPCs do not respawn.
+
+Everything is **tracked**: per-player faction summaries (economy + live fleet count + standing order)
+ride the snapshot wire as `FactionView`, and the NPC ships carry `owner`/`role` so a client and the e2e
+can tell your fleet from enemies. Live mining (yours or a drone's) deposits into the owning faction.
+Factions and their fleet ships are serialized into the sector snapshot and replicated (§4), so a host
+handover never costs you a tick of production or a ship. "Your faction is always alive" is literal: it
+ticks — builds, mines, fights — whether or not your own ship is in the sector.
 
 ---
 
