@@ -207,7 +207,7 @@ pub enum PlacementKind {
 pub struct Placement {
     #[serde(default)]
     pub at: Transform2D,
-    #[serde(flatten)]
+    /// What this placement instantiates (a concrete object or a nested blueprint).
     pub kind: PlacementKind,
     /// Literal numeric customisation (e.g. `w`, `h`, `r` resize the shape).
     #[serde(default)]
