@@ -23,6 +23,12 @@ each one defines underneath. Keep this file up to date as the design evolves.
 
 > Document this verbatim
 
+> Deploy it globally! Always!
+
+(=> Standing rule: every spacegame iteration is deployed live via `bash deploy/deploy.sh` — backend
+adaptive-galaxy node + wasm frontend published through ce-serve — gated by the live browser smoke test.
+"Always" = make global deploy the default end-step of a change, not an opt-in.)
+
 ---
 
 ## What these define (the model we are building toward)
