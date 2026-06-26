@@ -22,8 +22,9 @@ use ce_rs::{Amount, BidSpec, CeClient, Receipt};
 use std::collections::HashMap;
 
 use crate::leaderboard::{Commitment, Leaderboard};
-use crate::shard::{best_host, nearest_host, shard_for, HostCandidate};
-use crate::sim::Sim;
+use crate::ruleset::Ruleset;
+use crate::shard::{best_host, nearest_host, shard_for, HostCandidate, SectorId};
+use crate::sim::{Sim, Transit};
 use crate::snapshot::SectorSnapshot;
 use crate::wire::topics;
 
@@ -233,6 +234,154 @@ pub async fn pay_host_tick(ce: &CeClient, channel_id: &str, host: &str, cumulati
     ce.sign_receipt(channel_id, host, cumulative).await.context("sign receipt")
 }
 
+// ----------------------------------------------------------------------------------------------
+// INFINITE MAP: cross-sector transit delivery.
+// ----------------------------------------------------------------------------------------------
+
+/// The pubsub topic on which a host receives ships arriving from neighbouring sectors. A host
+/// subscribes to its own sector's transit topic; a neighbour publishes a [`Transit`] here when one of
+/// its ships crosses the shared edge.
+pub fn transit_topic(sector: &str) -> String {
+    format!("{}/transit", topics::service(sector))
+}
+
+/// Deliver a ship that left this sector to its destination sector over the mesh. Whichever host is
+/// running the destination sector is subscribed to that sector's [`transit_topic`] and will
+/// [`accept_transit`](crate::sim::Sim::accept_transit) it. Best-effort: a transient publish failure is
+/// surfaced so the caller can apply its solo-wrap fallback.
+pub async fn publish_transit(ce: &CeClient, t: &Transit) -> Result<()> {
+    let topic = transit_topic(&t.to.token());
+    let bytes = serde_json::to_vec(t).context("encode transit")?;
+    ce.publish(&topic, &bytes).await.with_context(|| format!("publish transit to {}", t.to.token()))?;
+    tracing::debug!(to = %t.to.token(), ship = %t.ship.id, "handed ship to neighbouring sector");
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------------
+// HOT RELOAD: distribute a new ruleset across the mesh, live.
+// ----------------------------------------------------------------------------------------------
+
+/// The galaxy-wide config topic on which the live ruleset's CID + version is announced. Every sector
+/// host and every client subscribes; a higher version wins, so a balance/shader edit reaches the whole
+/// mesh instantly with no restart.
+pub fn ruleset_topic() -> String {
+    format!("ce-game/{}/{}/ruleset", topics::GAME, GALAXY)
+}
+
+/// The DHT service holders of the latest ruleset advertise, so a node that joins late can pull the
+/// current ruleset without waiting for the next announcement.
+pub fn ruleset_service() -> String {
+    format!("ce-game/{}/{}/ruleset", topics::GAME, GALAXY)
+}
+
+/// An announcement that a new ruleset is live: its content-addressed CID and its version. Published on
+/// [`ruleset_topic`] after a designer pushes an edit.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RulesetAnnounce {
+    pub cid: String,
+    pub version: u64,
+}
+
+/// **Hot reload (publish side):** store the new ruleset as a content-addressed object, advertise the
+/// ruleset service, and announce its CID + version on the config topic. Every live host re-tunes and
+/// every live client re-fetches shaders/weapon stats — instantly, no restart. Returns the CID.
+pub async fn publish_ruleset(ce: &CeClient, ruleset: &Ruleset) -> Result<String> {
+    ruleset.validate().map_err(|e| anyhow::anyhow!("refusing to publish invalid ruleset: {e}"))?;
+    let bytes = ruleset.encode().context("encode ruleset")?;
+    let cid = ce.put_object(&bytes).await.context("put_object ruleset")?;
+    if let Err(e) = ce.advertise_service(&ruleset_service()).await {
+        tracing::debug!(error = %e, "ruleset-service advertise failed (continuing)");
+    }
+    let ann = RulesetAnnounce { cid: cid.clone(), version: ruleset.version };
+    let frame = serde_json::to_vec(&ann).context("encode ruleset announce")?;
+    ce.publish(&ruleset_topic(), &frame).await.context("publish ruleset announce")?;
+    tracing::info!(version = ruleset.version, cid, label = %ruleset.label, "published live ruleset to the mesh (hot reload)");
+    Ok(cid)
+}
+
+/// **Hot reload (fetch side):** fetch and decode a ruleset object by CID (validating it). Called by a
+/// host or client when it sees a higher version announced.
+pub async fn fetch_ruleset(ce: &CeClient, cid: &str) -> Result<Ruleset> {
+    let bytes = ce.get_object(cid).await.with_context(|| format!("get_object ruleset {cid}"))?;
+    Ruleset::decode(&bytes).context("decode ruleset")
+}
+
+/// Pull the current live ruleset on startup, if any holder advertises one — so a freshly started host
+/// joins already running the latest balance, not the built-in default. `None` if none is published.
+pub async fn adopt_latest_ruleset(ce: &CeClient) -> Result<Option<Ruleset>> {
+    use futures_util::StreamExt as _;
+    let topic = ruleset_topic();
+    ce.subscribe(&topic).await?;
+    let mut best: Option<RulesetAnnounce> = None;
+    let listen = async {
+        if let Ok(stream) = ce.messages_stream().await {
+            tokio::pin!(stream);
+            while let Some(Ok(m)) = stream.next().await {
+                if m.topic != topic {
+                    continue;
+                }
+                if let Ok(bytes) = m.payload()
+                    && let Ok(ann) = serde_json::from_slice::<RulesetAnnounce>(&bytes)
+                    && best.as_ref().map(|b| ann.version > b.version).unwrap_or(true)
+                {
+                    best = Some(ann);
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), listen).await;
+    match best {
+        Some(ann) => Ok(Some(fetch_ruleset(ce, &ann.cid).await?)),
+        None => Ok(None),
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// AUTOSCALE: spread load across the mesh as a region fills up.
+// ----------------------------------------------------------------------------------------------
+
+/// A sector is "under pressure" once it carries this many ships — the cue to pre-warm its neighbours so
+/// players spilling across an edge land on a host that is already simulating that region.
+pub const PREWARM_THRESHOLD: usize = 80;
+
+/// **Autoscale:** when a sector is busy, proactively place its still-unhosted neighbouring sectors on
+/// the best mesh hosts, so the seamless infinite map keeps spreading load instead of piling everyone
+/// onto one cell. Returns the sectors that were newly placed. Idempotent: a neighbour that already has
+/// a live host is left alone. Safe to call periodically from a busy host.
+pub async fn prewarm_neighbors(
+    ce: &CeClient,
+    sector: &str,
+    image: &str,
+    duration_secs: u64,
+    bid: Amount,
+    grant: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(here) = SectorId::parse(sector) else { return Ok(vec![]) };
+    let cands = gather_candidates(ce).await?;
+    let mut placed = Vec::new();
+    for n in here.neighbors() {
+        if n == here {
+            continue;
+        }
+        let tok = n.token();
+        // Already hosted? Skip.
+        if !ce.find_service(&topics::service(&tok)).await.unwrap_or_default().is_empty() {
+            continue;
+        }
+        let Some(host) = best_host(&cands, MIN_CORES, MIN_MEM_MB).map(|c| c.node_id.clone()) else {
+            continue;
+        };
+        match deploy_sector_cell(ce, &host, &tok, image, duration_secs, bid, grant).await {
+            Ok(job) => {
+                tracing::info!(sector = %tok, host, job, "autoscale: pre-warmed neighbouring sector");
+                placed.push(tok);
+            }
+            Err(e) => tracing::debug!(error = %e, sector = %tok, "autoscale pre-warm failed (continuing)"),
+        }
+    }
+    Ok(placed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +389,12 @@ mod tests {
     // The director's logic is wired SDK I/O; the deterministic decisions it composes are tested in
     // their own modules. These pin the pure string/topic helpers clients and standby hosts must agree
     // on exactly, plus the per-sector board reduction.
+
+    #[test]
+    fn transit_and_ruleset_topics_are_stable() {
+        assert_eq!(transit_topic("1_0"), "ce-game/spacegame/1_0/transit");
+        assert_eq!(ruleset_topic(), "ce-game/spacegame/main/ruleset");
+    }
 
     #[test]
     fn seal_topic_is_galaxy_scoped() {

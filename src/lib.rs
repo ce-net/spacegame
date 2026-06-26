@@ -35,9 +35,11 @@
 //! The library half (`sim`, `shard`, `wire`, `room`, `snapshot`, `leaderboard`) is pure and fully
 //! unit-tested; this module adds the thin mesh I/O loop that the binary drives.
 
+pub mod aabb;
 pub mod director;
 pub mod leaderboard;
 pub mod room;
+pub mod ruleset;
 pub mod shard;
 pub mod sim;
 pub mod snapshot;
@@ -45,8 +47,10 @@ pub mod wire;
 
 use anyhow::{anyhow, Result};
 use ce_rs::CeClient;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use ruleset::Ruleset;
 pub use wire::topics;
 
 /// Configuration for one hosted sector.
@@ -64,6 +68,11 @@ pub struct SectorConfig {
     /// disables. (A multi-sector host can instead seal the merged galaxy board centrally; see the
     /// binary.)
     pub seal_every: u64,
+    /// **Autoscale:** how often (ticks) a busy host pre-warms neighbouring sectors (`0` disables). The
+    /// image deployed for a pre-warmed neighbour is [`SectorConfig::image`].
+    pub prewarm_every: u64,
+    /// Container image used when this host autoscale-deploys a neighbouring sector cell.
+    pub image: String,
 }
 
 impl Default for SectorConfig {
@@ -74,6 +83,8 @@ impl Default for SectorConfig {
             advertise_every: 100,
             snapshot_every: 100,
             seal_every: 600,
+            prewarm_every: 0,
+            image: "ce-net/spacegame:latest".into(),
         }
     }
 }
@@ -103,13 +114,34 @@ pub async fn run_sector(
     let in_topic = topics::input(&cfg.sector);
     let state_topic = topics::state(&cfg.sector);
     let service = topics::service(&cfg.sector);
+    let transit_topic = director::transit_topic(&cfg.sector);
+    let ruleset_topic = director::ruleset_topic();
+    let sector_id = shard::SectorId::parse(&cfg.sector).unwrap_or(shard::SectorId::new(0, 0));
 
     ce.subscribe(&in_topic).await?;
+    // INFINITE MAP: receive ships arriving from neighbouring sectors.
+    if let Err(e) = ce.subscribe(&transit_topic).await {
+        tracing::debug!(error = %e, "transit subscribe failed (continuing)");
+    }
+    // HOT RELOAD: listen for live ruleset updates pushed to the whole galaxy.
+    if let Err(e) = ce.subscribe(&ruleset_topic).await {
+        tracing::debug!(error = %e, "ruleset subscribe failed (continuing)");
+    }
     if let Err(e) = ce.advertise_service(&service).await {
         tracing::warn!(error = %e, "initial advertise_service failed (continuing)");
     }
 
     let hz = cfg.hz.max(1);
+
+    // HOT RELOAD: start from the latest published ruleset if one exists, else the built-in default.
+    let mut rules: Arc<Ruleset> = match director::adopt_latest_ruleset(ce).await {
+        Ok(Some(r)) => {
+            tracing::info!(version = r.version, label = %r.label, "adopted live ruleset on startup");
+            Arc::new(r)
+        }
+        _ => Arc::new(Ruleset::builtin()),
+    };
+
     // REPLICATION / FAILOVER: adopt a previous host's latest snapshot for this sector so play resumes
     // from that state instead of an empty sector. Best-effort — a fresh sector starts clean.
     let mut sim = match adopt_latest_snapshot(ce, &cfg.sector).await {
@@ -117,12 +149,15 @@ pub async fn run_sector(
             tracing::info!(sector = %cfg.sector, tick = s.tick, ships = s.player_count(), "adopted replicated snapshot on startup");
             s
         }
-        Ok(None) => sim::Sim::new(),
+        Ok(None) => sim::Sim::for_sector(sector_id, rules.clone()),
         Err(e) => {
             tracing::debug!(error = %e, "snapshot adoption failed; starting fresh");
-            sim::Sim::new()
+            sim::Sim::for_sector(sector_id, rules.clone())
         }
     };
+    // Make sure the restored/fresh sim runs the current sector + live ruleset.
+    sim.sector = sector_id;
+    sim.apply_ruleset(rules.clone());
     let mut tick_timer = tokio::time::interval(Duration::from_millis((1000 / hz as u64).max(1)));
     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -157,6 +192,30 @@ pub async fn run_sector(
                 // Fixed-rate authoritative tick + snapshot broadcast.
                 _ = tick_timer.tick() => {
                     sim.tick(1.0);
+
+                    // INFINITE MAP: hand off ships that crossed an edge to their destination sector. If
+                    // no host runs that neighbour yet, re-admit the ship at our edge so a solo / not-yet-
+                    // scaled world never loses a player (the autoscaler pre-warms neighbours separately).
+                    for t in sim.take_transits() {
+                        match ce.find_service(&topics::service(&t.to.token())).await {
+                            Ok(hosts) if !hosts.is_empty() => {
+                                let ce2 = ce.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = director::publish_transit(&ce2, &t).await {
+                                        tracing::debug!(error = %e, "transit publish failed (transient)");
+                                    }
+                                });
+                            }
+                            _ => {
+                                let mut snap = t.ship.clone();
+                                let (x, y) = readmit_coords(sector_id, &t);
+                                snap.x = x;
+                                snap.y = y;
+                                sim.accept_transit(snap);
+                            }
+                        }
+                    }
+
                     let snap = room::build_snapshot(&sim, &cfg.sector, &host_id, now_ms());
                     match snap.encode() {
                         Ok(bytes) => {
