@@ -26,8 +26,11 @@ WorkingDirectory=/opt/ce-build/spacegame-run
 # --hz 60: the authoritative sim ticks and publishes snapshots at 60 Hz (16.6 ms granularity) so play feels
 # realtime — at 20 Hz the 50 ms tick was the dominant lag even with the relay nearby. The fleet is kept
 # lean (faction AutoPolicy) so a 2-core relay sustains 60 Hz; the client smooths between frames on top.
+# --ring 1: also host the 3x3 ring of neighbouring play sectors in-process so crossing a sector edge is
+# seamless (no wall) — the world is one continuous open expanse on this box, and still splits onto donor
+# nodes under load. Set --ring 0 if the relay is CPU-bound, or higher to pre-warm a larger open area.
 ExecStart=/opt/ce-build/spacegame-run/spacegame node \
-  --gateway --region eu-central --hz 60 --max-depth 3 --split-players 60 \
+  --gateway --region eu-central --hz 60 --max-depth 3 --split-players 60 --ring 1 \
   --ruleset /opt/ce-build/spacegame-run/live.json
 Restart=always
 RestartSec=3

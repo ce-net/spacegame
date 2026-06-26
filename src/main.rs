@@ -242,6 +242,7 @@ async fn main() -> Result<()> {
                 grant,
                 max_depth,
                 split_players,
+                play_ring: ring,
                 ..Default::default()
             };
             node::run_node(&ce, opts, async { let _ = tokio::signal::ctrl_c().await; }).await
