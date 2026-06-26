@@ -106,7 +106,22 @@ src/
 
 The `sim`, `aabb`, `ruleset`, `shard`, `wire`, `room`, `snapshot`, and `leaderboard` modules are
 **pure and fully unit-tested** — no mesh, no network, no clock. `director` and `lib` hold the thin
-async mesh I/O.
+async mesh I/O, gated behind the default **`mesh`** feature (it pulls `ce-rs`/`tokio`).
+
+### Building & testing
+
+The crate is two layers: the **pure SDK** (everything except `director`/the binary) is wasm-clean and
+needs no mesh deps; the **mesh backend** is behind the default `mesh` feature.
+
+```bash
+cargo test --no-default-features      # the pure game SDK + integration tests (no tokio/ce-rs)
+cargo build                           # the full mesh backend + `spacegame` binary (default features)
+```
+
+The pure SDK + integration suite (`tests/physics.rs`, `tests/combat.rs`, `tests/systems.rs`) is **green**
+(153 tests: rigid-body physics, all weapons, missile AoE/destruction, NPC fleets, transit, hot reload,
+replica agreement, snapshot determinism, build/procgen/one-ship-mesh). A frontend embeds the SDK with
+`default-features = false` (see `web/spacegame-wasm/`).
 
 ---
 

@@ -91,3 +91,15 @@ whole ship in one pass, getting its AABB efficiently, and caching it.)
 ### 18 — tests + frontend interaction architecture
 
 > Write tests for the physics , destruction, weapons, systems and other stuff. Prepare how the frontend (native application, browser on desktop, browser on mobile device) will interact with it efficently when its distributed and fault tolerant and insanely scalable.
+
+### 19 — browser frontend (Rust WASM + wgpu, using the SDK), and test everything
+
+> Start writing the browser frontend for spacegame.
+
+> Test everything.
+
+> browser frontend should be wasm rust wgpu
+
+> using the rust spacegame backend skd
+
+> sdk
