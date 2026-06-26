@@ -34,7 +34,8 @@ use std::sync::Arc;
 use crate::build::{
     Blueprint, BpParam, Catalog, ObjectCategory, ObjectDef, ObjectStats, Placement, Repeat, Transform2D,
 };
-use crate::shape::Shape2D;
+use crate::procgen::{GeneratedShip, ModuleDef, ShipGrammar, Slot, SlotRule};
+use crate::shape::{NamedShape, Shape2D};
 
 /// How a weapon delivers damage. The authoritative simulation dispatches firing on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +219,9 @@ pub struct Ruleset {
     pub weapons: Vec<WeaponDef>,
     /// The tech tree.
     pub tech: Vec<TechNode>,
+    /// Named, reusable shape library — shapes as first-class hot-reloadable entities.
+    #[serde(default)]
+    pub shapes: Vec<NamedShape>,
     /// The buildable object/block catalogue (structure, armor, weapons, thrusters, command centres,
     /// radars, sensors, tanks, containers, upgrades…) — hot-reloadable like everything else.
     #[serde(default)]
@@ -225,6 +229,12 @@ pub struct Ruleset {
     /// Reusable, recursive blueprints designers build from the object catalogue.
     #[serde(default)]
     pub blueprints: Vec<Blueprint>,
+    /// Procedural-generation modules: blueprints tagged with a role + the slots where others attach.
+    #[serde(default)]
+    pub modules: Vec<ModuleDef>,
+    /// Placement grammars that drive the recursive procedural ship generator.
+    #[serde(default)]
+    pub grammars: Vec<ShipGrammar>,
     /// Frontend assets (shaders, art params).
     #[serde(default)]
     pub assets: Assets,
@@ -455,8 +465,11 @@ impl Ruleset {
                     effect: TechEffect::UnlockWeapon { weapon: "lance".into() },
                 },
             ],
+            shapes: builtin_shapes(),
             objects: builtin_objects(),
             blueprints: builtin_blueprints(),
+            modules: builtin_modules(),
+            grammars: builtin_grammars(),
             assets: Assets::default(),
         }
     }
@@ -474,6 +487,38 @@ impl Ruleset {
         args: &std::collections::BTreeMap<String, f32>,
     ) -> Result<crate::build::ResolvedCraft, String> {
         crate::build::resolve_blueprint(&self.catalog(), id, args)
+    }
+
+    /// Look up a named shape from the hot-reloadable shape library.
+    pub fn shape(&self, id: &str) -> Option<&Shape2D> {
+        self.shapes.iter().find(|s| s.id == id).map(|s| &s.def)
+    }
+
+    /// **Procedurally generate a ship** from a grammar id + seed: recursively attaches modules per the
+    /// grammar into a synthesized blueprint. Deterministic in the seed (same ship on every node).
+    pub fn generate_ship(&self, grammar_id: &str, seed: u64) -> Result<GeneratedShip, String> {
+        let g = self
+            .grammars
+            .iter()
+            .find(|g| g.id == grammar_id)
+            .ok_or_else(|| format!("unknown grammar {grammar_id}"))?;
+        crate::procgen::generate_ship(&self.modules, g, seed)
+    }
+
+    /// Generate a whole fleet of distinct designs from one grammar.
+    pub fn generate_fleet(&self, grammar_id: &str, base_seed: u64, count: u32) -> Result<Vec<GeneratedShip>, String> {
+        let g = self
+            .grammars
+            .iter()
+            .find(|g| g.id == grammar_id)
+            .ok_or_else(|| format!("unknown grammar {grammar_id}"))?;
+        Ok(crate::procgen::generate_fleet(&self.modules, g, base_seed, count))
+    }
+
+    /// Resolve a procedurally-generated ship's synthesized blueprint into a concrete craft (mass,
+    /// thrust, weapon mounts, parts) against this ruleset's catalogue.
+    pub fn resolve_generated(&self, ship: &GeneratedShip) -> Result<crate::build::ResolvedCraft, String> {
+        crate::build::resolve_design(&self.catalog(), &ship.blueprint, &std::collections::BTreeMap::new())
     }
 
     /// The weapon with `id`, if present.
@@ -538,6 +583,21 @@ impl Ruleset {
         // The buildable catalogue: shapes sane, references resolve, no blueprint cycles, interior-only
         // objects placed inside a holder.
         crate::build::validate_catalog(&self.catalog())?;
+        // Named shape library: each entry is sane geometry.
+        for ns in &self.shapes {
+            ns.shape.validate().map_err(|e| format!("shape {}: {e}", ns.id))?;
+        }
+        // Procgen modules reference real blueprints; grammars reference a rootable module tag.
+        for m in &self.modules {
+            if self.blueprints.iter().all(|b| b.id != m.blueprint) {
+                return Err(format!("module {} references unknown blueprint {}", m.id, m.blueprint));
+            }
+        }
+        for g in &self.grammars {
+            if !self.modules.iter().any(|m| m.has_tag(&g.root_tag)) {
+                return Err(format!("grammar {} has no module tagged '{}' to root a ship", g.id, g.root_tag));
+            }
+        }
         Ok(())
     }
 
@@ -676,7 +736,103 @@ fn builtin_blueprints() -> Vec<Blueprint> {
             Placement::object("armor-plate", Transform2D::new(0.0, 5.0, 0.0)).with_bind("w", "armor"),
         ],
     };
-    vec![pod, scout]
+
+    // --- Module blueprints the procedural generator attaches (each is a small functional chunk). ---
+    let bp = |id: &str, name: &str, root: Vec<Placement>| Blueprint {
+        id: id.into(),
+        name: name.into(),
+        params: vec![],
+        root,
+    };
+    let core = bp(
+        "bp-core",
+        "Core",
+        vec![Placement::object("struct-block", Transform2D::default()).with_children(vec![
+            Placement::object("command-center", Transform2D::default()),
+            Placement::object("radar", Transform2D::new(0.0, 0.5, 0.0)),
+        ])],
+    );
+    let wing = bp(
+        "bp-wing",
+        "Wing",
+        vec![
+            Placement::object("struct-corner", Transform2D::new(0.0, 0.0, 0.0)),
+            Placement::object("armor-wedge", Transform2D::new(0.0, 0.6, 0.0)),
+        ],
+    );
+    let engine = bp(
+        "bp-engine",
+        "Engine Pod",
+        vec![Placement::object("struct-block", Transform2D::default()).with_children(vec![
+            Placement::object("thruster", Transform2D::new(-0.5, -0.6, 0.0)),
+            Placement::object("thruster", Transform2D::new(0.5, -0.6, 0.0)),
+        ])],
+    );
+    let nose = bp(
+        "bp-nose",
+        "Nose",
+        vec![Placement::object("struct-corner", Transform2D::default()).with_children(vec![
+            Placement::object("sensor", Transform2D::default()),
+        ])],
+    );
+
+    vec![pod, scout, core, wing, engine, nose]
+}
+
+/// A small hot-reloadable shape library, referenced by id or edited to restyle many blocks at once.
+fn builtin_shapes() -> Vec<NamedShape> {
+    vec![
+        NamedShape { id: "wedge".into(), def: Shape2D::Triangle { w: 2.0, h: 2.0, skew: 0.0 } },
+        NamedShape { id: "hex".into(), def: Shape2D::RegularPolygon { sides: 6, r: 1.2 } },
+        NamedShape { id: "long-plate".into(), def: Shape2D::Rect { w: 4.0, h: 1.0 } },
+        NamedShape { id: "round".into(), def: Shape2D::Disc { r: 1.0 } },
+        NamedShape { id: "fin".into(), def: Shape2D::Triangle { w: 1.4, h: 3.0, skew: 1.0 } },
+    ]
+}
+
+/// Procgen modules: each wraps a module blueprint with a role tag and the slots others dock to.
+fn builtin_modules() -> Vec<ModuleDef> {
+    vec![
+        ModuleDef {
+            id: "core".into(),
+            blueprint: "bp-core".into(),
+            tags: vec!["core".into()],
+            slots: vec![
+                Slot { tag: "wing".into(), at: Transform2D::new(-2.2, 0.0, 0.0), mirror: true, step: 0.0 },
+                Slot { tag: "nose".into(), at: Transform2D::new(0.0, 2.4, 0.0), mirror: false, step: 0.0 },
+                Slot { tag: "engine".into(), at: Transform2D::new(0.0, -2.4, 0.0), mirror: false, step: 0.0 },
+                Slot { tag: "weapon".into(), at: Transform2D::new(0.0, 1.0, 0.0), mirror: true, step: 0.0 },
+            ],
+        },
+        ModuleDef {
+            id: "wing".into(),
+            blueprint: "bp-wing".into(),
+            tags: vec!["wing".into()],
+            slots: vec![
+                Slot { tag: "engine".into(), at: Transform2D::new(-1.4, -1.0, 0.0), mirror: false, step: 0.0 },
+                Slot { tag: "weapon".into(), at: Transform2D::new(-1.4, 1.0, 0.0), mirror: false, step: 1.2 },
+            ],
+        },
+        ModuleDef { id: "engine".into(), blueprint: "bp-engine".into(), tags: vec!["engine".into()], slots: vec![] },
+        ModuleDef { id: "weapon".into(), blueprint: "turret-pod".into(), tags: vec!["weapon".into()], slots: vec![] },
+        ModuleDef { id: "nose".into(), blueprint: "bp-nose".into(), tags: vec!["nose".into()], slots: vec![] },
+    ]
+}
+
+/// Built-in placement grammars for the generator.
+fn builtin_grammars() -> Vec<ShipGrammar> {
+    vec![ShipGrammar {
+        id: "warship".into(),
+        name: "Warship".into(),
+        root_tag: "core".into(),
+        rules: vec![
+            SlotRule { slot_tag: "wing".into(), options: vec!["wing".into()], min: 1, max: 1, chance: 1.0 },
+            SlotRule { slot_tag: "nose".into(), options: vec!["nose".into()], min: 1, max: 1, chance: 0.85 },
+            SlotRule { slot_tag: "engine".into(), options: vec!["engine".into()], min: 1, max: 2, chance: 1.0 },
+            SlotRule { slot_tag: "weapon".into(), options: vec!["weapon".into()], min: 1, max: 2, chance: 0.9 },
+        ],
+        max_depth: 4,
+    }]
 }
 
 #[cfg(test)]
@@ -792,5 +948,30 @@ mod tests {
             .resolve_craft("scout", &std::collections::BTreeMap::from([("armor".to_string(), 6.0)]))
             .unwrap();
         assert!(wide.total_mass > craft.total_mass, "a wider armour parameter makes a heavier craft");
+    }
+
+    #[test]
+    fn procedural_generator_makes_varied_buildable_ships() {
+        let r = Ruleset::builtin();
+        // A deterministic ship from the warship grammar resolves to a real craft.
+        let ship = r.generate_ship("warship", 0xC0FFEE).unwrap();
+        assert!(ship.module_count >= 4, "the ship grew several modules");
+        let craft = r.resolve_generated(&ship).unwrap();
+        assert!(!craft.parts.is_empty(), "the generated design resolves to concrete parts");
+        assert!(craft.total_thrust > 0.0, "it has engines");
+        assert!(!craft.weapon_mounts.is_empty(), "it has weapons");
+
+        // The same seed reproduces the same ship on any node (replica-safe).
+        let again = r.generate_ship("warship", 0xC0FFEE).unwrap();
+        assert_eq!(ship.blueprint, again.blueprint);
+
+        // A fleet has structural variety.
+        let fleet = r.generate_fleet("warship", 1, 6).unwrap();
+        let sizes: std::collections::BTreeSet<usize> = fleet.iter().map(|s| s.blueprint.root.len()).collect();
+        assert!(sizes.len() > 1, "different seeds yield different designs");
+        // Every generated ship resolves.
+        for s in &fleet {
+            assert!(r.resolve_generated(s).is_ok());
+        }
     }
 }

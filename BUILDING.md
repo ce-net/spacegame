@@ -73,6 +73,38 @@ let armoured = ruleset.resolve_craft("scout", &BTreeMap::from([("armor".into(), 
 Edit any of it — a new shape, a new object, a rebalanced blueprint, a new sub-assembly — and push the
 ruleset; it goes live mid-match like every other piece of content.
 
+## 4. Recursive procedural ship generation (`procgen.rs`)
+
+The same parts feed a generator that **invents ships**. It takes:
+
+- **modules** ([`ModuleDef`]) — a blueprint tagged with a role (`core`, `wing`, `engine`, `weapon`,
+  `nose`…) plus the **attach slots** where other modules may dock (a position, an accepted role tag,
+  optional **mirror** for symmetry, and a lateral **step** for multi-attach);
+- a **placement grammar** ([`ShipGrammar`]) — the system that says *how blueprints can and should be
+  placed*: which role roots the ship, and per slot tag which module roles may fill it, how many, and
+  with what probability, plus a recursion depth cap.
+
+[`generate_ship`] grows a ship **recursively**: it picks a root module, and for each of its slots the
+grammar chooses module(s) to attach (mirrored if the slot says so), composes the transforms, and
+**recurses into the attached modules' own slots** — a core sprouts wings, the wings sprout engines and
+weapon pods, the nose sprouts sensors — until the depth cap or the `MAX_MODULES` safety cap. The result
+is a synthesized [`Blueprint`] (a flat tree of module references at computed transforms) that flows
+straight back through [`resolve_design`] into a concrete, flyable craft.
+
+Generation is **deterministic in its seed** (a SplitMix64 PRNG), so `(grammar, seed)` makes the same
+ship on every node — reproducible for sharing and consistent across the anti-cheat replicas.
+[`generate_fleet`] sweeps seeds to produce a fleet of distinct designs.
+
+```rust
+let ship  = ruleset.generate_ship("warship", 0xC0FFEE)?;   // one deterministic design
+let craft = ruleset.resolve_generated(&ship)?;             // -> mass, thrust, weapon mounts, parts
+let fleet = ruleset.generate_fleet("warship", 1, 12)?;     // a dozen varied ships
+```
+
+Modules, grammars, blueprints, objects **and shapes** (a named [`crate::shape::NamedShape`] library)
+all live in the hot-reloadable ruleset, so editing a module, a slot, a grammar rule or a shape and
+regenerating yields a different fleet — live.
+
 ## What's next
 
 The data + resolution layer is complete and tested. Wiring a `ResolvedCraft` into a live ship (its mass

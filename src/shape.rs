@@ -24,6 +24,16 @@ use serde::{Deserialize, Serialize};
 /// A point / vertex, kept as a plain pair so the wire form is compact (`[x, y]`).
 pub type P2 = [f32; 2];
 
+/// A named, reusable shape — the hot-reloadable **shape library** entry. Designers define shapes once
+/// here and reference them by id from objects/blueprints, or edit a named shape to change every block
+/// that uses it at once. Lives in the [`Ruleset`](crate::ruleset::Ruleset).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedShape {
+    pub id: String,
+    /// The shape geometry (tagged by its `shape` discriminant).
+    pub def: Shape2D,
+}
+
 /// A parametric 2D shape. Each variant is defined in a natural frame; [`outline`](Self::outline)
 /// returns the vertices **re-centred on the centroid**, so a part's centre of mass is its origin
 /// (which is what the physics solver assumes).

@@ -84,6 +84,8 @@ src/
   build.rs        free-form building: object catalog (structure/armor/weapon/turret/thruster/command/
                   radar/sensor/tank/container/upgrade) + placement + RECURSIVE blueprints (blueprints
                   in blueprints) with params, repeat, and runtime resolution to a concrete craft.
+  procgen.rs      recursive procedural ship generation: modules (blueprint + role + attach slots) + a
+                  placement grammar -> deterministically grown, varied ship designs (resolve to craft).
   shard.rs        SectorId + rendezvous-hash sharding + latency-first host scoring + interest set.
   wire.rs         sector-keyed pubsub topics + ClientMsg / Snapshot JSON wire types (weapons, beams).
   room.rs         glue: authenticated mesh msg -> sim intent; sim -> wire Snapshot (full + viewport-

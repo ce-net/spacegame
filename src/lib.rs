@@ -41,6 +41,7 @@ pub mod director;
 pub mod faction;
 pub mod leaderboard;
 pub mod physics;
+pub mod procgen;
 pub mod replication;
 pub mod room;
 pub mod ruleset;

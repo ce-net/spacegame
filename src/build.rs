@@ -376,6 +376,19 @@ pub fn resolve_blueprint(
     Ok(aggregate(parts))
 }
 
+/// Resolve a blueprint **value** (e.g. one synthesized by the procedural generator, which is not in the
+/// catalogue) against the object/blueprint catalogue it references.
+pub fn resolve_design(
+    catalog: &Catalog,
+    blueprint: &Blueprint,
+    args: &BTreeMap<String, f32>,
+) -> Result<ResolvedCraft, String> {
+    let mut parts = Vec::new();
+    let mut path = Vec::new();
+    resolve_blueprint_value(catalog, blueprint, args, &Transform2D::default(), 0, &mut path, &mut parts)?;
+    Ok(aggregate(parts))
+}
+
 fn resolve_blueprint_into(
     catalog: &Catalog,
     id: &str,
@@ -385,13 +398,25 @@ fn resolve_blueprint_into(
     path: &mut Vec<String>,
     out: &mut Vec<ResolvedPart>,
 ) -> Result<(), String> {
-    if depth > MAX_BLUEPRINT_DEPTH {
-        return Err(format!("blueprint nesting exceeded {MAX_BLUEPRINT_DEPTH} (cycle or too deep) at {id}"));
-    }
-    if path.iter().any(|p| p == id) {
-        return Err(format!("blueprint cycle detected: {} -> {id}", path.join(" -> ")));
-    }
     let bp = catalog.blueprint(id).ok_or_else(|| format!("unknown blueprint {id}"))?;
+    resolve_blueprint_value(catalog, bp, args, parent, depth, path, out)
+}
+
+fn resolve_blueprint_value(
+    catalog: &Catalog,
+    bp: &Blueprint,
+    args: &BTreeMap<String, f32>,
+    parent: &Transform2D,
+    depth: usize,
+    path: &mut Vec<String>,
+    out: &mut Vec<ResolvedPart>,
+) -> Result<(), String> {
+    if depth > MAX_BLUEPRINT_DEPTH {
+        return Err(format!("blueprint nesting exceeded {MAX_BLUEPRINT_DEPTH} (cycle or too deep) at {}", bp.id));
+    }
+    if path.iter().any(|p| p == &bp.id) {
+        return Err(format!("blueprint cycle detected: {} -> {}", path.join(" -> "), bp.id));
+    }
 
     // Build this blueprint's parameter scope: declared defaults (clamped) overridden by args.
     let mut scope: BTreeMap<String, f32> = BTreeMap::new();
@@ -406,7 +431,7 @@ fn resolve_blueprint_into(
         scope.insert(p.name.clone(), v);
     }
 
-    path.push(id.to_string());
+    path.push(bp.id.clone());
     for placement in &bp.root {
         resolve_placement(catalog, placement, &scope, parent, depth, path, out)?;
     }
