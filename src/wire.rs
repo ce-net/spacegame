@@ -61,9 +61,16 @@ pub enum ClientMsg {
         name: Option<String>,
     },
 
-    /// Buy an upgrade (server-priced and gated): `kind` is `"hull" | "speed" | "gun"`.
+    /// Buy from the tech tree (server-priced and gated). `kind` is a tech node id
+    /// (e.g. `"hull-1" | "thruster-1" | "twin-guns" | "tech-missile" | "tech-railgun" | "tech-laser"`).
+    /// The legacy tokens `"hull" | "speed" | "gun"` are also accepted and mapped to the matching node.
     #[serde(rename = "build")]
     Build { kind: String },
+
+    /// Switch the active weapon to an unlocked one (`id` is a weapon id in the live ruleset, e.g.
+    /// `"blaster" | "missile" | "railgun" | "laser"`).
+    #[serde(rename = "weapon")]
+    Weapon { id: String },
 
     /// Request a respawn after death (honoured only once the cooldown elapsed).
     #[serde(rename = "respawn")]
@@ -90,10 +97,16 @@ pub struct ShipView {
     pub minerals: u32,
     pub kills: u32,
     pub guns: u32,
+    /// Selected weapon id, so the renderer can draw the right muzzle / HUD.
+    #[serde(default)]
+    pub weapon: String,
+    /// Unlocked weapon ids, so the loadout UI can show what this ship may switch to.
+    #[serde(default)]
+    pub weapons: Vec<String>,
     pub alive: bool,
 }
 
-/// One live bullet in a snapshot.
+/// One live bullet in a snapshot. `homing` lets the renderer draw a missile trail vs a pellet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BulletView {
     pub x: i32,
@@ -101,6 +114,20 @@ pub struct BulletView {
     pub vx: i32,
     pub vy: i32,
     pub hue: u32,
+    #[serde(default)]
+    pub homing: bool,
+}
+
+/// One beam a hitscan weapon emitted this tick (railgun shot / laser sweep), for the renderer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeamView {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub hue: u32,
+    /// `0` = railgun, `1` = laser.
+    pub kind: u8,
 }
 
 /// One kill-feed entry in a snapshot.
@@ -126,10 +153,18 @@ pub struct Snapshot {
     pub ships: Vec<ShipView>,
     /// Live bullets.
     pub bullets: Vec<BulletView>,
+    /// Hitscan beams emitted this tick (railgun/laser).
+    #[serde(default)]
+    pub beams: Vec<BeamView>,
     /// Asteroid cells currently depleted: `[cx, cy]`. Clients hide these rocks.
     pub depleted: Vec<[i32; 2]>,
     /// Kill events emitted this tick (for the kill feed).
     pub kills: Vec<KillView>,
+    /// The live ruleset version in force on the host. When a client sees this number rise it knows a
+    /// hot reload happened and re-fetches the ruleset (new weapon stats, new shaders) — instant,
+    /// no page reload.
+    #[serde(default)]
+    pub ruleset: u64,
     /// Host wall-clock millis when produced (clients estimate RTT from it).
     pub ts: u64,
 }
@@ -194,9 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn build_respawn_bye_roundtrip() {
+    fn build_weapon_respawn_bye_roundtrip() {
         for m in [
-            ClientMsg::Build { kind: "gun".into() },
+            ClientMsg::Build { kind: "tech-railgun".into() },
+            ClientMsg::Weapon { id: "missile".into() },
             ClientMsg::Respawn,
             ClientMsg::Bye,
         ] {
@@ -230,11 +266,15 @@ mod tests {
                 minerals: 35,
                 kills: 2,
                 guns: 3,
+                weapon: "railgun".into(),
+                weapons: vec!["blaster".into(), "railgun".into()],
                 alive: true,
             }],
-            bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120 }],
+            bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],
+            beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
             depleted: vec![[3, 4]],
             kills: vec![KillView { killer: "p1".into(), victim: "p2".into() }],
+            ruleset: 7,
             ts: 1_700_000_000_000,
         };
         let bytes = snap.encode().unwrap();
