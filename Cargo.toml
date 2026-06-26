@@ -5,8 +5,11 @@ edition = "2024"
 description = "Authoritative, sector-sharded mesh backend for CE Spacegame — a real-time multiplayer space arena. The galaxy is a grid of SECTORS; each sector is an independent authoritative cell, rendezvous-hashed onto a latency-optimal mesh node, snapshot-replicated to content-addressed blobs for failover, with the leaderboard sealed against the PoW chain. A flagship demonstration that CE is a global supercomputer."
 license = "MIT"
 
-# A lib (the pure, testable sim + sharding + snapshot + consensus) plus a thin binary that
-# wires the sector cells to the local CE node over the mesh.
+# The crate is two layers:
+#   * the PURE, deterministic game SDK (sim, physics, shapes, build, procgen, wire, client, …) — no
+#     mesh, no tokio, no ce-rs; compiles to wasm32 and is what the browser/native frontends embed.
+#   * the MESH I/O (director + run_sector + the binary) behind the default `mesh` feature, which pulls
+#     ce-rs/tokio. A frontend depends on this crate with `default-features = false` to get just the SDK.
 [lib]
 name = "spacegame"
 path = "src/lib.rs"
@@ -14,17 +17,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "spacegame"
 path = "src/main.rs"
+required-features = ["mesh"]
+
+[features]
+default = ["mesh"]
+# The mesh backend: sector hosting, replication, hot-reload distribution, the CLI. Off for wasm SDK use.
+mesh = ["dep:ce-rs", "dep:tokio", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "dep:clap"]
 
 [dependencies]
-ce-rs = { path = "../ce-rs" }
+# Pure-SDK deps (always on).
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
-futures-util = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Mesh-only deps (optional; enabled by the `mesh` feature).
+ce-rs = { path = "../ce-rs", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }

@@ -35,10 +35,10 @@
 //! The library half (`sim`, `shard`, `wire`, `room`, `snapshot`, `leaderboard`) is pure and fully
 //! unit-tested; this module adds the thin mesh I/O loop that the binary drives.
 
+// --- Pure, deterministic SDK (wasm-clean; no mesh, no tokio, no ce-rs) ---
 pub mod aabb;
 pub mod build;
 pub mod client;
-pub mod director;
 pub mod faction;
 pub mod leaderboard;
 pub mod physics;
@@ -53,15 +53,24 @@ pub mod sim;
 pub mod snapshot;
 pub mod wire;
 
+// --- Mesh I/O (behind the default `mesh` feature; pulls ce-rs/tokio) ---
+#[cfg(feature = "mesh")]
+pub mod director;
+
+#[cfg(feature = "mesh")]
 use anyhow::{anyhow, Result};
+#[cfg(feature = "mesh")]
 use ce_rs::CeClient;
+#[cfg(feature = "mesh")]
 use std::sync::Arc;
+#[cfg(feature = "mesh")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use ruleset::Ruleset;
 pub use wire::topics;
 
 /// Configuration for one hosted sector.
+#[cfg(feature = "mesh")]
 #[derive(Debug, Clone)]
 pub struct SectorConfig {
     /// Sector token (e.g. `"0_0"`). See [`shard::SectorId::token`].
