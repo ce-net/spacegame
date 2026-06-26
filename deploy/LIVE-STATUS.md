@@ -30,10 +30,12 @@ into four across the relay's cores (and onto donor nodes as they join), bounded 
 
 ## Honest remaining rungs to literal millions
 
-1. **Snapshot rate single-node.** With no remote peer subscribed to a cell's `/state` topic, the relay's
-   self-delivery to the bridged browser is gossipsub-heartbeat-paced (~1 Hz), not 20 Hz. Client-side
-   prediction keeps play smooth; full authoritative rate returns the moment a second node (desktop/donor)
-   or an in-tab libp2p peer subscribes to the cell. This is a node-transport property, not a sim issue.
+1. **Snapshot rate single-node — FIXED.** Originally the relay's genesis snapshots reached bridged
+   browsers only via a (now-removed) stray host, because gossipsub never echoes a publish back to its own
+   publisher, so the relay's own genesis was invisible to the browsers it bridges. The CE node now
+   self-delivers app pub/sub to its local subscribers (ce commit "node: self-deliver app pub/sub to local
+   subscribers"), so the relay's genesis `/state` reaches bridged browsers at the full 20 Hz. The genesis
+   cell is anchored by the GATEWAY only (no split-brain across nodes).
 2. **In-tab libp2p peer (distinct identity per browser).** `spacegame-wasm/galaxy-peer.js` is the
    scaffold; `startPeer` still needs `@libp2p/*` bundled into the page. Until then every browser shares
    the relay node's identity through the `/ce` bridge (fine for play, not yet "a million distinct
