@@ -8,8 +8,11 @@
 //! per-client bandwidth is `O(visible)` rather than `O(sector population)`.
 
 use crate::aabb::{Aabb, AabbTree};
-use crate::sim::{Intent, Sim, SECTOR_SIZE};
-use crate::wire::{BeamView, BulletView, ClientMsg, DebrisView, KillView, ShipView, Snapshot, SnapshotTag};
+use crate::faction::FactionCommand;
+use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
+use crate::wire::{
+    BeamView, BulletView, ClientMsg, DebrisView, FactionView, KillView, ShipView, Snapshot, SnapshotTag,
+};
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
 pub fn hue_for(node_id: &str) -> u32 {
@@ -25,6 +28,70 @@ fn tech_node_for(token: &str) -> &str {
         "gun" => "twin-guns",
         other => other,
     }
+}
+
+/// Parse a fleet command from the wire `order` token + optional coordinates.
+fn command_for(order: &str, x: Option<f32>, y: Option<f32>) -> Option<FactionCommand> {
+    Some(match order {
+        "defend" => FactionCommand::Defend,
+        "follow" => FactionCommand::Follow,
+        "mine" => FactionCommand::Mine,
+        "hold" => FactionCommand::Hold,
+        "attack" | "attacknearest" | "attack_nearest" => FactionCommand::AttackNearest,
+        "attackmove" | "attack_move" => FactionCommand::AttackMove { x: x?, y: y? },
+        _ => return None,
+    })
+}
+
+fn role_str(r: ShipRole) -> &'static str {
+    match r {
+        ShipRole::Player => "player",
+        ShipRole::Drone => "drone",
+        ShipRole::Fighter => "fighter",
+        ShipRole::Hauler => "hauler",
+    }
+}
+
+fn command_str(c: FactionCommand) -> &'static str {
+    match c {
+        FactionCommand::Defend => "defend",
+        FactionCommand::Follow => "follow",
+        FactionCommand::Mine => "mine",
+        FactionCommand::Hold => "hold",
+        FactionCommand::AttackNearest => "attack_nearest",
+        FactionCommand::AttackMove { .. } => "attack_move",
+    }
+}
+
+/// Build the per-player faction summaries for the snapshot (economy + the live NPC fleet count).
+pub fn faction_views(sim: &Sim) -> Vec<FactionView> {
+    use crate::faction::UnitKind;
+    let mut out: Vec<FactionView> = sim
+        .factions
+        .values()
+        .map(|f| {
+            let fleet_alive = sim
+                .ships
+                .values()
+                .filter(|s| s.owner.as_deref() == Some(f.owner.as_str()) && s.alive)
+                .count() as u32;
+            FactionView {
+                owner: f.owner.clone(),
+                minerals: f.resources.minerals,
+                energy: f.resources.energy,
+                alloys: f.resources.alloys,
+                buildings: f.buildings.len() as u32,
+                drones: f.unit_count(UnitKind::Drone) as u32,
+                fighters: f.unit_count(UnitKind::Fighter) as u32,
+                haulers: f.unit_count(UnitKind::Hauler) as u32,
+                fleet_alive,
+                power: f.power(),
+                command: command_str(f.command).to_string(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.owner.cmp(&b.owner));
+    out
 }
 
 /// Apply one authenticated client message from `from` to a sector's simulation. `from` is the verified
@@ -43,6 +110,11 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
         }
         ClientMsg::Weapon { id } => {
             sim.select_weapon(from, &id);
+        }
+        ClientMsg::Command { order, x, y } => {
+            if let Some(cmd) = command_for(&order, x, y) {
+                sim.command_faction(from, cmd);
+            }
         }
         ClientMsg::Respawn => {
             sim.respawn(from);
@@ -70,6 +142,8 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         guns: s.guns,
         weapon: s.weapon.clone(),
         weapons: s.weapons.clone(),
+        owner: s.owner.clone(),
+        role: role_str(s.role).to_string(),
         alive: s.alive,
     }
 }
@@ -135,6 +209,7 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         bullets,
         beams,
         debris,
+        factions: faction_views(sim),
         depleted,
         kills,
         ruleset: sim.rules.version,
@@ -229,6 +304,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         bullets,
         beams,
         debris,
+        factions: faction_views(sim),
         depleted,
         kills,
         ruleset: sim.rules.version,

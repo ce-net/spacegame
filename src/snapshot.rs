@@ -55,6 +55,12 @@ pub struct ShipSnap {
     /// Bought tech node ids.
     #[serde(default)]
     pub owned: Vec<String>,
+    /// `Some(faction_owner)` for an NPC fleet ship, `None` for a human player.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Player or NPC fleet role.
+    #[serde(default)]
+    pub role: crate::sim::ShipRole,
     pub alive: bool,
 }
 

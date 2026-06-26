@@ -156,6 +156,14 @@ pub struct Tunables {
     pub max_guns: u32,
     /// Ship↔ship collision push stiffness (0 disables ship collision physics).
     pub ship_push: f32,
+    /// Max live NPC fleet ships a single faction may field at once (bounds the simulation cost a busy
+    /// faction can impose; excess roster units wait until a slot frees).
+    #[serde(default = "default_max_fleet")]
+    pub max_fleet: u32,
+}
+
+fn default_max_fleet() -> u32 {
+    24
 }
 
 impl Default for Tunables {
@@ -172,6 +180,7 @@ impl Default for Tunables {
             player_ttl_ticks: 100,
             max_guns: 5,
             ship_push: 0.5,
+            max_fleet: 24,
         }
     }
 }

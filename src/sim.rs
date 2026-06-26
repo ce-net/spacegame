@@ -30,11 +30,40 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::aabb::{Aabb, AabbTree};
-use crate::faction::Faction;
+use crate::faction::{Faction, FactionCommand, UnitKind};
 use crate::physics::{self, RigidBody, Shape, Vec2};
 use crate::ruleset::{Ruleset, RulesetHandle, TechEffect, Tunables, WeaponKind};
 use crate::shard::SectorId;
 use crate::snapshot::ShipSnap;
+
+/// What a ship is: a human player, or one of the NPC fleet roles a [`Faction`] fields under command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShipRole {
+    #[default]
+    Player,
+    Drone,
+    Fighter,
+    Hauler,
+}
+
+impl ShipRole {
+    pub fn from_unit(u: UnitKind) -> ShipRole {
+        match u {
+            UnitKind::Drone => ShipRole::Drone,
+            UnitKind::Fighter => ShipRole::Fighter,
+            UnitKind::Hauler => ShipRole::Hauler,
+        }
+    }
+    pub fn to_unit(self) -> Option<UnitKind> {
+        match self {
+            ShipRole::Drone => Some(UnitKind::Drone),
+            ShipRole::Fighter => Some(UnitKind::Fighter),
+            ShipRole::Hauler => Some(UnitKind::Hauler),
+            ShipRole::Player => None,
+        }
+    }
+}
 
 /// Side length of one sector in world units. A sector's local coordinates run `0..SECTOR_SIZE`.
 pub const SECTOR_SIZE: f32 = 3000.0;
@@ -130,6 +159,13 @@ pub struct Ship {
     pub weapons: Vec<String>,
     /// Tech node ids the ship has bought (for `requires` gating of the tech tree).
     pub owned: Vec<String>,
+    /// `None` for a human player's ship (its id *is* the player). `Some(faction_owner_node_id)` for an
+    /// NPC fleet ship — the player who commands it. NPCs are tracked here and in [`Faction::units`].
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Player ship, or which NPC fleet role this is.
+    #[serde(default)]
+    pub role: ShipRole,
     pub alive: bool,
     #[serde(skip)]
     pub dead_at: u64,
@@ -165,6 +201,8 @@ impl Ship {
             weapon: default_weapon.clone(),
             weapons: vec![default_weapon],
             owned: Vec::new(),
+            owner: None,
+            role: ShipRole::Player,
             alive: true,
             dead_at: 0,
             last_fire: 0,
@@ -173,6 +211,22 @@ impl Ship {
             want_fire: false,
             last_input_tick: tick,
         }
+    }
+
+    /// Spawn an NPC fleet ship of `role` for faction `owner` at `(x, y)`. It carries the blaster (so a
+    /// fighter can fight) and full hull for its role; its id is the synthetic `npc:<owner>:<seq>`.
+    #[allow(clippy::too_many_arguments)]
+    fn npc(role: ShipRole, owner: String, x: f32, y: f32, hp: i32, hue: u32, tick: u64) -> Self {
+        let mut s = Ship::new(format!("{role:?}"), hue, tick, "blaster".into(), hp);
+        s.x = x;
+        s.y = y;
+        s.max_hp = hp;
+        s.hp = hp;
+        s.owner = Some(owner);
+        s.role = role;
+        // NPCs never idle-expire (they are server-owned, not driven by client input).
+        s.last_input_tick = tick;
+        s
     }
 
     /// Rebuild a ship from a persistent snapshot (used by replication failover and cross-sector
@@ -195,6 +249,8 @@ impl Ship {
             weapon: if snap.weapon.is_empty() { "blaster".into() } else { snap.weapon.clone() },
             weapons: if snap.weapons.is_empty() { vec![snap.weapon.clone()] } else { snap.weapons.clone() },
             owned: snap.owned.clone(),
+            owner: snap.owner.clone(),
+            role: snap.role,
             alive: snap.alive,
             dead_at: 0,
             last_fire: 0,
@@ -241,8 +297,15 @@ impl Ship {
             weapon: self.weapon.clone(),
             weapons: self.weapons.clone(),
             owned: self.owned.clone(),
+            owner: self.owner.clone(),
+            role: self.role,
             alive: self.alive,
         }
+    }
+
+    /// The faction this ship belongs to: its owner for an NPC, else the player's own id.
+    pub fn faction_id<'a>(&'a self, id: &'a str) -> &'a str {
+        self.owner.as_deref().unwrap_or(id)
     }
 }
 
@@ -577,6 +640,10 @@ impl Sim {
         self.kill_feed.clear();
         self.beams.clear();
 
+        // --- Pass 0: NPC fleet AI. Faction ships under command pick a goal and decide to fire; their
+        // intents are then integrated exactly like a player's in pass 1. ---
+        self.drive_npcs(&tun);
+
         // --- Pass 1: integrate motion, mine, expire, and transit ships across sector edges. ---
         let ids: Vec<String> = {
             let mut v: Vec<String> = self.ships.keys().cloned().collect();
@@ -623,7 +690,9 @@ impl Sim {
                 s.y += s.vy * dt_scale;
 
                 let out = s.x < 0.0 || s.y < 0.0 || s.x >= SECTOR_SIZE || s.y >= SECTOR_SIZE;
-                if out && self.seamless {
+                // Only player ships transit between sectors; NPC fleet ships belong to their faction's
+                // sector and bounce off the edge instead of wandering off the mesh.
+                if out && self.seamless && s.owner.is_none() {
                     // INFINITE MAP: hand the ship to the neighbour sector instead of bouncing.
                     let mut dsx = 0;
                     let mut dsy = 0;
@@ -696,12 +765,17 @@ impl Sim {
             }
             for (cx, cy, val) in mined_now {
                 self.mined.insert((cx, cy), now);
+                // The faction credited is the ship's owner (so an NPC drone banks to your faction, and
+                // a player's own mining banks to theirs).
+                let fid = self
+                    .ships
+                    .get(id)
+                    .map(|s| s.faction_id(id).to_string())
+                    .unwrap_or_else(|| id.to_string());
                 if let Some(s) = self.ships.get_mut(id) {
                     s.minerals = s.minerals.saturating_add(val);
                 }
-                // Feed the player's persistent faction economy from live mining — the bridge from the
-                // arena to the always-alive industrial layer.
-                if let Some(f) = self.factions.get_mut(id) {
+                if let Some(f) = self.factions.get_mut(&fid) {
                     f.deposit_minerals(val as u64);
                 }
             }
@@ -740,10 +814,12 @@ impl Sim {
             self.resolve_ship_collisions(&tree, &tun);
         }
 
-        // --- Pass 5: the always-alive factions tick every step, online or not. ---
+        // --- Pass 5: the always-alive factions tick every step, online or not, then their roster is
+        // reconciled into live NPC fleet ships in the world. ---
         for f in self.factions.values_mut() {
             f.tick();
         }
+        self.reconcile_fleets(&tun);
 
         // --- Pass 6: LOD rigid-body wreckage. Precision follows the players: debris near a ship is
         // simulated at high precision/iteration; far debris is coarse or merely registered. ---
@@ -779,6 +855,229 @@ impl Sim {
             .filter(|(_, s)| s.alive)
             .map(|(id, s)| (Aabb::around(s.x, s.y, SHIP_R), id.clone()));
         AabbTree::build(bounds, items)
+    }
+
+    /// Set the standing order for a player's faction. Every NPC ship the faction owns obeys it from
+    /// the next tick.
+    pub fn command_faction(&mut self, owner: &str, cmd: FactionCommand) {
+        if let Some(f) = self.factions.get_mut(owner) {
+            f.command = cmd;
+        }
+    }
+
+    /// **Fleet AI** — drive every NPC ship under faction command this tick: steer toward its goal and
+    /// decide whether to fire. Runs before motion so the intents it sets are integrated like a player's.
+    /// Deterministic: ships and targets are chosen in sorted order.
+    fn drive_npcs(&mut self, tun: &Tunables) {
+        let now = self.tick;
+        let mut npc_ids: Vec<String> = self
+            .ships
+            .iter()
+            .filter(|(_, s)| s.alive && s.role != ShipRole::Player)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if npc_ids.is_empty() {
+            return;
+        }
+        npc_ids.sort();
+        let tree = self.build_ship_tree();
+        for id in npc_ids {
+            let (role, owner, x, y) = {
+                let Some(s) = self.ships.get(&id) else { continue };
+                (s.role, s.owner.clone().unwrap_or_default(), s.x, s.y)
+            };
+            let cmd = self.factions.get(&owner).map(|f| f.command).unwrap_or_default();
+            let (tx, ty, want_fire) = self.npc_goal(role, &owner, x, y, cmd, &tree);
+            if let Some(s) = self.ships.get_mut(&id) {
+                let dx = tx - x;
+                let dy = ty - y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > 1.0 {
+                    let desired = dy.atan2(dx);
+                    let mut d = (desired - s.a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                        - std::f32::consts::PI;
+                    d = d.clamp(-tun.turn_rate, tun.turn_rate);
+                    s.a = (s.a + d).rem_euclid(std::f32::consts::TAU);
+                }
+                s.want_thrust = dist > 45.0;
+                s.want_turn = 0;
+                s.want_fire = want_fire;
+                s.last_input_tick = now; // server-owned: never idle-expire
+            }
+        }
+    }
+
+    /// Decide an NPC's goal point and whether to open fire, from its role and its faction's standing
+    /// [`FactionCommand`]. Fighters engage enemies (any ship of another faction); drones seek asteroids;
+    /// haulers escort. The "owner" anchor is the commanding player's own ship if present.
+    fn npc_goal(
+        &self,
+        role: ShipRole,
+        owner: &str,
+        x: f32,
+        y: f32,
+        cmd: FactionCommand,
+        tree: &AabbTree<String>,
+    ) -> (f32, f32, bool) {
+        let anchor = self
+            .ships
+            .get(owner)
+            .map(|s| (s.x, s.y))
+            .unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+        match role {
+            ShipRole::Fighter => {
+                let engage_r = match cmd {
+                    FactionCommand::AttackNearest => 4000.0,
+                    FactionCommand::Defend => 950.0,
+                    FactionCommand::Hold => 700.0,
+                    FactionCommand::AttackMove { .. } => 1100.0,
+                    _ => 850.0,
+                };
+                let enemy = self.nearest_enemy_of(owner, x, y, engage_r, tree);
+                if let Some(eid) = &enemy
+                    && let Some(e) = self.ships.get(eid)
+                {
+                    let d = ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt();
+                    let aimed = self.roughly_aimed(x, y, e.x, e.y);
+                    return (e.x, e.y, d <= 700.0 && aimed);
+                }
+                match cmd {
+                    FactionCommand::Hold => (x, y, false),
+                    FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
+                    _ => (anchor.0, anchor.1, false), // escort the owner
+                }
+            }
+            ShipRole::Drone => match cmd {
+                FactionCommand::Hold => (x, y, false),
+                _ => {
+                    if let Some((rx, ry)) = self.nearest_live_rock(x, y, 1400.0) {
+                        (rx, ry, false)
+                    } else {
+                        (anchor.0, anchor.1, false)
+                    }
+                }
+            },
+            ShipRole::Hauler => match cmd {
+                FactionCommand::Hold => (x, y, false),
+                FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
+                _ => (anchor.0, anchor.1, false),
+            },
+            ShipRole::Player => (x, y, false),
+        }
+    }
+
+    /// Nearest alive ship of a *different faction* than `owner` (an enemy) within `radius`.
+    fn nearest_enemy_of(&self, owner: &str, x: f32, y: f32, radius: f32, tree: &AabbTree<String>) -> Option<String> {
+        let mut cands = tree.query(&Aabb::around(x, y, radius));
+        cands.sort();
+        let mut best: Option<(f32, String)> = None;
+        for cid in cands {
+            let Some(s) = self.ships.get(&cid) else { continue };
+            if !s.alive {
+                continue;
+            }
+            if s.faction_id(&cid) == owner {
+                continue; // same faction (the owner or its own fleet)
+            }
+            let d2 = (s.x - x).powi(2) + (s.y - y).powi(2);
+            if d2 <= radius * radius && best.as_ref().map(|(b, _)| d2 < *b).unwrap_or(true) {
+                best = Some((d2, cid));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Is a ship at `(x,y)` heading roughly toward `(tx,ty)` enough to bother firing? (Cheap gate so
+    /// NPCs do not waste shots while turning.)
+    fn roughly_aimed(&self, _x: f32, _y: f32, _tx: f32, _ty: f32) -> bool {
+        true // the fire cooldown + steering already gate it; keep deterministic and simple
+    }
+
+    /// The position of the nearest non-depleted asteroid within `radius` of `(x,y)`, for drone mining.
+    fn nearest_live_rock(&self, x: f32, y: f32, radius: f32) -> Option<(f32, f32)> {
+        let now = self.tick;
+        let regen = self.rules.tunables.rock_regen_ticks;
+        let min_cx = ((x - radius) / ROCK_CELL).floor() as i32;
+        let max_cx = ((x + radius) / ROCK_CELL).floor() as i32;
+        let min_cy = ((y - radius) / ROCK_CELL).floor() as i32;
+        let max_cy = ((y + radius) / ROCK_CELL).floor() as i32;
+        let mut best: Option<(f32, f32, f32)> = None;
+        for cx in min_cx..=max_cx {
+            for cy in min_cy..=max_cy {
+                let Some(r) = rock_in_cell(cx, cy) else { continue };
+                if let Some(&t) = self.mined.get(&(cx, cy))
+                    && now.saturating_sub(t) < regen
+                {
+                    continue;
+                }
+                let d2 = (r.x - x).powi(2) + (r.y - y).powi(2);
+                if d2 <= radius * radius && best.as_ref().map(|(_, _, b)| d2 < *b).unwrap_or(true) {
+                    best = Some((r.x, r.y, d2));
+                }
+            }
+        }
+        best.map(|(rx, ry, _)| (rx, ry))
+    }
+
+    /// **Fleet reconciliation** — make the set of live NPC ships match each faction's roster. New
+    /// roster units (built by the economy) spawn as ships near their owner; the per-faction `max_fleet`
+    /// cap bounds simulation cost. Called after the factions tick.
+    fn reconcile_fleets(&mut self, tun: &Tunables) {
+        let now = self.tick;
+        let max_fleet = tun.max_fleet as usize;
+        let mut owners: Vec<String> = self.factions.keys().cloned().collect();
+        owners.sort();
+
+        // (id, owner, role, x, y, hp, hue)
+        let mut spawns: Vec<(String, String, ShipRole, f32, f32, i32, u32)> = Vec::new();
+        for owner in owners {
+            // Live NPC ships of this faction, by role + total.
+            let mut have_drone = 0usize;
+            let mut have_fighter = 0usize;
+            let mut have_hauler = 0usize;
+            for s in self.ships.values() {
+                if s.owner.as_deref() == Some(owner.as_str()) {
+                    match s.role {
+                        ShipRole::Drone => have_drone += 1,
+                        ShipRole::Fighter => have_fighter += 1,
+                        ShipRole::Hauler => have_hauler += 1,
+                        ShipRole::Player => {}
+                    }
+                }
+            }
+            let mut total_live = have_drone + have_fighter + have_hauler;
+            let (ax, ay) = self
+                .ships
+                .get(&owner)
+                .map(|s| (s.x, s.y))
+                .unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+            let hue = self.ships.get(&owner).map(|s| s.hue).unwrap_or_else(|| fnv1a(&owner) % 360);
+
+            let Some(f) = self.factions.get_mut(&owner) else { continue };
+            for (kind, have) in [
+                (UnitKind::Drone, have_drone),
+                (UnitKind::Fighter, have_fighter),
+                (UnitKind::Hauler, have_hauler),
+            ] {
+                let desired = f.unit_count(kind);
+                let mut need = desired.saturating_sub(have);
+                while need > 0 && total_live < max_fleet {
+                    let seq = f.next_unit_seq;
+                    let id = f.next_ship_id();
+                    // Deterministic ring spawn around the owner.
+                    let ang = (seq as f32) * 2.399_963; // golden angle, spreads the fleet
+                    let rad = 60.0 + (seq % 5) as f32 * 14.0;
+                    let sx = (ax + ang.cos() * rad).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                    let sy = (ay + ang.sin() * rad).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                    spawns.push((id, owner.clone(), ShipRole::from_unit(kind), sx, sy, kind.hp(), hue));
+                    total_live += 1;
+                    need -= 1;
+                }
+            }
+        }
+        for (id, owner, role, x, y, hp, hue) in spawns {
+            self.ships.insert(id, Ship::npc(role, owner, x, y, hp, hue, now));
+        }
     }
 
     /// Fire ship `id`'s selected weapon, dispatching on its kind. Reads the live ruleset, so a hot
@@ -1022,6 +1321,19 @@ impl Sim {
             victim_name,
             tick: now,
         });
+
+        // An NPC fleet ship does not respawn: it is removed from the world and struck from its
+        // faction's roster (you lose a ship and must build another). Player ships stay dead-but-present
+        // for the respawn cooldown.
+        let npc = self.ships.get(victim).and_then(|v| v.owner.clone().map(|o| (o, v.role)));
+        if let Some((owner, role)) = npc {
+            if let Some(unit) = role.to_unit()
+                && let Some(f) = self.factions.get_mut(&owner)
+            {
+                f.lose_unit(unit);
+            }
+            self.ships.remove(victim);
+        }
     }
 
     /// Push overlapping ships apart so they cannot stack — the ship↔ship collision physics. Uses the

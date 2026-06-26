@@ -347,6 +347,12 @@ pub struct Faction {
     pub queue: VecDeque<BuildOrder>,
     pub tech: Vec<String>,
     pub policy: AutoPolicy,
+    /// The standing order every NPC ship of this faction obeys.
+    #[serde(default)]
+    pub command: FactionCommand,
+    /// Monotonic id source for spawned NPC ships, so a destroyed ship's id is never reused.
+    #[serde(default)]
+    pub next_unit_seq: u64,
     /// Total ticks the faction has been simulated (advances whether the player is online or not).
     pub age_ticks: u64,
 }
@@ -365,8 +371,35 @@ impl Faction {
             queue: VecDeque::new(),
             tech: Vec::new(),
             policy: AutoPolicy::default(),
+            command: FactionCommand::default(),
+            next_unit_seq: 0,
             age_ticks: 0,
         }
+    }
+
+    /// Allocate the next stable NPC ship id for this faction (`npc:<owner>:<seq>`). The owner prefix
+    /// makes the id self-describing and the monotonic seq guarantees a destroyed ship's id is never
+    /// reused.
+    pub fn next_ship_id(&mut self) -> String {
+        let id = format!("npc:{}:{}", self.owner, self.next_unit_seq);
+        self.next_unit_seq += 1;
+        id
+    }
+
+    /// Record the loss of one NPC ship of `kind` (its hull hit zero in the world). Returns true if a
+    /// unit was removed from the roster.
+    pub fn lose_unit(&mut self, kind: UnitKind) -> bool {
+        if let Some(i) = self.units.iter().position(|u| u.kind == kind) {
+            self.units.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Count roster units of a kind (the desired number of live NPC ships of that kind).
+    pub fn unit_count(&self, kind: UnitKind) -> usize {
+        self.units.iter().filter(|u| u.kind == kind).count()
     }
 
     /// Manually enqueue a build (a player's explicit order). Pays the cost up front; returns false if

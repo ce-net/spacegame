@@ -72,6 +72,17 @@ pub enum ClientMsg {
     #[serde(rename = "weapon")]
     Weapon { id: String },
 
+    /// Command your faction's NPC fleet. `order` is one of
+    /// `"defend" | "follow" | "mine" | "hold" | "attack" | "attackmove"`; `attackmove` uses `x`/`y`.
+    #[serde(rename = "command")]
+    Command {
+        order: String,
+        #[serde(default)]
+        x: Option<f32>,
+        #[serde(default)]
+        y: Option<f32>,
+    },
+
     /// Request a respawn after death (honoured only once the cooldown elapsed).
     #[serde(rename = "respawn")]
     Respawn,
@@ -103,7 +114,37 @@ pub struct ShipView {
     /// Unlocked weapon ids, so the loadout UI can show what this ship may switch to.
     #[serde(default)]
     pub weapons: Vec<String>,
+    /// `Some(faction_owner)` if this is an NPC fleet ship, so the client can render it as a fleet unit
+    /// (and as friendly/hostile relative to the viewer). `None`/absent for a human player.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// `"player" | "drone" | "fighter" | "hauler"`.
+    #[serde(default)]
+    pub role: String,
     pub alive: bool,
+}
+
+/// A compact view of one player's faction, so the HUD can **track factions** — your industry and your
+/// fleet — and so the e2e can assert the always-alive economy and the NPC ships under command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FactionView {
+    /// Owning player NodeId.
+    pub owner: String,
+    pub minerals: u64,
+    pub energy: u64,
+    pub alloys: u64,
+    /// Building count.
+    pub buildings: u32,
+    /// Roster unit counts.
+    pub drones: u32,
+    pub fighters: u32,
+    pub haulers: u32,
+    /// Live NPC fleet ships currently in the world (under command).
+    pub fleet_alive: u32,
+    /// Coarse strength rating.
+    pub power: u64,
+    /// Standing fleet order (e.g. `"defend"`, `"attack_nearest"`, `"attack_move"`).
+    pub command: String,
 }
 
 /// One live bullet in a snapshot. `homing` lets the renderer draw a missile trail vs a pellet.
@@ -169,6 +210,9 @@ pub struct Snapshot {
     /// Rigid-body wreckage drifting in this sector.
     #[serde(default)]
     pub debris: Vec<DebrisView>,
+    /// Per-player faction summaries (economy + fleet), so clients can track factions.
+    #[serde(default)]
+    pub factions: Vec<FactionView>,
     /// Asteroid cells currently depleted: `[cx, cy]`. Clients hide these rocks.
     pub depleted: Vec<[i32; 2]>,
     /// Kill events emitted this tick (for the kill feed).
@@ -281,11 +325,26 @@ mod tests {
                 guns: 3,
                 weapon: "railgun".into(),
                 weapons: vec!["blaster".into(), "railgun".into()],
+                owner: None,
+                role: "player".into(),
                 alive: true,
             }],
             bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],
             beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
             debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
+            factions: vec![FactionView {
+                owner: "p1".into(),
+                minerals: 120,
+                energy: 60,
+                alloys: 20,
+                buildings: 3,
+                drones: 2,
+                fighters: 1,
+                haulers: 0,
+                fleet_alive: 3,
+                power: 42,
+                command: "defend".into(),
+            }],
             depleted: vec![[3, 4]],
             kills: vec![KillView { killer: "p1".into(), victim: "p2".into() }],
             ruleset: 7,
