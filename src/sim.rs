@@ -2126,13 +2126,24 @@ impl Sim {
                 let dx = sb.x - ax;
                 let dy = sb.y - ay;
                 let d2 = dx * dx + dy * dy;
-                if d2 >= min_d * min_d || d2 <= 1e-6 {
+                if d2 >= min_d * min_d {
                     continue;
                 }
                 let d = d2.sqrt();
+                // Separation direction. At (near-)zero distance there is NONE, so we must NOT skip (that
+                // welds two ships onto the exact same point forever) — pick a deterministic direction from
+                // the id pair so perfectly-overlapping ships always shove apart the same way and resolve.
+                let (nx, ny) = if d > 1e-3 {
+                    (dx / d, dy / d)
+                } else {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for byte in a.bytes().chain(b.bytes()) {
+                        h = (h ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                    let ang = (h as f32 / u64::MAX as f32) * std::f32::consts::TAU;
+                    (ang.cos(), ang.sin())
+                };
                 let overlap = (min_d - d) * 0.5 * tun.ship_push;
-                let nx = dx / d;
-                let ny = dy / d;
                 let pa = pushes.entry(a.clone()).or_insert((0.0, 0.0));
                 pa.0 -= nx * overlap;
                 pa.1 -= ny * overlap;
