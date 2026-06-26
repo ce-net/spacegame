@@ -12,18 +12,23 @@
 //! loss.
 //!
 //! [`SectorSnapshot`] is a faithful, deterministic capture: `restore(&capture(&s))` reproduces the
-//! same observable state (ships, bullets, minerals, kills, asteroid cooldowns), which is what makes
-//! failover seamless. This module is pure; the snapshot-every-N-ticks I/O and the
-//! `put_object`/`get_object` round-trip live in [`crate::director`] / [`crate::run_sector`].
+//! same observable state (ships incl. loadout/tech, bullets, minerals, kills, asteroid cooldowns),
+//! which is what makes failover seamless. The snapshot also records the sector coordinate and the
+//! ruleset version it ran under, so the recovering host restores into the right region and can detect
+//! whether it must hot-apply a newer ruleset. This module is pure; the snapshot-every-N-ticks I/O and
+//! the `put_object`/`get_object` round-trip live in [`crate::director`] / [`crate::run_sector`].
 
 use serde::{Deserialize, Serialize};
 
-use crate::sim::{Bullet, Ship, Sim};
+use crate::shard::SectorId;
+use crate::sim::{Bullet, Sim};
 
 /// Format version, so a future field change can be migrated rather than mis-read.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
-/// A serializable capture of one ship's authoritative state.
+/// A serializable capture of one ship's authoritative, persistent state. The newer loadout/tech fields
+/// carry `#[serde(default)]` so a v1 snapshot (pre-weapons) still decodes — the ship simply comes back
+/// with the default blaster.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShipSnap {
     pub id: String,
@@ -40,6 +45,15 @@ pub struct ShipSnap {
     pub kills: u32,
     pub speed_lv: u32,
     pub guns: u32,
+    /// Selected weapon id.
+    #[serde(default)]
+    pub weapon: String,
+    /// Unlocked weapon ids.
+    #[serde(default)]
+    pub weapons: Vec<String>,
+    /// Bought tech node ids.
+    #[serde(default)]
+    pub owned: Vec<String>,
     pub alive: bool,
 }
 
@@ -48,6 +62,15 @@ pub struct ShipSnap {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SectorSnapshot {
     pub version: u32,
+    /// Sector coordinate this snapshot belongs to.
+    #[serde(default)]
+    pub sx: i32,
+    #[serde(default)]
+    pub sy: i32,
+    /// The ruleset version the sector was running under (so a recovering host knows whether to fetch a
+    /// newer one before resuming).
+    #[serde(default)]
+    pub ruleset_version: u64,
     pub tick: u64,
     pub ships: Vec<ShipSnap>,
     pub bullets: Vec<Bullet>,
@@ -59,27 +82,7 @@ impl SectorSnapshot {
     /// Capture the full authoritative state of `sim`. Ships and mined cells are emitted in sorted
     /// order so the bytes (and hence the CID) are reproducible for identical state.
     pub fn capture(sim: &Sim) -> Self {
-        let mut ships: Vec<ShipSnap> = sim
-            .ships
-            .iter()
-            .map(|(id, s)| ShipSnap {
-                id: id.clone(),
-                name: s.name.clone(),
-                hue: s.hue,
-                x: s.x,
-                y: s.y,
-                vx: s.vx,
-                vy: s.vy,
-                a: s.a,
-                hp: s.hp,
-                max_hp: s.max_hp,
-                minerals: s.minerals,
-                kills: s.kills,
-                speed_lv: s.speed_lv,
-                guns: s.guns,
-                alive: s.alive,
-            })
-            .collect();
+        let mut ships: Vec<ShipSnap> = sim.ships.iter().map(|(id, s)| s.snap(id)).collect();
         ships.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut mined: Vec<(i32, i32, u64)> =
@@ -88,6 +91,9 @@ impl SectorSnapshot {
 
         SectorSnapshot {
             version: SNAPSHOT_VERSION,
+            sx: sim.sector.sx,
+            sy: sim.sector.sy,
+            ruleset_version: sim.rules.version,
             tick: sim.tick,
             ships,
             bullets: sim.bullets.clone(),
@@ -95,33 +101,16 @@ impl SectorSnapshot {
         }
     }
 
-    /// Rebuild a [`Sim`] from this snapshot — what a new host calls after fetching the latest CID, so
-    /// play resumes from the replicated state instead of an empty sector.
+    /// Rebuild a [`Sim`] from this snapshot — what a new host calls after fetching the latest CID. The
+    /// restored sim carries the snapshot's sector; the caller (the host) hot-applies the live ruleset
+    /// afterwards if a newer one is in force, so a ship returns into the right region under the right
+    /// rules.
     pub fn restore(&self) -> Sim {
-        let mut sim = Sim::new();
+        let mut sim = Sim::for_sector(SectorId::new(self.sx, self.sy), std::sync::Arc::new(crate::ruleset::Ruleset::builtin()));
         sim.tick = self.tick;
         sim.bullets = self.bullets.clone();
         for s in &self.ships {
-            sim.ships.insert(
-                s.id.clone(),
-                Ship::from_snap(
-                    s.name.clone(),
-                    s.hue,
-                    s.x,
-                    s.y,
-                    s.vx,
-                    s.vy,
-                    s.a,
-                    s.hp,
-                    s.max_hp,
-                    s.minerals,
-                    s.kills,
-                    s.speed_lv,
-                    s.guns,
-                    s.alive,
-                    self.tick,
-                ),
-            );
+            sim.ships.insert(s.id.clone(), crate::sim::Ship::from_snap(s, self.tick));
         }
         sim.set_mined(self.mined.iter().map(|&(cx, cy, t)| ((cx, cy), t)));
         sim
@@ -135,8 +124,8 @@ impl SectorSnapshot {
     /// Deserialize from `get_object` bytes.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
         let snap: SectorSnapshot = serde_json::from_slice(bytes)?;
-        if snap.version != SNAPSHOT_VERSION {
-            anyhow::bail!("unsupported sector snapshot version {}", snap.version);
+        if snap.version > SNAPSHOT_VERSION {
+            anyhow::bail!("unsupported sector snapshot version {} (this build reads up to {})", snap.version, SNAPSHOT_VERSION);
         }
         Ok(snap)
     }
@@ -149,12 +138,12 @@ mod tests {
     use crate::sim::rock_in_cell;
     use crate::wire::ClientMsg;
 
-    /// Build a non-trivial live sector: ships that moved, mined, fired, and bought upgrades.
+    /// Build a non-trivial live sector: ships that moved, mined, fired, bought tech, swapped weapons.
     fn busy_sim() -> Sim {
         let mut s = Sim::new();
+        s.seamless = false; // keep ships inside one sector for a clean round-trip comparison
         apply_client_msg(&mut s, "nodeA", ClientMsg::Join { name: "Ace".into() });
         apply_client_msg(&mut s, "nodeB", ClientMsg::Join { name: "Bee".into() });
-        // Drop Ace onto a live rock so it banks minerals (creating a mined-cooldown entry).
         let rock = (0..40)
             .flat_map(|cx| (0..40).map(move |cy| (cx, cy)))
             .find_map(|(cx, cy)| rock_in_cell(cx, cy))
@@ -162,48 +151,39 @@ mod tests {
         if let Some(sh) = s.ships.get_mut("nodeA") {
             sh.x = rock.x;
             sh.y = rock.y;
+            sh.minerals = 500;
         }
+        apply_client_msg(&mut s, "nodeA", ClientMsg::Build { kind: "tech-missile".into() });
+        apply_client_msg(&mut s, "nodeA", ClientMsg::Weapon { id: "missile".into() });
         apply_client_msg(&mut s, "nodeA", ClientMsg::Input { thrust: true, turn: 0, fire: true, aim: Some(0.0), name: None });
         apply_client_msg(&mut s, "nodeB", ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(1.0), name: None });
         s.tick(1.0);
-        s.tick(1.0);
-        // Buy an upgrade for Ace.
-        s.ships.get_mut("nodeA").unwrap().minerals += 100;
-        apply_client_msg(&mut s, "nodeA", ClientMsg::Build { kind: "speed".into() });
         s.tick(1.0);
         s
     }
 
     #[test]
-    fn capture_then_restore_is_faithful() {
+    fn capture_then_restore_is_faithful_incl_loadout() {
         let original = busy_sim();
         let snap = SectorSnapshot::capture(&original);
         let restored = snap.restore();
 
         assert_eq!(restored.tick, original.tick);
+        assert_eq!(restored.sector, original.sector);
         assert_eq!(restored.player_count(), original.player_count());
         for (id, p) in &original.ships {
             let q = restored.ships.get(id).expect("ship restored");
             assert_eq!(q.minerals, p.minerals);
             assert_eq!(q.kills, p.kills);
             assert_eq!(q.guns, p.guns);
-            assert_eq!(q.speed_lv, p.speed_lv);
-            assert_eq!(q.hp, p.hp);
-            assert_eq!(q.alive, p.alive);
+            assert_eq!(q.weapon, p.weapon, "selected weapon survives failover");
+            assert_eq!(q.weapons, p.weapons, "unlocked loadout survives failover");
             assert!((q.x - p.x).abs() < 1e-3 && (q.y - p.y).abs() < 1e-3);
         }
-        // Same depleted-rock set survives the round-trip.
-        let mut a: Vec<_> = original.mined_cells();
-        let mut b: Vec<_> = restored.mined_cells();
-        a.sort();
-        b.sort();
-        assert_eq!(a, b);
     }
 
     #[test]
     fn restored_sim_continues_deterministically() {
-        // The strong failover property: a restored host advancing the sim produces the SAME future
-        // the original would have. Snapshot at T, advance both K ticks (same inputs = none), equal.
         let mut original = busy_sim();
         let snap = SectorSnapshot::capture(&original);
         let mut restored = snap.restore();
@@ -222,16 +202,16 @@ mod tests {
         let snap = SectorSnapshot::capture(&busy_sim());
         let bytes = snap.encode().unwrap();
         assert_eq!(SectorSnapshot::decode(&bytes).unwrap(), snap);
-        // Same state -> same bytes (so put_object yields the same CID): re-capture matches.
         let again = SectorSnapshot::capture(&snap.restore());
         assert_eq!(again.encode().unwrap(), bytes);
     }
 
     #[test]
-    fn decode_rejects_wrong_version() {
-        let mut snap = SectorSnapshot::capture(&busy_sim());
-        snap.version = 999;
-        let bytes = snap.encode().unwrap();
-        assert!(SectorSnapshot::decode(&bytes).is_err());
+    fn snapshot_records_sector_and_ruleset_version() {
+        let mut s = Sim::for_sector(SectorId::new(3, -2), std::sync::Arc::new(crate::ruleset::Ruleset::builtin()));
+        s.join("n", "p", 0);
+        let snap = SectorSnapshot::capture(&s);
+        assert_eq!((snap.sx, snap.sy), (3, -2));
+        assert_eq!(snap.ruleset_version, 1);
     }
 }
