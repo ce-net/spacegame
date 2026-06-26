@@ -11,7 +11,8 @@ use crate::aabb::{Aabb, AabbTree};
 use crate::faction::FactionCommand;
 use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
 use crate::wire::{
-    BeamView, BulletView, ClientMsg, DebrisView, FactionView, KillView, ShipView, Snapshot, SnapshotTag,
+    BeamView, BulletView, ClientMsg, DebrisView, ExplosionView, FactionView, KillView, ShipView, Snapshot,
+    SnapshotTag,
 };
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
@@ -180,6 +181,12 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         })
         .collect();
 
+    let explosions: Vec<ExplosionView> = sim
+        .explosions
+        .iter()
+        .map(|e| ExplosionView { x: e.x.round() as i32, y: e.y.round() as i32, r: e.r.round() as i32, hue: e.hue })
+        .collect();
+
     let debris: Vec<DebrisView> = sim
         .debris
         .bodies
@@ -208,6 +215,7 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         ships,
         bullets,
         beams,
+        explosions,
         debris,
         factions: faction_views(sim),
         depleted,
@@ -265,6 +273,13 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         })
         .collect();
 
+    let explosions: Vec<ExplosionView> = sim
+        .explosions
+        .iter()
+        .filter(|e| pad.contains_point(e.x, e.y))
+        .map(|e| ExplosionView { x: e.x.round() as i32, y: e.y.round() as i32, r: e.r.round() as i32, hue: e.hue })
+        .collect();
+
     let debris: Vec<DebrisView> = sim
         .debris
         .bodies
@@ -303,6 +318,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         ships,
         bullets,
         beams,
+        explosions,
         debris,
         factions: faction_views(sim),
         depleted,

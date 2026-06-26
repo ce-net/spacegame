@@ -171,6 +171,15 @@ pub struct BeamView {
     pub kind: u8,
 }
 
+/// A missile detonation this tick, for the renderer to flash a blast of radius `r`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExplosionView {
+    pub x: i32,
+    pub y: i32,
+    pub r: i32,
+    pub hue: u32,
+}
+
 /// One piece of rigid-body wreckage in a snapshot, for the renderer to tumble.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DebrisView {
@@ -207,6 +216,9 @@ pub struct Snapshot {
     /// Hitscan beams emitted this tick (railgun/laser).
     #[serde(default)]
     pub beams: Vec<BeamView>,
+    /// Missile detonations this tick.
+    #[serde(default)]
+    pub explosions: Vec<ExplosionView>,
     /// Rigid-body wreckage drifting in this sector.
     #[serde(default)]
     pub debris: Vec<DebrisView>,
@@ -331,6 +343,7 @@ mod tests {
             }],
             bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],
             beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
+            explosions: vec![ExplosionView { x: 50, y: 50, r: 80, hue: 20 }],
             debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
             factions: vec![FactionView {
                 owner: "p1".into(),

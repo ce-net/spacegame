@@ -407,6 +407,8 @@ pub struct Sim {
     pub kill_feed: Vec<KillEvent>,
     /// Beams emitted this tick (railgun/laser) for the wire snapshot. Cleared each tick.
     pub beams: Vec<BeamEvent>,
+    /// Missile detonations this tick, for the wire snapshot. Cleared each tick.
+    pub explosions: Vec<Explosion>,
     /// Ships that left this sector this tick, to be delivered to neighbours. Drained by the host.
     pub transit_out: Vec<Transit>,
     /// Per-player **always-alive** factions, keyed by owner NodeId. Ticked every sim tick whether or
@@ -429,6 +431,7 @@ impl Default for Sim {
             mined: HashMap::new(),
             kill_feed: Vec::new(),
             beams: Vec::new(),
+            explosions: Vec::new(),
             transit_out: Vec::new(),
             factions: std::collections::HashMap::new(),
             debris: physics::World::new(),
@@ -653,6 +656,7 @@ impl Sim {
         let tun = self.tun();
         self.kill_feed.clear();
         self.beams.clear();
+        self.explosions.clear();
 
         // --- Pass 0: NPC fleet AI. Faction ships under command pick a goal and decide to fire; their
         // intents are then integrated exactly like a player's in pass 1. ---
@@ -1127,6 +1131,8 @@ impl Sim {
                 let spread = def.spread;
                 let homing = if def.kind == WeaponKind::Homing { def.turn_rate } else { 0.0 };
                 let dmg = def.damage + if def.id == "blaster" { (guns.saturating_sub(1) as i32) * 2 } else { 0 };
+                // Homing rounds are missiles: they detonate with an AoE blast scaled to their payload.
+                let explode_radius = if def.kind == WeaponKind::Homing { def.damage as f32 * 1.4 + 45.0 } else { 0.0 };
                 for g in 0..count {
                     let off = if count > 1 { (g as f32 - (count as f32 - 1.0) / 2.0) * spread } else { 0.0 };
                     let a = wa + off;
@@ -1140,6 +1146,7 @@ impl Sim {
                         hue,
                         die_at: now + def.ttl,
                         homing,
+                        explode_radius,
                     });
                 }
             }
@@ -1224,7 +1231,11 @@ impl Sim {
         let bullets = std::mem::take(&mut self.bullets);
         let mut surviving: Vec<Bullet> = Vec::with_capacity(bullets.len());
         for mut b in bullets {
+            let missile = b.explode_radius > 0.0;
             if now >= b.die_at {
+                if missile {
+                    self.detonate(&b, now, tree); // a missile that runs out of fuel still blows up
+                }
                 continue;
             }
             // Homing: steer the velocity toward the nearest alive enemy within the acquire radius.
@@ -1245,6 +1256,9 @@ impl Sim {
             b.x += b.vx * dt_scale;
             b.y += b.vy * dt_scale;
             if b.x < 0.0 || b.y < 0.0 || b.x > SECTOR_SIZE || b.y > SECTOR_SIZE {
+                if missile {
+                    self.detonate(&b, now, tree);
+                }
                 continue;
             }
             // Broad-phase: only ships near the bullet are candidates.
@@ -1267,12 +1281,61 @@ impl Sim {
                 }
             }
             if let Some(victim) = hit_target {
-                self.apply_damage(&victim, b.dmg, &b.owner, now);
-                continue; // bullet consumed
+                if missile {
+                    self.detonate(&b, now, tree); // AoE — the direct target is inside the blast too
+                } else {
+                    self.apply_damage(&victim, b.dmg, &b.owner, now);
+                }
+                continue; // round consumed
             }
             surviving.push(b);
         }
         self.bullets = surviving;
+    }
+
+    /// Detonate a missile `b` at its current position: flash an [`Explosion`], deal area-of-effect
+    /// damage to every alive ship of another faction within `explode_radius` (full damage at the
+    /// centre, falling off to 25% at the edge — never friendly-fires the firer's own faction), and
+    /// scatter wreckage. The blast is found with the AABB broad-phase, so it is cheap even in a crowd.
+    fn detonate(&mut self, b: &Bullet, now: u64, tree: &AabbTree<String>) {
+        let radius = b.explode_radius;
+        self.explosions.push(Explosion { x: b.x, y: b.y, r: radius, hue: b.hue });
+        // The firer's faction (to avoid blowing up your own fleet).
+        let own_faction = self
+            .ships
+            .get(&b.owner)
+            .map(|s| s.faction_id(&b.owner).to_string())
+            .unwrap_or_else(|| b.owner.clone());
+        let mut victims = tree.query(&Aabb::around(b.x, b.y, radius));
+        victims.sort();
+        for cid in victims {
+            let (alive, fac, sx, sy) = {
+                let Some(s) = self.ships.get(&cid) else { continue };
+                (s.alive, s.faction_id(&cid).to_string(), s.x, s.y)
+            };
+            if !alive || fac == own_faction {
+                continue;
+            }
+            let d = ((sx - b.x).powi(2) + (sy - b.y).powi(2)).sqrt();
+            if d > radius {
+                continue;
+            }
+            let falloff = (1.0 - d / radius).max(0.25);
+            let dmg = ((b.dmg as f32) * falloff).round() as i32;
+            self.apply_damage(&cid, dmg, &b.owner, now);
+        }
+        // A little debris kicked out by the blast (deterministic from position + tick).
+        let seed = fnv1a(&b.owner) ^ (b.x as u32).wrapping_mul(2654435761) ^ now as u32;
+        for k in 0..3u32 {
+            let a = ((seed.wrapping_add(k.wrapping_mul(40503)) % 360) as f32).to_radians();
+            let spd = 20.0 + ((seed >> (k % 8)) % 40) as f32;
+            let mut body = RigidBody::dynamic(Vec2::new(b.x, b.y), 0.6, Shape::Circle { r: 3.0 });
+            body.vel = Vec2::new(a.cos() * spd, a.sin() * spd);
+            body.ang_vel = a.sin() * 2.0;
+            body.restitution = 0.5;
+            body.tag = now;
+            self.debris.add(body);
+        }
     }
 
     /// The nearest alive enemy (not `owner`) to `(x, y)` within `radius`, via the AABB broad-phase.
@@ -1411,6 +1474,78 @@ impl Sim {
                 s.vy += py * 0.3;
             }
         }
+    }
+
+    /// A deterministic digest of the authoritative state at this tick — the **anti-cheat / agreement**
+    /// fingerprint. Replicas that simulate the same sector from the same inputs produce the *same*
+    /// hash; a host that fudges the rules (teleports a ship, fakes a kill, mints minerals) produces a
+    /// *different* hash and is outvoted by the honest replicas. Floats are quantised so honest replicas
+    /// agree despite tiny rounding, and order-independent fields (bullets, debris) are folded with XOR
+    /// so map iteration order never causes a false disagreement. Pairs with [`crate::replication`].
+    pub fn state_hash(&self) -> u64 {
+        const PRIME: u64 = 0x100000001b3;
+        fn mix(h: &mut u64, v: u64) {
+            *h ^= v;
+            *h = h.wrapping_mul(PRIME);
+        }
+        fn q(f: f32) -> u64 {
+            // Quantise to 1/8 unit so honest replicas agree despite sub-unit float noise.
+            (f * 8.0).round() as i64 as u64
+        }
+        let mut h: u64 = 0xcbf29ce484222325;
+        mix(&mut h, self.tick);
+        mix(&mut h, self.sector.sx as u64);
+        mix(&mut h, self.sector.sy as u64);
+        mix(&mut h, self.rules.version);
+
+        // Ships: sorted by id (stable order).
+        let mut ids: Vec<&String> = self.ships.keys().collect();
+        ids.sort();
+        for id in ids {
+            let s = &self.ships[id];
+            mix(&mut h, fnv1a(id) as u64);
+            mix(&mut h, q(s.x));
+            mix(&mut h, q(s.y));
+            mix(&mut h, q(s.vx));
+            mix(&mut h, q(s.vy));
+            mix(&mut h, q(s.a));
+            mix(&mut h, s.hp as i64 as u64);
+            mix(&mut h, s.minerals as u64);
+            mix(&mut h, s.kills as u64);
+            mix(&mut h, s.guns as u64);
+            mix(&mut h, s.alive as u64);
+            mix(&mut h, s.role as u64);
+            mix(&mut h, fnv1a(&s.weapon) as u64);
+            mix(&mut h, fnv1a(s.owner.as_deref().unwrap_or("")) as u64);
+        }
+
+        // Bullets: order-independent (XOR fold), since the Vec order is an implementation detail.
+        let mut bsum: u64 = 0;
+        for b in &self.bullets {
+            let mut bh: u64 = 0x9e3779b97f4a7c15;
+            mix(&mut bh, fnv1a(&b.owner) as u64);
+            mix(&mut bh, q(b.x));
+            mix(&mut bh, q(b.y));
+            mix(&mut bh, b.dmg as i64 as u64);
+            mix(&mut bh, b.die_at);
+            bsum ^= bh;
+        }
+        mix(&mut h, bsum);
+
+        // Factions: sorted by owner.
+        let mut owners: Vec<&String> = self.factions.keys().collect();
+        owners.sort();
+        for o in owners {
+            let f = &self.factions[o];
+            mix(&mut h, fnv1a(o) as u64);
+            mix(&mut h, f.resources.minerals);
+            mix(&mut h, f.resources.energy);
+            mix(&mut h, f.resources.alloys);
+            mix(&mut h, f.buildings.len() as u64);
+            mix(&mut h, f.units.len() as u64);
+            mix(&mut h, f.power());
+        }
+        h
     }
 
     // ---- snapshot/cooldown plumbing ----
@@ -1656,6 +1791,58 @@ mod tests {
     }
 
     #[test]
+    fn missile_travels_and_detonates_with_area_damage() {
+        let mut s = arena();
+        s.join("g", "G", 10);
+        {
+            let g = s.ships.get_mut("g").unwrap();
+            g.weapons.push("missile".into());
+            g.weapon = "missile".into();
+            g.x = 500.0;
+            g.y = 500.0;
+            g.a = 0.0;
+            g.vx = 0.0;
+            g.vy = 0.0;
+        }
+        // Two enemies clustered downrange so the blast catches both.
+        s.join("e1", "E1", 100);
+        s.join("e2", "E2", 110);
+        for (id, ex, ey) in [("e1", 900.0, 500.0), ("e2", 928.0, 520.0)] {
+            let e = s.ships.get_mut(id).unwrap();
+            e.x = ex;
+            e.y = ey;
+            e.hp = 300;
+            e.max_hp = 300;
+            e.vx = 0.0;
+            e.vy = 0.0;
+        }
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);
+        s.tick(1.0);
+        assert!(s.bullets.iter().any(|b| b.explode_radius > 0.0), "a missile is in flight");
+
+        let mut exploded = false;
+        for _ in 0..60 {
+            // Hold the targets still and let the missile fly in and detonate.
+            for (id, ex, ey) in [("e1", 900.0, 500.0), ("e2", 928.0, 520.0)] {
+                if let Some(e) = s.ships.get_mut(id) {
+                    e.x = ex;
+                    e.y = ey;
+                }
+            }
+            s.tick(1.0);
+            if !s.explosions.is_empty() {
+                exploded = true;
+                break;
+            }
+        }
+        assert!(exploded, "the missile detonated (an explosion was emitted)");
+        let e1_hurt = s.ships.get("e1").map(|e| !e.alive || e.hp < 300).unwrap_or(true);
+        let e2_hurt = s.ships.get("e2").map(|e| !e.alive || e.hp < 300).unwrap_or(true);
+        assert!(e1_hurt && e2_hurt, "area-of-effect blast damaged BOTH clustered enemies");
+        assert!(s.ships["g"].alive && s.ships["g"].hp == s.ships["g"].max_hp, "the firer's own ship is unharmed");
+    }
+
+    #[test]
     fn tech_tree_unlocks_a_weapon_and_gates_on_cost() {
         let mut s = Sim::new();
         s.join("n", "p", 0);
@@ -1799,6 +1986,28 @@ mod tests {
         s.apply_damage(&fid, 9999, "B", s.tick);
         assert!(!s.ships.contains_key(&fid), "destroyed NPC is removed from the world");
         assert!(s.factions["A"].unit_count(UnitKind::Fighter) < before, "the loss struck the faction roster");
+    }
+
+    #[test]
+    fn state_hash_agrees_for_honest_replicas_and_catches_a_cheat() {
+        // Two replicas simulate the same sector from the same inputs: their state hashes must match.
+        let mut a = arena();
+        let mut b = arena();
+        for r in [&mut a, &mut b] {
+            r.join("x", "X", 1);
+            r.join("y", "Y", 200);
+        }
+        for _ in 0..25 {
+            for r in [&mut a, &mut b] {
+                r.apply_intent("x", Intent { thrust: true, aim: Some(0.3), fire: true, ..Default::default() }, 1);
+                r.tick(1.0);
+            }
+        }
+        assert_eq!(a.state_hash(), b.state_hash(), "honest replicas agree on the world hash");
+
+        // A cheating host teleports its ship; its hash now disagrees and would be outvoted.
+        a.ships.get_mut("x").unwrap().x += 60.0;
+        assert_ne!(a.state_hash(), b.state_hash(), "a tampered state produces a different hash");
     }
 
     #[test]
