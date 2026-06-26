@@ -20,11 +20,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::faction::Faction;
 use crate::shard::SectorId;
 use crate::sim::{Bullet, Sim};
 
 /// Format version, so a future field change can be migrated rather than mis-read.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// A serializable capture of one ship's authoritative, persistent state. The newer loadout/tech fields
 /// carry `#[serde(default)]` so a v1 snapshot (pre-weapons) still decodes — the ship simply comes back
@@ -76,6 +77,10 @@ pub struct SectorSnapshot {
     pub bullets: Vec<Bullet>,
     /// Asteroid cells depleted: `(cx, cy, mined_at_tick)`.
     pub mined: Vec<(i32, i32, u64)>,
+    /// Always-alive player factions, so a host taking over keeps everyone's economy building without
+    /// missing a beat. (Ephemeral debris is not snapshotted — it is cosmetic and bounded.)
+    #[serde(default)]
+    pub factions: Vec<Faction>,
 }
 
 impl SectorSnapshot {
@@ -89,6 +94,9 @@ impl SectorSnapshot {
             sim.mined_cells().into_iter().map(|((cx, cy), t)| (cx, cy, t)).collect();
         mined.sort();
 
+        let mut factions: Vec<Faction> = sim.factions.values().cloned().collect();
+        factions.sort_by(|a, b| a.owner.cmp(&b.owner));
+
         SectorSnapshot {
             version: SNAPSHOT_VERSION,
             sx: sim.sector.sx,
@@ -98,6 +106,7 @@ impl SectorSnapshot {
             ships,
             bullets: sim.bullets.clone(),
             mined,
+            factions,
         }
     }
 
@@ -113,6 +122,9 @@ impl SectorSnapshot {
             sim.ships.insert(s.id.clone(), crate::sim::Ship::from_snap(s, self.tick));
         }
         sim.set_mined(self.mined.iter().map(|&(cx, cy, t)| ((cx, cy), t)));
+        for f in &self.factions {
+            sim.factions.insert(f.owner.clone(), f.clone());
+        }
         sim
     }
 

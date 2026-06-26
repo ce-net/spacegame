@@ -398,12 +398,15 @@ impl Sim {
         self.rules.tunables.clone()
     }
 
-    /// Register or update a ship's identity (called on join).
+    /// Register or update a ship's identity (called on join). Also founds the player's always-alive
+    /// faction the first time they are seen, so their economy exists from then on regardless of
+    /// presence.
     pub fn join(&mut self, id: &str, name: &str, hue: u32) {
         let tick = self.tick;
         let name = sanitize_name(name);
         let dw = self.rules.default_weapon();
         let base_hp = self.rules.tunables.base_hp;
+        self.factions.entry(id.to_string()).or_insert_with(|| Faction::founding(id));
         match self.ships.get_mut(id) {
             Some(s) => {
                 s.name = name;
@@ -696,6 +699,11 @@ impl Sim {
                 if let Some(s) = self.ships.get_mut(id) {
                     s.minerals = s.minerals.saturating_add(val);
                 }
+                // Feed the player's persistent faction economy from live mining — the bridge from the
+                // arena to the always-alive industrial layer.
+                if let Some(f) = self.factions.get_mut(id) {
+                    f.deposit_minerals(val as u64);
+                }
             }
         }
 
@@ -730,6 +738,28 @@ impl Sim {
         // --- Pass 4: ship<->ship collision physics (push overlapping ships apart). ---
         if tun.ship_push > 0.0 {
             self.resolve_ship_collisions(&tree, &tun);
+        }
+
+        // --- Pass 5: the always-alive factions tick every step, online or not. ---
+        for f in self.factions.values_mut() {
+            f.tick();
+        }
+
+        // --- Pass 6: LOD rigid-body wreckage. Precision follows the players: debris near a ship is
+        // simulated at high precision/iteration; far debris is coarse or merely registered. ---
+        if !self.debris.bodies.is_empty() {
+            let focus: Vec<Vec2> = self.ships.values().map(|s| Vec2::new(s.x, s.y)).collect();
+            physics::assign_lod(&mut self.debris.bodies, &focus, 700.0, 1500.0, 3000.0);
+            self.debris.step(1.0 / 20.0, Vec2::zero());
+            // Retire wreckage that drifted out of the sector or has lived long enough.
+            let sector_box = (0.0, 0.0, SECTOR_SIZE, SECTOR_SIZE);
+            self.debris.retain(|b| {
+                b.pos.x >= sector_box.0 - 200.0
+                    && b.pos.y >= sector_box.1 - 200.0
+                    && b.pos.x <= sector_box.2 + 200.0
+                    && b.pos.y <= sector_box.3 + 200.0
+                    && now.saturating_sub(b.tag) < 1200
+            });
         }
 
         // --- Housekeeping: GC the mined-cooldown map so it can't grow without bound. ---
@@ -955,14 +985,29 @@ impl Sim {
         if !killed {
             return;
         }
-        {
+        let (vx, vy) = {
             let v = self.ships.get_mut(victim).expect("present");
             v.alive = false;
             v.hp = 0;
             v.dead_at = now;
             v.minerals = 0;
+            let p = (v.x, v.y);
             v.vx = 0.0;
             v.vy = 0.0;
+            p
+        };
+        // Scatter rigid-body wreckage from the wreck. Deterministic spread from the victim id + tick,
+        // so every replica produces identical debris.
+        let seed = fnv1a(victim) ^ (now as u32).wrapping_mul(2654435761);
+        for k in 0..5u32 {
+            let a = ((seed.wrapping_add(k.wrapping_mul(0x9e3779b1)) % 360) as f32).to_radians();
+            let spd = 30.0 + ((seed >> (k % 8)) % 60) as f32;
+            let mut body = RigidBody::dynamic(Vec2::new(vx, vy), 1.0, Shape::Circle { r: 4.0 + (k % 3) as f32 });
+            body.vel = Vec2::new(a.cos() * spd, a.sin() * spd);
+            body.ang_vel = (a.cos()) * 2.0;
+            body.restitution = 0.5;
+            body.tag = now;
+            self.debris.add(body);
         }
         let killer_name = if let Some(k) = self.ships.get_mut(attacker) {
             k.kills += 1;

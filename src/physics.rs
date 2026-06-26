@@ -299,6 +299,23 @@ impl World {
         idx
     }
 
+    /// Keep only bodies matching `pred`, rebuilding the broad-phase (proxies are reassigned). Used to
+    /// retire wreckage that drifted away or expired.
+    pub fn retain(&mut self, mut pred: impl FnMut(&RigidBody) -> bool) {
+        let kept: Vec<RigidBody> = self.bodies.drain(..).filter(|b| pred(b)).collect();
+        self.bodies = kept;
+        self.rebuild_tree();
+    }
+
+    /// Rebuild the dynamic tree from scratch and reassign every body's proxy (after a bulk removal).
+    fn rebuild_tree(&mut self) {
+        self.tree = DynamicAabbTree::new(self.tree.fat_margin);
+        for i in 0..self.bodies.len() {
+            let aabb = self.bodies[i].world_aabb();
+            self.bodies[i].proxy = self.tree.insert(aabb, i);
+        }
+    }
+
     /// Refresh the broad-phase entry for body `i` after it moved (cheap if it stayed in its fat box).
     fn refit(&mut self, i: usize) {
         let aabb = self.bodies[i].world_aabb();

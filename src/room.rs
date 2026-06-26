@@ -9,7 +9,7 @@
 
 use crate::aabb::{Aabb, AabbTree};
 use crate::sim::{Intent, Sim, SECTOR_SIZE};
-use crate::wire::{BeamView, BulletView, ClientMsg, KillView, ShipView, Snapshot, SnapshotTag};
+use crate::wire::{BeamView, BulletView, ClientMsg, DebrisView, KillView, ShipView, Snapshot, SnapshotTag};
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
 pub fn hue_for(node_id: &str) -> u32 {
@@ -106,6 +106,18 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         })
         .collect();
 
+    let debris: Vec<DebrisView> = sim
+        .debris
+        .bodies
+        .iter()
+        .map(|b| DebrisView {
+            x: b.pos.x.round() as i32,
+            y: b.pos.y.round() as i32,
+            a: (b.angle * 100.0).round() as i32,
+            r: b.shape.bound_radius().round() as i32,
+        })
+        .collect();
+
     let depleted = sim.depleted_cells().into_iter().map(|(cx, cy, _)| [cx, cy]).collect();
 
     let kills = sim
@@ -122,6 +134,7 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         ships,
         bullets,
         beams,
+        debris,
         depleted,
         kills,
         ruleset: sim.rules.version,
@@ -177,6 +190,19 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         })
         .collect();
 
+    let debris: Vec<DebrisView> = sim
+        .debris
+        .bodies
+        .iter()
+        .filter(|b| pad.contains_point(b.pos.x, b.pos.y))
+        .map(|b| DebrisView {
+            x: b.pos.x.round() as i32,
+            y: b.pos.y.round() as i32,
+            a: (b.angle * 100.0).round() as i32,
+            r: b.shape.bound_radius().round() as i32,
+        })
+        .collect();
+
     let depleted = sim
         .depleted_cells()
         .into_iter()
@@ -202,6 +228,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         ships,
         bullets,
         beams,
+        debris,
         depleted,
         kills,
         ruleset: sim.rules.version,

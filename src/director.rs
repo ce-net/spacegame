@@ -22,6 +22,7 @@ use ce_rs::{Amount, BidSpec, CeClient, Receipt};
 use std::collections::HashMap;
 
 use crate::leaderboard::{Commitment, Leaderboard};
+use crate::replication::ReplicaCandidate;
 use crate::ruleset::Ruleset;
 use crate::shard::{best_host, nearest_host, shard_for, HostCandidate, SectorId};
 use crate::sim::{Sim, Transit};
@@ -382,6 +383,51 @@ pub async fn prewarm_neighbors(
     Ok(placed)
 }
 
+// ----------------------------------------------------------------------------------------------
+// FAULT TOLERANCE: proximity-replica heartbeats + candidate gathering.
+// ----------------------------------------------------------------------------------------------
+
+/// The pubsub topic a region's replica holders heartbeat on, so the set can detect a dropped replica
+/// and agree on takeover. Region = sector token.
+pub fn replica_topic(region: &str) -> String {
+    format!("{}/replica", topics::service(region))
+}
+
+/// A liveness heartbeat from a node that holds a high-precision replica of `region`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub region: String,
+    pub node: String,
+    pub tick: u64,
+}
+
+/// Announce that this node holds a live replica of `region` (one heartbeat). Other replica holders
+/// [`observe`](crate::replication::ReplicaSet::observe) it; a missed heartbeat is how a drop is found.
+pub async fn publish_heartbeat(ce: &CeClient, region: &str, node: &str, tick: u64) -> Result<()> {
+    let hb = Heartbeat { region: region.to_string(), node: node.to_string(), tick };
+    let bytes = serde_json::to_vec(&hb).context("encode heartbeat")?;
+    ce.publish(&replica_topic(region), &bytes).await.context("publish heartbeat")?;
+    Ok(())
+}
+
+/// Build the candidate set for replica placement from the live mesh view. In-game proximity is the
+/// strongest signal but is not visible at the mesh layer, so we approximate it with measured latency
+/// (a low-RTT node is usually a node whose player is engaging the same region); the host can refine
+/// `in_game_dist` from actual player positions before calling [`ReplicaSet::plan`].
+pub async fn gather_replica_candidates(ce: &CeClient) -> Result<Vec<ReplicaCandidate>> {
+    let cands = gather_candidates(ce).await?;
+    Ok(cands
+        .into_iter()
+        .map(|c| ReplicaCandidate {
+            in_game_dist: c.rtt_ms.unwrap_or(150.0) as f32,
+            rtt_ms: c.rtt_ms,
+            free_cores: c.cpu_cores,
+            alive: true,
+            node_id: c.node_id,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +435,11 @@ mod tests {
     // The director's logic is wired SDK I/O; the deterministic decisions it composes are tested in
     // their own modules. These pin the pure string/topic helpers clients and standby hosts must agree
     // on exactly, plus the per-sector board reduction.
+
+    #[test]
+    fn replica_topic_is_stable() {
+        assert_eq!(replica_topic("3_4"), "ce-game/spacegame/3_4/replica");
+    }
 
     #[test]
     fn transit_and_ruleset_topics_are_stable() {

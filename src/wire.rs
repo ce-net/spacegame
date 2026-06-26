@@ -130,6 +130,16 @@ pub struct BeamView {
     pub kind: u8,
 }
 
+/// One piece of rigid-body wreckage in a snapshot, for the renderer to tumble.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebrisView {
+    pub x: i32,
+    pub y: i32,
+    /// Heading in centi-radians (quantized), so the client can spin it.
+    pub a: i32,
+    pub r: i32,
+}
+
 /// One kill-feed entry in a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KillView {
@@ -156,6 +166,9 @@ pub struct Snapshot {
     /// Hitscan beams emitted this tick (railgun/laser).
     #[serde(default)]
     pub beams: Vec<BeamView>,
+    /// Rigid-body wreckage drifting in this sector.
+    #[serde(default)]
+    pub debris: Vec<DebrisView>,
     /// Asteroid cells currently depleted: `[cx, cy]`. Clients hide these rocks.
     pub depleted: Vec<[i32; 2]>,
     /// Kill events emitted this tick (for the kill feed).
@@ -272,6 +285,7 @@ mod tests {
             }],
             bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],
             beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
+            debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
             depleted: vec![[3, 4]],
             kills: vec![KillView { killer: "p1".into(), victim: "p2".into() }],
             ruleset: 7,
