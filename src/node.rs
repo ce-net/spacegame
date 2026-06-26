@@ -452,9 +452,15 @@ pub async fn run_node(
         epoch: 0,
     };
 
-    // GENESIS: host the root cell here and announce it so clients and other controllers learn it exists.
-    node.host_cell(CellId::ROOT);
-    node.commit_shape(ShapeOp::Place { cell: CellId::ROOT, node: me.clone(), from_snapshot: None }).await;
+    // GENESIS: exactly one public node must anchor the root cell so it always exists and browsers have an
+    // arena to join. We make that the GATEWAY (the public entry point). Donor nodes (no `--gateway`) host
+    // ONLY the cells the galaxy assigns them via splits/placements they own — so two nodes never
+    // split-brain the genesis cell into divergent authoritative sims. Run exactly one gateway as the
+    // genesis anchor (or, with several gateways, the ROOT rendezvous owner among them).
+    if opts.gateway {
+        node.host_cell(CellId::ROOT);
+        node.commit_shape(ShapeOp::Place { cell: CellId::ROOT, node: me.clone(), from_snapshot: None }).await;
+    }
 
     if opts.gateway {
         // Advertise as a browser gateway entry point so the directory builder / peers can find us.
