@@ -347,10 +347,10 @@ mod tests {
         let mut set = ReplicaSet::new("0_0", "host", ReplicationConstraint { k: 3 }, 0);
         set.admit("backupA", 0);
         set.admit("backupB", 0);
-        // Heartbeats from backups at t=10, but not the primary.
-        set.observe("backupA", 10);
-        set.observe("backupB", 10);
-        set.expire(20, 5); // primary last seen at 0 -> unhealthy
+        // Fresh heartbeats from the backups, but not the primary.
+        set.observe("backupA", 18);
+        set.observe("backupB", 18);
+        set.expire(20, 5); // primary last seen at 0 -> unhealthy; backups (t=18) stay healthy
         let candidates = vec![
             cand("backupA", 150.0, 30.0, true), // closer => higher score => promoted
             cand("backupB", 800.0, 10.0, true),

@@ -1772,6 +1772,7 @@ mod tests {
         let mut s = arena();
         s.join("gunner", "G", 10);
         s.join("target", "T", 20);
+        solo(&mut s);
         {
             let g = s.ships.get_mut("gunner").unwrap();
             g.weapons.push("missile".into());
@@ -1818,6 +1819,7 @@ mod tests {
         // Two enemies clustered downrange so the blast catches both.
         s.join("e1", "E1", 100);
         s.join("e2", "E2", 110);
+        solo(&mut s);
         for (id, ex, ey) in [("e1", 900.0, 500.0), ("e2", 928.0, 520.0)] {
             let e = s.ships.get_mut(id).unwrap();
             e.x = ex;

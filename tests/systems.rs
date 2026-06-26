@@ -124,8 +124,8 @@ fn the_quorum_outvotes_a_cheater() {
 fn replica_set_promotes_and_re_replicates_on_failure() {
     let mut set = ReplicaSet::new("0_0", "host", ReplicationConstraint { k: 3 }, 0);
     set.admit("near", 0);
-    set.observe("near", 10);
-    set.expire(20, 5); // host went silent
+    set.observe("near", 18);
+    set.expire(20, 5); // host went silent; the backup (t=18) stays healthy
     let cands = vec![
         ReplicaCandidate { node_id: "near".into(), rtt_ms: Some(20.0), in_game_dist: 100.0, free_cores: 4, alive: true },
         ReplicaCandidate { node_id: "fresh".into(), rtt_ms: Some(30.0), in_game_dist: 400.0, free_cores: 8, alive: true },

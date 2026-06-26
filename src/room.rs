@@ -344,6 +344,7 @@ mod tests {
     fn build_then_select_weapon_via_wire() {
         let mut sim = Sim::new();
         apply_client_msg(&mut sim, "playerA", ClientMsg::Join { name: "Ace".into() });
+        sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet ships in the snapshot
         sim.ships.get_mut("playerA").unwrap().minerals = 1000;
         // Legacy "gun" token maps onto the twin-guns tech node.
         apply_client_msg(&mut sim, "playerA", ClientMsg::Build { kind: "gun".into() });
@@ -379,6 +380,7 @@ mod tests {
         // One ship near the origin, one far away.
         apply_client_msg(&mut sim, "near", ClientMsg::Join { name: "N".into() });
         apply_client_msg(&mut sim, "far", ClientMsg::Join { name: "F".into() });
+        sim.factions.values_mut().for_each(|f| f.units.clear()); // count only the two player ships
         sim.ships.get_mut("near").unwrap().x = 200.0;
         sim.ships.get_mut("near").unwrap().y = 200.0;
         sim.ships.get_mut("far").unwrap().x = 2800.0;
