@@ -190,6 +190,39 @@ impl UnitKind {
     pub fn needs_shipyard(self) -> bool {
         matches!(self, UnitKind::Hauler)
     }
+    /// Hull of the NPC ship this unit becomes in the world.
+    pub fn hp(self) -> i32 {
+        match self {
+            UnitKind::Drone => 30,
+            UnitKind::Fighter => 90,
+            UnitKind::Hauler => 140,
+        }
+    }
+    /// Does this unit fight (carry a weapon)? Drones mine, haulers haul; fighters fight.
+    pub fn is_combat(self) -> bool {
+        matches!(self, UnitKind::Fighter)
+    }
+}
+
+/// A standing order the player gives their faction — every NPC ship the faction owns obeys it. The
+/// order persists with the faction (snapshotted/replicated), so your fleet keeps its instructions
+/// across a host failover and while you are offline.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum FactionCommand {
+    /// Guard the owner: drones mine nearby, fighters escort and engage anything that comes close.
+    #[default]
+    Defend,
+    /// All ships converge on and stay near the owner.
+    Follow,
+    /// Drones seek asteroids; non-drones idle. Pure economy.
+    Mine,
+    /// Hold position — stop and wait.
+    Hold,
+    /// Fighters hunt the nearest enemy anywhere in the sector.
+    AttackNearest,
+    /// Move the fleet to a point, engaging enemies en route.
+    AttackMove { x: f32, y: f32 },
 }
 
 /// A constructed building.
