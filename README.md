@@ -17,13 +17,32 @@ another, and even the ship's color (derived from the NodeId) is unspoofable.
 
 ```
 ce start                                       # the local node must be running (this is the mesh)
-spacegame host --sector 0_0               # host the origin sector here
-spacegame host --sector 0_0 --sector 1_0  # host several sectors (independent cells) at once
+spacegame host --sector 0_0                    # host the origin sector here
+spacegame host --sector 0_0 --sector 1_0       # host several sectors (independent cells) at once
+spacegame host --sector 0_0 --autoscale        # pre-warm neighbours as the sector fills up
+spacegame host --sector 0_0 --ruleset live.json# host AND hot-reload: every save of live.json re-tunes
+                                               # the live game for every host + client, no restart
 spacegame place --sector 1_0 --image ce-net/spacegame:latest
                                                # atlas-guided: pick the best host, deploy the cell there
-spacegame shard   --sector 1_0            # which node rendezvous-hash assigns this sector to
-spacegame nearest --sector 1_0            # nearest live host of this sector (client view)
+spacegame ruleset init live.json               # write the built-in ruleset as an editable template
+spacegame ruleset push live.json               # push an edited ruleset live to the whole mesh, now
+spacegame shard   --sector 1_0                 # which node rendezvous-hash assigns this sector to
+spacegame nearest --sector 1_0                 # nearest live host of this sector (client view)
 ```
+
+See [`SCALING.md`](SCALING.md) for how this design holds **1,000,000+ concurrent players**.
+
+### Combat, content and the infinite map
+
+- **Weapons are data** in a hot-reloadable [ruleset](src/ruleset.rs): the **blaster** (ballistic),
+  **homing missile** (steers to the nearest enemy), **railgun** (instant hitscan ray) and **laser**
+  (continuous beam). Add or re-balance weapons by editing the ruleset — no redeploy.
+- **Tech tree** unlocks weapons and upgrades (hull / thrusters / guns), server-priced and gated.
+- **Infinite map:** a ship that crosses a sector edge is *handed off* to the neighbouring sector
+  (cross-sector transit), carrying its full loadout — one continuous galaxy, not walled arenas.
+- **Ship↔ship collision physics** keep ships from stacking.
+- **Hot reload:** weapons, items, tech tree, tunables and even **frontend shaders** can be changed
+  *while people are playing* and the change reaches every host and client across the mesh instantly.
 
 The frontend (`web/demos/spacegame/`) talks to these backends **only over the CE mesh**, through the
 same-origin node bridge (`window.__ceNode` if an in-browser WASM node is present, else the same-origin
