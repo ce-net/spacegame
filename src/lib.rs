@@ -37,6 +37,7 @@
 
 pub mod aabb;
 pub mod build;
+pub mod client;
 pub mod director;
 pub mod faction;
 pub mod leaderboard;

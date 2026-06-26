@@ -87,3 +87,7 @@ paraphrase or "correct" the quotes below.
 
 (Read as: the entire ship should now be convertible into one single ShapeBlueprint for rendering the
 whole ship in one pass, getting its AABB efficiently, and caching it.)
+
+### 18 — tests + frontend interaction architecture
+
+> Write tests for the physics , destruction, weapons, systems and other stuff. Prepare how the frontend (native application, browser on desktop, browser on mobile device) will interact with it efficently when its distributed and fault tolerant and insanely scalable.

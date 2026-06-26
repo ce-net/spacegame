@@ -30,9 +30,11 @@ spacegame shard   --sector 1_0                 # which node rendezvous-hash assi
 spacegame nearest --sector 1_0                 # nearest live host of this sector (client view)
 ```
 
-See [`SCALING.md`](SCALING.md) for how this design holds **1,000,000+ concurrent players**, and
+See [`SCALING.md`](SCALING.md) for how this design holds **1,000,000+ concurrent players**,
 [`SYSTEMS.md`](SYSTEMS.md) for the LOD rigid-body physics, nested/dynamic AABBs, the always-alive
-faction metagame, and the proximity-replica fault-tolerance system.
+faction metagame, and the proximity-replica fault-tolerance system, [`BUILDING.md`](BUILDING.md) for the
+shapes/objects/blueprints/procgen building system, and [`FRONTEND.md`](FRONTEND.md) for how the native /
+desktop-browser / mobile-browser clients connect efficiently across all of it.
 
 ### Combat, content and the infinite map
 
@@ -88,6 +90,8 @@ src/
                   in blueprints) with params, repeat, and runtime resolution to a concrete craft.
   procgen.rs      recursive procedural ship generation: modules (blueprint + role + attach slots) + a
                   placement grammar -> deterministically grown, varied ship designs (resolve to craft).
+  client.rs       shared per-platform client tuning (native / desktop browser / mobile browser):
+                  view radius, entity caps, snapshot subsampling, interest sectors, reconnect backoff.
   shard.rs        SectorId + rendezvous-hash sharding + latency-first host scoring + interest set.
   wire.rs         sector-keyed pubsub topics + ClientMsg / Snapshot JSON wire types (weapons, beams).
   room.rs         glue: authenticated mesh msg -> sim intent; sim -> wire Snapshot (full + viewport-
