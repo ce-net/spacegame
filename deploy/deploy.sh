@@ -79,9 +79,13 @@ frontend() {
   sync "$HERE"                   spacegame
   sync "$SIBS/spacegame-render"  spacegame-render
   sync "$SIBS/spacegame-wasm"    spacegame-wasm
+  # RUSTFLAGS --growable-table: recent rust-lld emits the wasm `__indirect_function_table` with a fixed
+  # maximum (min == max), so wasm-bindgen's runtime `table.grow()` for JS closures fails at boot
+  # ("WebAssembly.Table.grow() failed to grow table by N"). This flag makes the table growable. (`.cargo/`
+  # is excluded from the source sync, so the flag is set here rather than in a committed cargo config.)
   "${SSH[@]}" "$RELAY" 'source $HOME/.cargo/env; cd '"$REMOTE"'/spacegame-wasm &&
     (command -v wasm-pack >/dev/null || cargo install wasm-pack) &&
-    (wasm-pack build --release --target web --out-dir pkg > /tmp/spacegame-wasm-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-wasm-build.log; exit $rc)'
+    (RUSTFLAGS="-C link-arg=--growable-table" wasm-pack build --release --target web --out-dir pkg > /tmp/spacegame-wasm-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-wasm-build.log; exit $rc)'
   echo "==> publish the client to the hub as app '"$APP"' (serves at https://$APP.ce-net.com/)"
   # Upload index.html, the page's JS, and the built pkg/ to /apps/spacegame/ on the local hub, with the
   # right content types (wasm MUST be application/wasm or the browser refuses to stream-compile it).
