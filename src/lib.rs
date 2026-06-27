@@ -52,6 +52,7 @@ pub mod shard;
 pub mod sim;
 pub mod snapshot;
 pub mod wire;
+pub mod world;
 
 // --- Mesh I/O (behind the default `mesh` feature; pulls ce-rs/tokio) ---
 #[cfg(feature = "mesh")]
