@@ -242,10 +242,57 @@ pub struct Tunables {
     /// Energy regenerated per tick.
     #[serde(default = "default_energy_regen")]
     pub energy_regen: f32,
+    /// **Economy cadence.** The always-alive faction economy (production, the build queue, and the idle
+    /// auto-build policy) advances once every this many *sim* ticks, NOT every tick. The sim runs at
+    /// ~60 Hz for smooth flight, but the strategy layer is balanced in coarse "economy ticks": running it
+    /// every frame is what makes resources balloon into the millions and a full fleet appear in seconds.
+    /// `1` restores the old every-frame behaviour. Mining (active play) still banks every tick.
+    #[serde(default = "default_econ_interval")]
+    pub econ_interval_ticks: u64,
+    /// **Hostiles.** Ticks between marauder raids on a sector that holds a live player. `0` disables PvE
+    /// entirely (a pure builder/PvP sector).
+    #[serde(default = "default_enemy_wave_ticks")]
+    pub enemy_wave_ticks: u64,
+    /// Marauders spawned per raid (subject to `enemy_max`).
+    #[serde(default = "default_enemy_wave_size")]
+    pub enemy_wave_size: u32,
+    /// Hard cap on marauders alive in a sector at once (bounds the threat and the sim cost).
+    #[serde(default = "default_enemy_max")]
+    pub enemy_max: u32,
+    /// Hull a marauder spawns with.
+    #[serde(default = "default_enemy_hp")]
+    pub enemy_hp: i32,
+    /// Minerals a marauder drops as loot when destroyed (the kill -> reward -> rebuild loop).
+    #[serde(default = "default_enemy_loot")]
+    pub enemy_loot: u32,
+    /// How far from the targeted player a raid spawns in (world units) — far enough to see them coming.
+    #[serde(default = "default_enemy_spawn_dist")]
+    pub enemy_spawn_dist: f32,
 }
 
 fn default_max_fleet() -> u32 {
-    24
+    16
+}
+fn default_econ_interval() -> u64 {
+    15
+}
+fn default_enemy_wave_ticks() -> u64 {
+    1200
+}
+fn default_enemy_wave_size() -> u32 {
+    3
+}
+fn default_enemy_max() -> u32 {
+    12
+}
+fn default_enemy_hp() -> i32 {
+    70
+}
+fn default_enemy_loot() -> u32 {
+    40
+}
+fn default_enemy_spawn_dist() -> f32 {
+    1600.0
 }
 fn default_shield_regen() -> f32 {
     0.8
@@ -276,12 +323,19 @@ impl Default for Tunables {
             player_ttl_ticks: 100,
             max_guns: 5,
             ship_push: 0.5,
-            max_fleet: 24,
+            max_fleet: 16,
             base_shield: 0,
             shield_regen: 0.8,
             shield_delay: 90,
             base_energy: 100.0,
             energy_regen: 1.5,
+            econ_interval_ticks: 15,
+            enemy_wave_ticks: 1200,
+            enemy_wave_size: 3,
+            enemy_max: 12,
+            enemy_hp: 70,
+            enemy_loot: 40,
+            enemy_spawn_dist: 1600.0,
         }
     }
 }
