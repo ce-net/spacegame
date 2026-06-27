@@ -155,30 +155,68 @@ fn now_ms() -> u64 {
 }
 #[cfg(feature = "mesh")]
 
-/// Compare the replicas' state proofs collected for one checkpoint `tick` and log the verdict — the
-/// anti-cheat agreement step. `votes` maps node id -> state hash. If a strict majority agrees and this
-/// node's hash differs, this node has diverged (a bug, a desync, or — if it were the cheat — itself)
-/// and should resync; if another node is the lone dissenter, it is the suspect. Pure logging here; the
-/// existing replica machinery handles the actual takeover/resync.
-fn judge_proofs(host_id: &str, region: &str, tick: u64, votes: &std::collections::HashMap<String, u64>) {
+/// Compare the replicas' state proofs collected for one checkpoint `tick` and return the [`Verdict`] —
+/// the anti-cheat agreement step. `votes` maps node id -> state hash. If a strict majority agrees and
+/// this node's hash differs, this node has diverged (a bug, a desync, or — if it were the cheat —
+/// itself) and the caller MERGES it back to the agreed state ([`merge_to_quorum_if_outvoted`]); if
+/// another node is the lone dissenter, it is the suspect. Logs the verdict as a side effect.
+fn judge_proofs(
+    host_id: &str,
+    region: &str,
+    tick: u64,
+    votes: &std::collections::HashMap<String, u64>,
+) -> replication::Verdict {
     if votes.len() < 2 {
-        return; // need at least two replicas to cross-check
+        return replication::Verdict::Inconclusive; // need at least two replicas to cross-check
     }
     let proofs: Vec<replication::StateProof> = votes
         .iter()
         .map(|(node, &hash)| replication::StateProof { region: region.to_string(), node: node.clone(), tick, hash })
         .collect();
-    let a = replication::agree(&proofs);
-    if !a.has_quorum {
-        tracing::warn!(region, tick, replicas = votes.len(), "no replica quorum on state hash (split) — cannot accept a result this checkpoint");
-        return;
+    let verdict = replication::agree(&proofs).verdict(host_id);
+    match &verdict {
+        replication::Verdict::Inconclusive => {
+            tracing::warn!(region, tick, replicas = votes.len(), "no replica quorum on state hash (split) — cannot accept a result this checkpoint")
+        }
+        replication::Verdict::Agreed => {
+            tracing::debug!(region, tick, replicas = votes.len(), "all replicas agree on the world hash (verified)")
+        }
+        replication::Verdict::ResyncTo(h) => {
+            tracing::warn!(region, tick, quorum_hash = h, "THIS node is out-voted by the replica quorum — MERGING to the agreed state")
+        }
+        replication::Verdict::PeersDiverged(suspects) => {
+            tracing::warn!(region, tick, suspects = ?suspects, "replica(s) disagree with the quorum — faulty or cheating, will be re-synced/excluded")
+        }
     }
-    if a.dissent.is_empty() {
-        tracing::debug!(region, tick, replicas = a.agree.len(), "all replicas agree on the world hash (verified)");
-    } else if a.dissent.iter().any(|d| d == host_id) {
-        tracing::warn!(region, tick, "THIS node diverged from the replica quorum — resyncing from the agreed snapshot");
-    } else {
-        tracing::warn!(region, tick, suspects = ?a.dissent, "replica(s) disagree with the quorum — faulty or cheating, will be re-synced/excluded");
+    verdict
+}
+
+/// Act on a checkpoint [`Verdict`]: if THIS replica was out-voted, MERGE — adopt the snapshot whose
+/// state hash the quorum agreed on, so a cheater or a desynced node converges to the single agreed world
+/// instead of drifting. No trusted server is involved; the majority of player-replicas IS the authority.
+#[cfg(feature = "mesh")]
+async fn merge_to_quorum_if_outvoted(
+    ce: &CeClient,
+    sim: &mut sim::Sim,
+    sector_id: shard::SectorId,
+    rules: &std::sync::Arc<ruleset::Ruleset>,
+    snap_index: &std::collections::HashMap<u64, (u64, String)>,
+    verdict: replication::Verdict,
+) {
+    let replication::Verdict::ResyncTo(hash) = verdict else { return };
+    let Some((_tick, cid)) = snap_index.get(&hash) else {
+        tracing::debug!(hash, "out-voted, but the agreed snapshot isn't cached yet — awaiting its announce");
+        return;
+    };
+    match director::restore_snapshot(ce, cid).await {
+        Ok(mut merged) => {
+            merged.sector = sector_id;
+            merged.hazards = crate::hazard::Hazards::for_sector(sector_id);
+            merged.apply_ruleset(rules.clone());
+            *sim = merged;
+            tracing::warn!(hash, "MERGE: re-synced this replica to the quorum-agreed state");
+        }
+        Err(e) => tracing::warn!(error = %e, "merge resync failed (will retry next checkpoint)"),
     }
 }
 #[cfg(feature = "mesh")]
@@ -251,9 +289,19 @@ pub async fn run_sector(
     if let Err(e) = ce.subscribe(&proof_topic).await {
         tracing::debug!(error = %e, "proof subscribe failed (continuing)");
     }
+    // Snapshot announces from every replica (incl. ourselves): how we obtain the agreed state to MERGE
+    // to when out-voted. We index them by their state hash so an out-voted node can fetch exactly the
+    // snapshot the quorum agreed on.
+    let snapshot_topic = director::snapshot_topic(&cfg.sector);
+    if let Err(e) = ce.subscribe(&snapshot_topic).await {
+        tracing::debug!(error = %e, "snapshot subscribe failed (continuing)");
+    }
     // Collected proofs per checkpoint tick: tick -> (node -> state hash).
     let mut proofs: std::collections::HashMap<u64, std::collections::HashMap<String, u64>> =
         std::collections::HashMap::new();
+    // Recent replicated snapshots, indexed by their state hash: hash -> (tick, cid). The merge step
+    // restores the cid whose hash the quorum agreed on. Bounded below to a handful of recent entries.
+    let mut snap_index: std::collections::HashMap<u64, (u64, String)> = std::collections::HashMap::new();
     // How often (ticks) every replica hashes the SAME checkpoint and publishes a proof.
     let proof_every: u64 = 100;
     // The local view of who holds a high-precision replica of this region, for K-replica takeover.
@@ -515,8 +563,9 @@ pub async fn run_sector(
                                 let _ = director::publish_state_proof(&ce2, &region, &me, t, hash).await;
                             });
                         }
-                        if let Some(v) = proofs.get(&t) {
-                            judge_proofs(&host_id, &cfg.sector, t, v);
+                        let verdict = proofs.get(&t).map(|v| judge_proofs(&host_id, &cfg.sector, t, v));
+                        if let Some(verdict) = verdict {
+                            merge_to_quorum_if_outvoted(ce, &mut sim, sector_id, &rules, &snap_index, verdict).await;
                         }
                         // Bound the buffer: keep only recent checkpoints.
                         proofs.retain(|&k, _| t.saturating_sub(k) <= proof_every * 4);
@@ -566,8 +615,24 @@ pub async fn run_sector(
                                 && p.node != host_id
                             {
                                 proofs.entry(p.tick).or_default().insert(p.node, p.hash);
-                                if let Some(v) = proofs.get(&p.tick) {
-                                    judge_proofs(&host_id, &cfg.sector, p.tick, v);
+                                let verdict = proofs.get(&p.tick).map(|v| judge_proofs(&host_id, &cfg.sector, p.tick, v));
+                                if let Some(verdict) = verdict {
+                                    merge_to_quorum_if_outvoted(ce, &mut sim, sector_id, &rules, &snap_index, verdict).await;
+                                }
+                            }
+                        } else if m.topic == snapshot_topic {
+                            // STATE MERGING: index every replica's snapshot by its state hash, so when we
+                            // are out-voted we can fetch and adopt exactly the state the quorum agreed on.
+                            if let Ok(ann) = serde_json::from_slice::<director::SnapshotAnnounce>(&payload)
+                                && ann.hash != 0
+                            {
+                                snap_index.insert(ann.hash, (ann.tick, ann.cid));
+                                // Bound the index — keep the freshest handful of snapshots.
+                                if snap_index.len() > 64 {
+                                    let oldest = snap_index.iter().min_by_key(|(_, (t, _))| *t).map(|(h, _)| *h);
+                                    if let Some(h) = oldest {
+                                        snap_index.remove(&h);
+                                    }
                                 }
                             }
                         } else if m.topic == ruleset_topic {

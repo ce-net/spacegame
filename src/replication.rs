@@ -273,6 +273,44 @@ pub struct Agreement {
     pub has_quorum: bool,
 }
 
+/// What a replica should DO this checkpoint, derived from an [`Agreement`] for a given node. This turns
+/// "the replicas disagree" from a log line into a convergent action — the heart of state merging: an
+/// out-voted replica (a cheater, or one that merely desynced) adopts the agreed state, so the world
+/// stays single-valued without any trusted central server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Fewer than two replicas, or no strict majority — cannot safely act this checkpoint.
+    Inconclusive,
+    /// This node is part of the quorum (or all agree) — nothing to do.
+    Agreed,
+    /// This node is out-voted by a quorum that agreed on this state hash — it must MERGE: re-sync its
+    /// sim to the snapshot whose [`crate::director::SnapshotAnnounce::hash`] equals this value.
+    ResyncTo(u64),
+    /// This node is IN the quorum; these other node(s) diverged — they are the cheat/fault suspects.
+    PeersDiverged(Vec<String>),
+}
+
+impl Agreement {
+    /// The action `this_node` should take given this agreement. See [`Verdict`].
+    pub fn verdict(&self, this_node: &str) -> Verdict {
+        if !self.has_quorum {
+            return Verdict::Inconclusive;
+        }
+        if self.dissent.is_empty() {
+            return Verdict::Agreed;
+        }
+        if self.dissent.iter().any(|d| d == this_node) {
+            // We lost the vote — merge to the agreed truth. quorum_hash is Some when has_quorum.
+            match self.quorum_hash {
+                Some(h) => Verdict::ResyncTo(h),
+                None => Verdict::Inconclusive,
+            }
+        } else {
+            Verdict::PeersDiverged(self.dissent.clone())
+        }
+    }
+}
+
 /// Compare the replicas' state proofs for a single tick and decide the agreed truth. The most common
 /// hash wins (ties broken by the lowest hash value, deterministically); every replica that computed a
 /// different hash is a **dissenter** — a host that is faulty or cheating. `has_quorum` is true only if
@@ -423,6 +461,21 @@ mod tests {
         assert!(a.has_quorum);
         assert!(a.dissent.is_empty());
         assert_eq!(a.quorum_hash, Some(5));
+    }
+
+    #[test]
+    fn verdict_tells_an_outvoted_node_to_merge_to_the_quorum() {
+        // a,b,c agree on 7; the cheater reports 9. The cheater's verdict is RESYNC to hash 7 (merge);
+        // an honest node's verdict is that the cheater diverged; a quorum node otherwise does nothing.
+        let a = agree(&[proof("a", 7), proof("b", 7), proof("c", 7), proof("cheat", 9)]);
+        assert_eq!(a.verdict("cheat"), Verdict::ResyncTo(7), "the out-voted node merges to the agreed truth");
+        assert_eq!(a.verdict("a"), Verdict::PeersDiverged(vec!["cheat".into()]), "a quorum node flags the suspect");
+        let unanimous = agree(&[proof("a", 5), proof("b", 5)]);
+        assert_eq!(unanimous.verdict("a"), Verdict::Agreed);
+        // No strict majority -> never act (can't tell truth from a lie in a 1-1 split).
+        let split = agree(&[proof("a", 1), proof("b", 2)]);
+        assert_eq!(split.verdict("a"), Verdict::Inconclusive);
+        assert_eq!(split.verdict("b"), Verdict::Inconclusive);
     }
 
     #[test]
