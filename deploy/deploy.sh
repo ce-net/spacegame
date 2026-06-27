@@ -101,6 +101,10 @@ frontend() {
     # locally with esbuild (npm run build:peer) and committed, so no npm is needed here. boot.js loads it
     # only with ?peer and falls back to the bridge on failure.
     if [ -f galaxy-peer.bundle.js ]; then cp galaxy-peer.bundle.js "$STAGE/"; else echo "    WARN: galaxy-peer.bundle.js missing; run npm i and npm run build:peer"; fi
+    # Account/start-menu bundle (encrypted ce-iam vault + start menu + node auth) + its wasm. Pre-built
+    # locally (npm run build:account); boot.js loads account.bundle.js before the game.
+    if [ -f account.bundle.js ]; then cp account.bundle.js "$STAGE/"; else echo "    WARN: account.bundle.js missing; run npm run build:account"; fi
+    if [ -f ce_iam_core_wasm_bg.wasm ]; then cp ce_iam_core_wasm_bg.wasm "$STAGE/"; fi
     cp galaxy/gateways.json "$STAGE/galaxy/"
     # The spacegame galaxy map lives UNDER the spacegame app at /map (it is spacegame-specific). The
     # bare map.ce-net.com is reserved for a future ce-net-wide donator map, so do NOT publish there.
