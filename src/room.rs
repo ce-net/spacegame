@@ -11,8 +11,8 @@ use crate::aabb::{Aabb, AabbTree};
 use crate::faction::FactionCommand;
 use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
 use crate::wire::{
-    BeamView, BulletView, ClientMsg, DebrisView, ExplosionView, FactionView, KillView, LootView, ShipView,
-    Snapshot, SnapshotTag,
+    BeamView, BulletView, ClientMsg, ClientPacket, DebrisView, ExplosionView, FactionView, KillView, LootView,
+    ShipView, Snapshot, SnapshotTag,
 };
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
@@ -100,7 +100,9 @@ pub fn faction_views(sim: &Sim) -> Vec<FactionView> {
 pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
     let hue = hue_for(from);
     match msg {
-        ClientMsg::Join { name } => {
+        ClientMsg::Join { name, cap: _ } => {
+            // `cap` is the optional ce-iam vouch capability; this SDK trusts the node-authenticated
+            // sender id directly, so the token is accepted and ignored here (a future host verifies it).
             sim.join(from, &name, hue);
         }
         ClientMsg::Input { thrust, turn, fire, aim, name } => {
@@ -128,6 +130,59 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
     false
 }
 
+/// Apply one authenticated client **packet** (the reliable netcode envelope, [`ClientPacket`]) from the
+/// verified sender `from` — the single wire path a real client uses:
+///
+/// 1. **Reliable actions** (`reliable`, oldest first) are applied in contiguous sequence order, each at
+///    most once: a [`SeqMsg`] whose `seq` is exactly `input_ack + 1` is applied and advances the ack;
+///    anything already covered (`seq <= input_ack`) is a harmless resend and skipped. The new ack rides
+///    back in [`crate::wire::ShipView::input_ack`], so the client retires those actions from its outbox.
+/// 2. **Continuous flight input** (`input`) is applied only if `input_seq` beats the last accepted one,
+///    discarding a stale or reordered frame.
+///
+/// Returns `true` if a `Bye` was applied. `Join` is itself the first reliable action, so it advances the
+/// ack and founds the ship/faction here.
+pub fn apply_client_packet(sim: &mut Sim, from: &str, pkt: ClientPacket) -> bool {
+    let mut said_bye = false;
+
+    // 1) Reliable actions: contiguous, idempotent, oldest-first.
+    let mut reliable = pkt.reliable;
+    reliable.sort_by_key(|m| m.seq);
+    for sm in reliable {
+        let ack = sim.ships.get(from).map(|s| s.input_ack).unwrap_or(0);
+        if sm.seq <= ack {
+            continue; // already applied (a resend)
+        }
+        if sm.seq != ack + 1 {
+            break; // a gap — wait for the missing seq rather than apply out of order
+        }
+        if apply_client_msg(sim, from, sm.msg) {
+            said_bye = true;
+        }
+        if let Some(s) = sim.ships.get_mut(from) {
+            s.input_ack = sm.seq;
+        }
+        if said_bye {
+            break;
+        }
+    }
+
+    // 2) Continuous flight input: freshest wins.
+    if let Some(ClientMsg::Input { thrust, turn, fire, aim, name }) = pkt.input {
+        let fresh =
+            pkt.input_seq == 0 || sim.ships.get(from).map(|s| pkt.input_seq > s.last_input_seq).unwrap_or(true);
+        if fresh {
+            let hue = hue_for(from);
+            sim.apply_intent(from, Intent { thrust, turn, fire, aim, name }, hue);
+            if let Some(s) = sim.ships.get_mut(from) {
+                s.last_input_seq = pkt.input_seq;
+            }
+        }
+    }
+
+    said_bye
+}
+
 fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
     ShipView {
         id: id.to_string(),
@@ -138,6 +193,14 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         a: (s.a * 100.0).round() as i32,
         hp: s.hp,
         max_hp: s.max_hp,
+        // Shields/energy/effects are not yet simulated in this SDK — emit neutral values (no shield
+        // system, empty effect set). The wire carries them so the renderer/clients are ready.
+        shield: 0,
+        max_shield: 0,
+        energy: 0,
+        max_energy: 0,
+        effects: Vec::new(),
+        input_ack: s.input_ack,
         minerals: s.minerals,
         kills: s.kills,
         guns: s.guns,
@@ -230,6 +293,10 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         explosions,
         debris,
         loot,
+        // Proximity mines and power-up pickups are not yet simulated in this SDK — emitted empty so the
+        // wire shape is complete and the renderer simply draws none.
+        mines: Vec::new(),
+        pickups: Vec::new(),
         factions: faction_views(sim),
         depleted,
         kills,
@@ -347,6 +414,10 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         explosions,
         debris,
         loot,
+        // Proximity mines and power-up pickups are not yet simulated in this SDK — emitted empty so the
+        // wire shape is complete and the renderer simply draws none.
+        mines: Vec::new(),
+        pickups: Vec::new(),
         factions: faction_views(sim),
         depleted,
         kills,
@@ -370,7 +441,7 @@ mod tests {
     #[test]
     fn build_then_select_weapon_via_wire() {
         let mut sim = Sim::new();
-        apply_client_msg(&mut sim, "playerA", ClientMsg::Join { name: "Ace".into() });
+        apply_client_msg(&mut sim, "playerA", ClientMsg::Join { name: "Ace".into(), cap: None });
         sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet ships in the snapshot
         sim.ships.get_mut("playerA").unwrap().minerals = 1000;
         // Legacy "gun" token maps onto the twin-guns tech node.
@@ -405,8 +476,8 @@ mod tests {
         let mut sim = Sim::new();
         sim.seamless = false;
         // One ship near the origin, one far away.
-        apply_client_msg(&mut sim, "near", ClientMsg::Join { name: "N".into() });
-        apply_client_msg(&mut sim, "far", ClientMsg::Join { name: "F".into() });
+        apply_client_msg(&mut sim, "near", ClientMsg::Join { name: "N".into(), cap: None });
+        apply_client_msg(&mut sim, "far", ClientMsg::Join { name: "F".into(), cap: None });
         sim.factions.values_mut().for_each(|f| f.units.clear()); // count only the two player ships
         sim.ships.get_mut("near").unwrap().x = 200.0;
         sim.ships.get_mut("near").unwrap().y = 200.0;

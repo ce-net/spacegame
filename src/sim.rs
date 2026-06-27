@@ -213,6 +213,14 @@ pub struct Ship {
     pub want_fire: bool,
     #[serde(skip)]
     pub last_input_tick: u64,
+    /// Netcode: highest continuous-input `input_seq` accepted, so a stale/reordered flight frame is
+    /// discarded. Live-only (resets on failover; the client re-establishes it next packet).
+    #[serde(skip)]
+    pub last_input_seq: u64,
+    /// Netcode: highest **contiguous reliable-action sequence** applied from this player, echoed to the
+    /// client as [`crate::wire::ShipView::input_ack`] so it can retire acked actions from its outbox.
+    #[serde(skip)]
+    pub input_ack: u64,
 }
 
 impl Ship {
@@ -244,6 +252,8 @@ impl Ship {
             want_turn: 0,
             want_fire: false,
             last_input_tick: tick,
+            last_input_seq: 0,
+            input_ack: 0,
         }
     }
 
@@ -292,6 +302,8 @@ impl Ship {
             want_turn: 0,
             want_fire: false,
             last_input_tick: tick,
+            last_input_seq: 0,
+            input_ack: 0,
         }
     }
 

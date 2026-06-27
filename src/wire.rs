@@ -42,9 +42,14 @@ pub mod topics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t")]
 pub enum ClientMsg {
-    /// Announce presence / set name in this sector.
+    /// Announce presence / set name in this sector. `cap` is an optional node-signed vouch capability
+    /// (ce-iam) the host may verify on the reliable join path; `None`/absent for anonymous play.
     #[serde(rename = "join")]
-    Join { name: String },
+    Join {
+        name: String,
+        #[serde(default)]
+        cap: Option<String>,
+    },
 
     /// One frame of input: thrust, turn (-1/0/+1), fire, and an optional absolute aim heading.
     #[serde(rename = "in")]
@@ -92,6 +97,66 @@ pub enum ClientMsg {
     Bye,
 }
 
+/// A reliable client action tagged with a monotonic sequence number. Discrete actions (join, weapon,
+/// build, command, respawn, bye) are wrapped in this and held in the client's resend outbox until the
+/// host's [`ShipView::input_ack`] covers the sequence — so a dropped action is never lost, and the host
+/// applies each sequence at most once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeqMsg {
+    pub seq: u64,
+    pub msg: ClientMsg,
+}
+
+/// The single client→host packet published on a sector's `/in` topic each send-tick. It carries the
+/// latest **continuous flight input** (unreliable; only the freshest matters, ordered by `input_seq`)
+/// plus every still-unacked **reliable action** (a resend). One packet, both channels — see
+/// [`crate::room::apply_client_packet`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ClientPacket {
+    /// The latest flight input ([`ClientMsg::Input`]); `None` if this packet carries only resends.
+    #[serde(default)]
+    pub input: Option<ClientMsg>,
+    /// Monotonic sequence for the continuous input, so the host discards a stale/reordered flight frame.
+    #[serde(default)]
+    pub input_seq: u64,
+    /// Reliable actions awaiting ack, oldest first.
+    #[serde(default)]
+    pub reliable: Vec<SeqMsg>,
+}
+
+impl ClientPacket {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+/// A client action stamped with the **simulation tick** it must apply at — the unit of the
+/// co-authoritative lockstep netcode ([`crate::replica`]). Every participant runs the full
+/// authoritative [`crate::sim::Sim`] and exchanges these on the sector `/in` topic; because each input
+/// is bound to a tick (broadcast a few ticks ahead — `INPUT_DELAY`), every replica applies the same
+/// inputs at the same ticks and stays bit-identical, with no central server. `seq` disambiguates and
+/// deduplicates multiple inputs from one author at the same tick (and across resends).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaggedInput {
+    pub tick: u64,
+    pub seq: u64,
+    pub msg: ClientMsg,
+}
+
+impl TaggedInput {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
 /// One ship as broadcast in a [`Snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShipView {
@@ -105,6 +170,28 @@ pub struct ShipView {
     pub a: i32,
     pub hp: i32,
     pub max_hp: i32,
+    /// Shield points and capacity. `max_shield == 0` means this ship has no shield system (the client
+    /// then draws no shield bubble). The authoritative sim does not yet deplete/regenerate shields — the
+    /// field is on the wire so the renderer and clients are ready for it; defaults to `0/0`.
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    /// Energy and capacity (weapon/ability budget). Not yet a live constraint in the sim; emitted full
+    /// (`0/0` when unmodelled) so the HUD has a bar to draw without faking depletion.
+    #[serde(default)]
+    pub energy: i32,
+    #[serde(default)]
+    pub max_energy: i32,
+    /// Active status-effect codes (EMP/burn/slow/stasis/overcharge/…). Empty until the effect system is
+    /// simulated; the client folds these into a status-aura bitmask.
+    #[serde(default)]
+    pub effects: Vec<u8>,
+    /// Netcode: the highest **contiguous reliable-action sequence** the host has applied from this
+    /// player. The client drops queued actions from its resend outbox once this covers them, so a
+    /// dropped join/build/command is never lost and never double-applied.
+    #[serde(default)]
+    pub input_ack: u64,
     pub minerals: u32,
     pub kills: u32,
     pub guns: u32,
@@ -209,6 +296,27 @@ pub struct LootView {
     pub amount: u32,
 }
 
+/// One proximity mine in a snapshot — a pulsing core the renderer rings when `armed`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MineView {
+    pub x: i32,
+    pub y: i32,
+    /// Trigger radius (drawn as a ring when armed).
+    pub r: i32,
+    pub hue: u32,
+    pub armed: bool,
+}
+
+/// One floating power-up in a snapshot. `kind`: 0=repair, 1=shield, 2=energy, 3=overcharge (the client
+/// colours it by kind).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PickupView {
+    pub x: i32,
+    pub y: i32,
+    pub hue: u32,
+    pub kind: u8,
+}
+
 /// The authoritative state a sector host broadcasts each tick on the sector's `/state` topic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
@@ -237,6 +345,12 @@ pub struct Snapshot {
     /// Floating alloy nuggets (mined-ore loot) drifting / being magnetised to ships.
     #[serde(default)]
     pub loot: Vec<LootView>,
+    /// Proximity mines laid in this sector.
+    #[serde(default)]
+    pub mines: Vec<MineView>,
+    /// Floating power-up pickups in this sector.
+    #[serde(default)]
+    pub pickups: Vec<PickupView>,
     /// Per-player faction summaries (economy + fleet), so clients can track factions.
     #[serde(default)]
     pub factions: Vec<FactionView>,
@@ -295,7 +409,7 @@ mod tests {
 
     #[test]
     fn client_join_roundtrips_and_tags() {
-        let m = ClientMsg::Join { name: "Ace".into() };
+        let m = ClientMsg::Join { name: "Ace".into(), cap: None };
         let bytes = m.encode().unwrap();
         assert_eq!(ClientMsg::decode(&bytes).unwrap(), m);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -347,6 +461,12 @@ mod tests {
                 a: 157,
                 hp: 80,
                 max_hp: 100,
+                shield: 0,
+                max_shield: 0,
+                energy: 0,
+                max_energy: 0,
+                effects: vec![],
+                input_ack: 0,
                 minerals: 35,
                 kills: 2,
                 guns: 3,
@@ -361,6 +481,8 @@ mod tests {
             explosions: vec![ExplosionView { x: 50, y: 50, r: 80, hue: 20 }],
             debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
             loot: vec![LootView { x: 7, y: 8, vx: 3, vy: -2, amount: 12 }],
+            mines: vec![MineView { x: 9, y: 10, r: 60, hue: 0, armed: true }],
+            pickups: vec![PickupView { x: 11, y: 12, hue: 200, kind: 1 }],
             factions: vec![FactionView {
                 owner: "p1".into(),
                 minerals: 120,

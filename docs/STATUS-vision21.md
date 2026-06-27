@@ -34,13 +34,34 @@ small and pointed so the next session can pick any one up.
 - Folded into `state_hash` (anti-cheat), persisted in `SectorSnapshot` (failover), carried as
   `wire::LootView` (`#[serde(default)]`).
 
+## Reconciliation pass (2026-06-28): all four repos now compile together
+
+The clients (`spacegame-render`, `-native`, `-wasm`) had drifted **ahead** of the SDK wire — a partial
+mesh-sync merge brought newer client code without the matching `wire.rs`/`sim.rs`. Extended the SDK to
+the clients' contract so the whole set builds:
+
+- `wire::ShipView` += `shield/max_shield/energy/max_energy/effects/input_ack` (all `#[serde(default)]`).
+- `wire::ClientMsg::Join` += `cap: Option<String>` (ce-iam vouch; accepted + ignored by this SDK).
+- `wire::Snapshot` += `mines`/`pickups` (+ `MineView`/`PickupView`).
+- New netcode: `wire::{ClientPacket, SeqMsg, TaggedInput}` + `room::apply_client_packet` (reliable,
+  contiguous-ack input path); `lib.rs` host loop decodes `ClientPacket` with a `ClientMsg` fallback.
+- New **`src/replica.rs`** — the co-authoritative lockstep `Replica` the native/wasm clients run
+  (`tick_at`, `TickInput`, `INPUT_DELAY`, `schedule`/`advance_to`/`apply_local_now`/`rehome_local_player`),
+  with a determinism test (two replicas + same inputs in different orders → identical `state_hash`).
+- **Loot is rendered** end to end: `spacegame-render` `Fx.loot` + `scene.rs` draws glinting gold
+  nuggets that streak when magnetised; demo snapshot seeded so the screenshot tool shows them.
+
+Builds verified: SDK + render + native (host target), wasm on `wasm32-unknown-unknown`; **170 SDK tests
+green**, mesh-feature build green.
+
+Honest gaps (wire-present, not yet simulated): shields, energy, status effects, mines, pickups emit
+neutral/empty values — the systems aren't in the `Sim` yet. The loot system IS fully simulated.
+
 ## Notes for the next session
-- **Renderer is mid-migration and does not currently compile against this SDK** (`spacegame-render`
-  expects a newer wire: shields/energy/effects/mines/pickups/`ClientPacket`). Do **not** build the loot
-  view on top of it until the renderer is resynced; then drawing loot is one loop mirroring `pickups`
-  in `spacegame-render/src/game.rs::visible_fx`.
 - **Host-loop port (world.md §6)** is the highest-leverage next step: announce per-host bubbles on a
   `…/bubble` topic, maintain a `World`, drive interest/hand-off from it.
+- **Simulate the wire-present systems** (shields/energy/effects) in `Sim` so the HUD bars are real, and
+  spawn mines/pickups so those views carry data.
 - **Trust/karma + reporting** should reuse `../trana` (`trana_core::karma` fuses social karma with
-  on-chain compute trust) rather than a bespoke system — that is exactly the "you still have access to
-  trana so you can build it up again" hook.
+  on-chain compute trust) rather than a bespoke system — exactly the "you still have access to trana so
+  you can build it up again" hook.

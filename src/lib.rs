@@ -43,6 +43,7 @@ pub mod faction;
 pub mod leaderboard;
 pub mod physics;
 pub mod procgen;
+pub mod replica;
 pub mod replication;
 pub mod room;
 pub mod ruleset;
@@ -436,9 +437,16 @@ pub async fn run_sector(
                             Err(e) => { tracing::debug!(error = %e, "bad payload hex"); continue; }
                         };
                         if m.topic == in_topic {
-                            match wire::ClientMsg::decode(&payload) {
-                                Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
-                                Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg"),
+                            // The modern client sends a reliable ClientPacket (input + acked actions);
+                            // older publishers send a bare ClientMsg. The two JSON shapes are disjoint
+                            // (ClientMsg is internally tagged with "t"; ClientPacket is not), so try the
+                            // tagged message first and fall back to the packet envelope.
+                            if let Ok(msg) = wire::ClientMsg::decode(&payload) {
+                                room::apply_client_msg(&mut sim, &m.from, msg);
+                            } else if let Ok(pkt) = wire::ClientPacket::decode(&payload) {
+                                room::apply_client_packet(&mut sim, &m.from, pkt);
+                            } else {
+                                tracing::debug!(from = %m.from, "undecodable client input (neither ClientMsg nor ClientPacket)");
                             }
                         } else if m.topic == transit_topic {
                             // INFINITE MAP: a ship arrived from a neighbouring sector.
