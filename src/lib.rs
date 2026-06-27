@@ -448,7 +448,10 @@ pub async fn run_sector(
                             + snap.pickups.len()
                             + snap.debris.len()) as u32;
                         let load = crate::galaxy::CellLoad {
-                            players: snap.ships.len() as u32,
+                            // Real players only (owner == None); NPC fleet ships (owner == Some(faction))
+                            // are entities, NOT players — counting them inflated the galaxy-map player
+                            // count and could trip the split_players autoscale threshold prematurely.
+                            players: sim.player_count() as u32,
                             entities,
                             tick_p99_us: tickmeter.p99(),
                             bandwidth_bps: (snap.ships.len() as u64 + 1) * 256 * hz as u64,
