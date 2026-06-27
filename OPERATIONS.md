@@ -44,11 +44,13 @@ spacegame (SDK, default-features=false = wasm-clean, no mesh/tokio)
   └── spacegame (default features = `mesh`) → ce-rs, ce-cap, tokio  (the host binary)
 ```
 
-> **IMPORTANT (git/GitHub reality):** All four crates are now separate public GitHub repos under the
-> `ce-net` org, each with a curated `development` branch. They are ALSO synced across the fleet by
-> **ce-gitsync over the mesh**, and the local working trees carry gitsync `live: ...` WIP history that
-> **deliberately diverges** from the clean GitHub history. Never naive-`git push` a local tree over
-> GitHub — publish via the curated-clone flow in §8. The pre-push guard enforces this.
+> **IMPORTANT (git/GitHub policy): keep GitHub in sync with local, always — but cleanly.** All four
+> crates are separate public GitHub repos under the `ce-net` org, each with a `development` branch.
+> They are ALSO synced across the fleet by **ce-gitsync over the mesh**, so the local working trees
+> accumulate gitsync `live: ...` WIP snapshot commits. GitHub must mirror the local tree at all times;
+> local is the source of truth. Before each push, **scrub the gitsync `live: ...` WIP commits** so the
+> published history stays clean (every commit Leif-authored with a real message, tree byte-identical to
+> local HEAD), then **force-push local `development` over GitHub**. See §8 for the one-command flow.
 
 ---
 
@@ -244,39 +246,37 @@ a `development` branch as the default:
 - `github.com/ce-net/spacegame-native` (desktop client + headless donor)
 - `github.com/ce-net/spacegame-wasm`   (browser client / app `spa`)
 
-The three sibling repos were first published as a **single clean Leif-authored initial commit**, tree
-byte-identical to the local `development` tip, with the gitsync `live: ...` WIP commits left out of
-the public history (they remain in the local/mesh working tree). So every repo follows the same rule:
-**GitHub = curated view, local/mesh = gitsync working view, and they diverge.**
+Every repo follows the same rule: **GitHub mirrors local at all times; local is the source of truth.**
+Push whenever you have new work — keep the four repos continuously in sync with GitHub.
 
-### The clean-history divergence (read before pushing any of them)
+### Keep GitHub in sync — cleanly (read before pushing any of them)
 
-GitHub `ce-net/spacegame` `development` carries a **curated, clean history** (tip `fc7f182`): every
-commit re-authored to Leif, the ce-gitsync `live: ...` WIP commits replaced with proper messages,
-tree byte-identical to the local tip. **It deliberately diverges from local `development` after the
-shared base `0c5bc28`** — GitHub is the published view, local/mesh is the gitsync working view. The
-three sibling repos diverge even harder: their GitHub history shares **no** common ancestor with the
-local tree (fresh clean root), so a naive `git push`/`git pull` against them will refuse — always use
-the curated-clone flow below.
+The only thing GitHub must NOT carry is the ce-gitsync `live: ...` WIP snapshot commits the mesh sync
+sprinkles into the local tree. So the push rule is: **scrub the gitsync WIP, then force-push local.**
 
-Consequences:
-- **Do NOT force-push local `development` over GitHub's** without re-curating. `git status` showing
-  "ahead 25" is gitsync WIP, not pushable history.
-- The **gitsync pre-push hook blocks WIP pushes** to GitHub (deliberate commits only). It accepts a
-  clean fast-forward to the existing branch but trips on a new branch (it scans full history and
-  flags already-published gitsync commits in the base) — push curated history to the **existing**
-  `development` branch as a fast-forward, not a new branch.
-- gitsync never touches GitHub; you cannot reconcile the divergence through it.
+The clean push (every repo, same flow):
+1. Commit your real work as Leif (see the command block above) — real subject + body, no co-author.
+2. **Drop the `ce-gitsync` `live: ...` commits** from the range you're pushing, keeping every real
+   commit and a **tree byte-identical** to local HEAD. The reliable, conflict-free way is to
+   re-snapshot each kept (non-gitsync) commit's tree onto a fresh linear history (each kept commit's
+   tree already subsumes the WIP snapshots before it, so nothing is lost) and verify
+   `git diff <old-HEAD> <new-HEAD>` is empty before moving the branch.
+3. **Force-push** local `development` over GitHub: `git push --force origin development`.
 
-**To publish a new range to GitHub** (the safe pattern that does not disturb local or gitsync):
 ```bash
-# In a THROWAWAY clone, re-author the new commits cleanly and fast-forward push:
-git clone https://github.com/ce-net/spacegame.git /tmp/sg-pub
-cd /tmp/sg-pub
-# bring in the new work (cherry-pick / re-apply), re-author to Leif, write real messages, then:
-git push origin development        # fast-forward onto the existing clean tip
+# After the scrub, sync each repo:
+for r in spacegame spacegame-render spacegame-native spacegame-wasm; do
+  git -C ~/ce-net/$r push --force origin development
+done
 ```
-This keeps `~/ce-net/spacegame` (and its gitsync mirror) untouched while GitHub stays curated.
+
+Notes:
+- Force-push is expected and correct — local is truth, GitHub mirrors it. There is no "curated
+  divergence" to protect anymore.
+- The pushed range must contain **zero** `ce-gitsync` commits (that is what "cleanly" means); the
+  pre-push guard passes because the new commits are all real. gitsync itself still never touches
+  GitHub — it syncs mesh + local only.
+- `.cargo/config.toml` (ce-dev-link output) and `target/` stay untracked/ignored, never pushed.
 
 ---
 
@@ -295,6 +295,6 @@ This keeps `~/ce-net/spacegame` (and its gitsync mirror) untouched while GitHub 
 | Frontend only | `bash deploy/deploy.sh frontend` |
 | Smoke gate only | `bash deploy/deploy.sh smoke` |
 | Hot-reload rules | edit `/opt/ce-build/spacegame-run/live.json` on the relay |
-| Publish to GitHub | throwaway clone, re-author, fast-forward push to `development` (see §8) |
+| Keep GitHub in sync | scrub gitsync `live:` WIP, then `git push --force origin development` (see §8) |
 
 Relay: `root@178.105.145.170` · App: `spa` -> `https://spa.ce-net.com/` · Map: `/map`.
