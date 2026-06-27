@@ -56,6 +56,20 @@ neighbouring nodes AUTOMATICALLY TAKE OVER hosting as players move. See `NETCODE
 
 > redo
 
+> yes all player should run the full server locally and contribute to the game.
+
+(=> Confirms the target: EVERY player's node runs the full authoritative `Sim` for its region and
+contributes compute to the shared game — players are the servers. Build: the deterministic `Replica`
+engine, integrated into browser/native/relay, merged by quorum.)
+
+> How do i see the map of the entire mesh and all active players and server instances? do we have a
+> spacegame map function to monitor the entire mesh and all servers contributing? document what i say
+> verbatim
+
+(=> Wants a live mesh-monitor view: the whole galaxy, every active player, and every node/server
+instance hosting a region (who is contributing compute, which sector each hosts). See the galaxy-map
+work; if it doesn't already show hosts+players live, that monitor is a build item.)
+
 (=> BINDING: there is NO trusted authority and NO "declare your own position" (the rejected `authored`
 bool / `self_state` — a client telling the host where it is, which is trivially cheatable). The model is
 **deterministic replicated simulation merged by quorum**: every node in a region runs the SAME

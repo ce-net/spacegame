@@ -152,13 +152,32 @@ smoke() {
   "${SSH[@]}" "$RELAY" "bash /opt/ce-build/spacegame-run/smoke.sh https://$APP.ce-net.com"
 }
 
+# MONITOR: publish the live galaxy map (galaxymap-web) — a real-time view of the whole adaptive galaxy:
+# every cell, who HOSTS it (which node/server instance is contributing), per-cell player count + load
+# heat, and live reshapes. Static self-contained page; ce-serve injects the mesh bridge so it pulls live
+# `…/galaxy` shape commits + `…/load` frames over the same-origin node. Served at https://map.ce-net.com/
+# (wildcard *.ce-net.com -> ce-serve). This is the mesh monitor.
+map() {
+  echo "==> publish the live galaxy map (static) via ce-serve at map.ce-net.com"
+  sync "$HERE/galaxymap-web" spacegame-map
+  "${SSH[@]}" "$RELAY" '
+    set -e; cd '"$REMOTE"'/spacegame-map
+    STAGE=/opt/ce-build/map-bundle
+    rm -rf "$STAGE" && mkdir -p "$STAGE"
+    cp index.html "$STAGE/"
+    CE_API_TOKEN=$(cat /root/.local/share/ce/api.token) \
+      /opt/ce-serve/ce-serve-publish "$STAGE" map.ce-net.com map'
+  echo "==> galaxy map live: https://map.ce-net.com/"
+}
+
 case "${1:-all}" in
   backend)  backend ;;
   frontend) frontend ;;
+  map)      map ;;
   dns)      dns ;;
   unshadow) unshadow ;;
   smoke)    smoke ;;
-  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; unshadow; smoke ;;
-  *) echo "usage: deploy.sh [all|backend|frontend|dns|unshadow|smoke]"; exit 1 ;;
+  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; map; unshadow; smoke ;;
+  *) echo "usage: deploy.sh [all|backend|frontend|map|dns|unshadow|smoke]"; exit 1 ;;
 esac
 echo "==> done"

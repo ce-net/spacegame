@@ -45,6 +45,21 @@ THIS: **deterministic simulation, replicated across the players present in a reg
   not a log line. Inert below 2 replicas (correctly: you can't cross-check a single host). Tested:
   `replication::tests::verdict_tells_an_outvoted_node_to_merge_to_the_quorum`.
 
+- **Deterministic replica engine — DONE (engine), 2026-06-27.** `replica::Replica`: advances a `Sim`
+  from a tick-tagged input log (`TickInput`), applying each tick's inputs in canonical `(player, seq)`
+  order so packet arrival order can't change the result. Mesh-free, so the SAME engine runs in the
+  browser (wasm), native, and relay — every participant is the same kind of replica. Tested:
+  `replica::tests::two_replicas_from_the_same_inputs_reach_identical_state` (the load-bearing determinism
+  guarantee) + rogue-input divergence + late-input rejection. This is the core that makes "everyone runs
+  the server and they agree" possible.
+
+## Live monitor
+
+- **Galaxy map — LIVE at https://map.ce-net.com/ (2026-06-27).** `galaxymap-web` (folds `galaxymap.rs`'s
+  model) published via ce-serve (`deploy/deploy.sh map`): every cell, **which node hosts it** (the server
+  instances contributing compute), per-cell player count + load heat, and live cell-splits, fed over the
+  mesh bridge. Shows host instances + player COUNTS; individual player dots are a possible enhancement.
+
 ## What remains (this is where the visible fixes live)
 
 The merge engine is real but **inert in solo play**, because today only ONE node (the relay) hosts a
