@@ -139,3 +139,27 @@ hot state as plain `Copy` arrays stepped by fixed-iteration kernels (no heap, no
 floating shortcuts), which is exactly the layout a GPU wants. **Fault tolerance and GPU
 cross-compatibility are the same requirement seen from two sides: every replica must agree, on any
 device.** Spacegame is the project that keeps us honest about both at once.
+
+---
+
+## 6. Physics-based mining: magnetic alloy loot (`sim.rs`)
+
+Mining is **no longer instant**. A depleted asteroid does not blink its value into your wallet — it
+**sheds physical alloy nuggets** ([`sim::Loot`]) at the rock, each with an outward drift. A nugget is
+then **magnetised toward the nearest ship** within [`sim::LOOT_MAGNET_R`] (found through the same
+per-tick AABB broad-phase as everything else), accelerates, glides (speed-capped + lightly damped), and
+is **collected on contact**, crediting that ship's spendable minerals and its faction stockpile. The
+"fly over the spray and vacuum it up" loop is the satisfying part the arcade instant-credit lacked.
+
+It is fully authoritative and deterministic: nuggets are spawned from a hash of the rock cell (no rng,
+so every replica spawns the identical field), folded into [`Sim::state_hash`] (a host that mints or
+palms floating loot diverges from the quorum), and carried in the [`snapshot::SectorSnapshot`] so a host
+hand-over never loses loot a player was about to grab. The wire carries it as
+[`wire::LootView`]; a resynced renderer draws it exactly like the existing pickups (`#[serde(default)]`,
+so older clients simply ignore it).
+
+Tuning lives in `sim.rs` constants for now (`ALLOY_PER_NUGGET`, `LOOT_MAGNET_R`, `LOOT_PULL`,
+`LOOT_MAX_SPEED`, `LOOT_DAMPING`, `LOOT_PICKUP_R`, `LOOT_LIFE_TICKS`) — a follow-up promotes them into
+the hot-reloadable [`ruleset::Tunables`] so loot feel can be tweaked live like everything else.
+
+See [`docs/world.md`](docs/world.md) for the seamless player-following world this mining lives in.

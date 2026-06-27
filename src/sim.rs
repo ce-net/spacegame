@@ -89,6 +89,40 @@ pub const ROCK_MAX_VAL: u32 = 30;
 /// Acquire radius for a homing missile to lock the nearest enemy.
 pub const HOMING_ACQUIRE_R: f32 = 1100.0;
 
+// --- Mined-alloy loot (magnetic pickup) ------------------------------------------------------------
+// Mining is **not instant**: a depleted asteroid sheds physical **alloy nuggets** that drift, then are
+// drawn to a nearby ship and collected on contact — the satisfying "vacuum the loot" loop. These tune
+// that mechanic. (Follow-up: promote to hot-reloadable [`Tunables`].)
+/// One alloy nugget carries roughly this much value; a rock's worth is split into several nuggets.
+pub const ALLOY_PER_NUGGET: u32 = 8;
+/// A ship within this radius of a nugget magnetises it (the nugget accelerates toward the ship).
+pub const LOOT_MAGNET_R: f32 = 280.0;
+/// Acceleration applied to a nugget toward the ship attracting it (units/tick²).
+pub const LOOT_PULL: f32 = 0.5;
+/// A nugget's glide speed cap — a touch above ship top speed so it can always catch up and be caught.
+pub const LOOT_MAX_SPEED: f32 = 9.0;
+/// Velocity retained per tick when no ship is pulling (gentle drag so free nuggets settle).
+pub const LOOT_DAMPING: f32 = 0.97;
+/// Distance at which a ship collects a nugget.
+pub const LOOT_PICKUP_R: f32 = SHIP_R + 8.0;
+/// Ticks a nugget survives before it dissolves (so unreachable loot can't accumulate forever).
+pub const LOOT_LIFE_TICKS: u64 = 2400;
+
+/// A floating **alloy nugget** shed by a mined asteroid. It drifts, is magnetised toward a nearby ship,
+/// and is collected on contact — crediting that ship (and its faction). Part of the authoritative
+/// state: simulated deterministically, snapshotted for failover, and folded into [`Sim::state_hash`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Loot {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    /// Value carried (added to the collector's spendable minerals).
+    pub amount: u32,
+    /// Tick the nugget was spawned, for the lifetime cap.
+    pub born: u64,
+}
+
 /// FNV-1a 32-bit hash of a string — the exact field hash the frontend uses, so the renderer and the
 /// authoritative server agree on the asteroid field bit-for-bit.
 pub fn fnv1a(s: &str) -> u32 {
@@ -417,6 +451,9 @@ pub struct Sim {
     /// Free-floating wreckage simulated with the LOD rigid-body engine: high precision near players,
     /// coarse far away. Spawned on kills; demonstrates the advanced 2D physics at scale.
     pub debris: physics::World,
+    /// Floating **alloy nuggets** shed by mined asteroids, magnetically collected by ships. Mining is
+    /// deferred through these rather than instant (see [`Loot`]).
+    pub loot: Vec<Loot>,
 }
 
 impl Default for Sim {
@@ -435,6 +472,7 @@ impl Default for Sim {
             transit_out: Vec::new(),
             factions: std::collections::HashMap::new(),
             debris: physics::World::new(),
+            loot: Vec::new(),
         }
     }
 }
@@ -784,18 +822,33 @@ impl Sim {
             }
             for (cx, cy, val) in mined_now {
                 self.mined.insert((cx, cy), now);
-                // The faction credited is the ship's owner (so an NPC drone banks to your faction, and
-                // a player's own mining banks to theirs).
-                let fid = self
-                    .ships
-                    .get(id)
-                    .map(|s| s.faction_id(id).to_string())
-                    .unwrap_or_else(|| id.to_string());
-                if let Some(s) = self.ships.get_mut(id) {
-                    s.minerals = s.minerals.saturating_add(val);
-                }
-                if let Some(f) = self.factions.get_mut(&fid) {
-                    f.deposit_minerals(val as u64);
+                // PHYSICS-BASED MINING: a depleted rock does not credit instantly — it sheds physical
+                // alloy nuggets at the rock that drift, get magnetised to a nearby ship, and are
+                // collected on contact (see `advance_loot`). Splitting the value into a few nuggets
+                // makes the pickup feel like a stream of loot rather than one blip.
+                let Some(r) = rock_in_cell(cx, cy) else { continue };
+                let n = (val / ALLOY_PER_NUGGET).max(1).min(6);
+                let each = val / n + if val % n != 0 { 1 } else { 0 };
+                let mut remaining = val;
+                for k in 0..n {
+                    let amount = each.min(remaining).max(1);
+                    remaining = remaining.saturating_sub(amount);
+                    // Scatter nuggets outward deterministically (hash of cell + index), so every replica
+                    // spawns the identical field — no rng, snapshot failover stays reproducible.
+                    let seed = cell_hash(cx, cy, &format!("loot{k}"));
+                    let ang = (seed % 6283) as f32 / 1000.0; // 0..2π
+                    let spd = 0.6 + (seed >> 13 & 0x3ff) as f32 / 1000.0;
+                    self.loot.push(Loot {
+                        x: r.x,
+                        y: r.y,
+                        vx: ang.cos() * spd,
+                        vy: ang.sin() * spd,
+                        amount,
+                        born: now,
+                    });
+                    if remaining == 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -832,6 +885,10 @@ impl Sim {
         if tun.ship_push > 0.0 {
             self.resolve_ship_collisions(&tree, &tun);
         }
+
+        // --- Pass 4b: magnetic alloy loot. Mined nuggets glide, get pulled to a nearby ship via the
+        // same AABB broad-phase, and are collected on contact — deferred, satisfying mining. ---
+        self.advance_loot(now, &tree, dt_scale);
 
         // --- Pass 5: the always-alive factions tick every step, online or not, then their roster is
         // reconciled into live NPC fleet ships in the world. ---
@@ -874,6 +931,109 @@ impl Sim {
             .filter(|(_, s)| s.alive)
             .map(|(id, s)| (Aabb::around(s.x, s.y, SHIP_R), id.clone()));
         AabbTree::build(bounds, items)
+    }
+
+    /// Advance the floating alloy nuggets: each is magnetised toward the **nearest alive ship** within
+    /// [`LOOT_MAGNET_R`] (found through the per-tick AABB broad-phase `tree`), accelerates toward it,
+    /// glides (capped + lightly damped), and is collected on contact — crediting that ship's spendable
+    /// minerals and its faction. Nuggets that age out, drift off the sector, or are collected are
+    /// removed. Deterministic: ships are resolved by id order via the tree's box query, no rng, so every
+    /// replica evolves the loot field identically (snapshot failover stays reproducible).
+    fn advance_loot(&mut self, now: u64, tree: &AabbTree<String>, dt_scale: f32) {
+        if self.loot.is_empty() {
+            return;
+        }
+        // Collect (loot index -> collector id) decisions first; mutate ships/factions after, so the
+        // immutable ship reads and the mutable credits don't borrow-clash.
+        let mut collected: Vec<(usize, String)> = Vec::new();
+        for (li, lt) in self.loot.iter_mut().enumerate() {
+            // Find the nearest alive ship to this nugget within the magnet radius.
+            let mut best: Option<(f32, f32, f32)> = None; // (dist2, sx, sy)
+            for id in tree.query_circle(lt.x, lt.y, LOOT_MAGNET_R) {
+                if let Some(s) = self.ships.get(&id) {
+                    if !s.alive {
+                        continue;
+                    }
+                    let dx = s.x - lt.x;
+                    let dy = s.y - lt.y;
+                    let d2 = dx * dx + dy * dy;
+                    if best.map(|(bd, _, _)| d2 < bd).unwrap_or(true) {
+                        best = Some((d2, s.x, s.y));
+                    }
+                }
+            }
+            if let Some((d2, sx, sy)) = best {
+                // Collected on contact.
+                if d2 <= LOOT_PICKUP_R * LOOT_PICKUP_R {
+                    // Pick the actual nearest ship id again deterministically for crediting.
+                    let mut who: Option<String> = None;
+                    let mut bd = f32::INFINITY;
+                    for id in tree.query_circle(lt.x, lt.y, LOOT_PICKUP_R) {
+                        if let Some(s) = self.ships.get(&id) {
+                            if !s.alive {
+                                continue;
+                            }
+                            let dd = (s.x - lt.x).powi(2) + (s.y - lt.y).powi(2);
+                            if dd < bd || (dd == bd && who.as_deref().map(|w| id.as_str() < w).unwrap_or(true)) {
+                                bd = dd;
+                                who = Some(id);
+                            }
+                        }
+                    }
+                    if let Some(id) = who {
+                        collected.push((li, id));
+                        continue;
+                    }
+                }
+                // Magnetise: accelerate toward the ship.
+                let d = d2.sqrt().max(0.0001);
+                lt.vx += (sx - lt.x) / d * LOOT_PULL * dt_scale;
+                lt.vy += (sy - lt.y) / d * LOOT_PULL * dt_scale;
+            } else {
+                // No attractor: drift with gentle drag.
+                lt.vx *= LOOT_DAMPING;
+                lt.vy *= LOOT_DAMPING;
+            }
+            // Speed cap + integrate.
+            let spd = (lt.vx * lt.vx + lt.vy * lt.vy).sqrt();
+            if spd > LOOT_MAX_SPEED {
+                let k = LOOT_MAX_SPEED / spd;
+                lt.vx *= k;
+                lt.vy *= k;
+            }
+            lt.x += lt.vx * dt_scale;
+            lt.y += lt.vy * dt_scale;
+        }
+
+        // Apply collections (credit ships + factions), then drop collected/expired/out-of-bounds loot.
+        let mut taken = vec![false; self.loot.len()];
+        for (li, id) in collected {
+            let amount = self.loot[li].amount;
+            taken[li] = true;
+            let fid = self.ships.get(&id).map(|s| s.faction_id(&id).to_string()).unwrap_or_else(|| id.clone());
+            if let Some(s) = self.ships.get_mut(&id) {
+                s.minerals = s.minerals.saturating_add(amount);
+            }
+            if let Some(f) = self.factions.get_mut(&fid) {
+                f.deposit_minerals(amount as u64);
+            }
+        }
+        let mut i = 0;
+        self.loot.retain(|lt| {
+            let keep = !taken[i]
+                && now.saturating_sub(lt.born) < LOOT_LIFE_TICKS
+                && lt.x > -200.0
+                && lt.y > -200.0
+                && lt.x < SECTOR_SIZE + 200.0
+                && lt.y < SECTOR_SIZE + 200.0;
+            i += 1;
+            keep
+        });
+        // Safety bound on total floating loot (busy sector): keep the freshest.
+        if self.loot.len() > 4096 {
+            self.loot.sort_by(|a, b| b.born.cmp(&a.born));
+            self.loot.truncate(4096);
+        }
     }
 
     /// Set the standing order for a player's faction. Every NPC ship the faction owns obeys it from
@@ -1533,6 +1693,21 @@ impl Sim {
         }
         mix(&mut h, bsum);
 
+        // Alloy loot: order-independent XOR fold (the Vec order is incidental). Folded in so a host
+        // that mints or palms floating loot diverges from the honest replica quorum.
+        let mut lsum: u64 = 0;
+        for lt in &self.loot {
+            let mut lh: u64 = 0x632be59bd9b4e019;
+            mix(&mut lh, q(lt.x));
+            mix(&mut lh, q(lt.y));
+            mix(&mut lh, q(lt.vx));
+            mix(&mut lh, q(lt.vy));
+            mix(&mut lh, lt.amount as u64);
+            mix(&mut lh, lt.born);
+            lsum ^= lh;
+        }
+        mix(&mut h, lsum);
+
         // Factions: sorted by owner.
         let mut owners: Vec<&String> = self.factions.keys().collect();
         owners.sort();
@@ -2048,5 +2223,85 @@ mod tests {
             s.tick(1.0);
         }
         assert_eq!(s.player_count(), 0);
+    }
+
+    /// Find a rock cell whose asteroid sits comfortably inside the arena (away from the edges), so a
+    /// ship can be parked on it without the wall-bounce clamp interfering.
+    fn an_inner_rock() -> Rock {
+        (3..40)
+            .flat_map(|cx| (3..40).map(move |cy| (cx, cy)))
+            .find_map(|(cx, cy)| rock_in_cell(cx, cy))
+            .expect("the deterministic field has rocks")
+    }
+
+    /// Park a lone miner within mining reach of `rock` but **outside** the pickup radius, so a mined
+    /// nugget (which spawns at the rock) is not collected on the very tick it appears — it has to glide
+    /// in. `solo` is applied so no NPC fleet ship steals the loot mid-test.
+    fn miner_beside_rock(rock: Rock, off: f32) -> Sim {
+        let mut s = arena();
+        s.join("n", "miner", 0);
+        solo(&mut s);
+        let p = s.ships.get_mut("n").unwrap();
+        p.x = rock.x + off;
+        p.y = rock.y;
+        p.vx = 0.0;
+        p.vy = 0.0;
+        p.minerals = 0;
+        s
+    }
+
+    #[test]
+    fn mining_sheds_alloy_nuggets_instead_of_crediting_instantly() {
+        let rock = an_inner_rock();
+        // 34 units: inside mining reach (SHIP_R+22 = 40), outside pickup (SHIP_R+8 = 26).
+        let mut s = miner_beside_rock(rock, 34.0);
+        s.tick(1.0);
+        assert!(!s.loot.is_empty(), "a mined rock sheds floating alloy nuggets, not instant credit");
+        assert_eq!(s.ships["n"].minerals, 0, "nothing is collected yet — the nuggets are still in flight");
+        // No value is created or destroyed: floating + collected == the rock's worth.
+        let floating: u32 = s.loot.iter().map(|l| l.amount).sum();
+        assert_eq!(floating + s.ships["n"].minerals, rock.val, "nuggets carry exactly the rock's value");
+    }
+
+    #[test]
+    fn nuggets_are_magnetised_in_and_collected() {
+        let rock = an_inner_rock();
+        let mut s = miner_beside_rock(rock, 34.0);
+        s.tick(1.0); // mine -> spawn nuggets in flight
+        assert!(!s.loot.is_empty());
+        // Hold position; the magnet pulls every nugget in within a few seconds and credits it.
+        for _ in 0..60 {
+            if let Some(p) = s.ships.get_mut("n") {
+                p.x = rock.x + 34.0;
+                p.y = rock.y;
+                p.vx = 0.0;
+                p.vy = 0.0;
+            }
+            s.tick(1.0);
+            if s.loot.is_empty() {
+                break;
+            }
+        }
+        assert!(s.loot.is_empty(), "all nuggets were vacuumed up by the magnet");
+        assert_eq!(s.ships["n"].minerals, rock.val, "the collected nuggets credited the full rock value");
+        // The faction also banked the loot (its always-alive economy adds more on top each tick).
+        assert!(
+            s.factions["n"].resources.minerals >= rock.val as u64,
+            "the collected nuggets were also banked to the faction stockpile"
+        );
+    }
+
+    #[test]
+    fn loot_survives_snapshot_failover() {
+        let rock = an_inner_rock();
+        let mut s = miner_beside_rock(rock, 34.0);
+        s.tick(1.0);
+        // Move the ship far away so the nuggets are not collected and persist as floating loot.
+        s.ships.get_mut("n").unwrap().x = (rock.x - 1500.0).max(SHIP_R + 1.0);
+        let n_loot = s.loot.len();
+        assert!(n_loot > 0);
+        let snap = crate::snapshot::SectorSnapshot::capture(&s);
+        let restored = snap.restore();
+        assert_eq!(restored.loot.len(), n_loot, "floating loot is carried across a host handover");
     }
 }

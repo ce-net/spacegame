@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "spacegame", about = "Authoritative, sector-sharded, hot-reloadable mesh backend for CE Spacegame")]
+#[command(name = "spacegame", about = "Authoritative, hot-reloadable mesh backend for CE Spacegame. By playing this you donate your compute to science!")]
 struct Args {
     /// Override the local node base URL (defaults to the SDK's 127.0.0.1:8844).
     #[arg(long, env = "CE_BASE_URL", global = true)]

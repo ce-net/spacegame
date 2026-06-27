@@ -107,3 +107,22 @@ whole ship in one pass, getting its AABB efficiently, and caching it.)
 ### 20 — visual verification + screenshots + native app, web/native coexisting
 
 > Make a system so that you can visually verify it and take screenshots and drive design development. Write a native app to access spacegame locally also - web and browser should coexist and work together seamlessly.
+
+### 21 — seamless player-following world, planet scale, smarter AI, physics-based mining & building
+
+> make chunks / sections seamless - no lag transitions and ideally no transition required at all because its smarter than now and optimizes it - our own player server must of course follow us. and the current chunk system is not capable of what we want to achieve - a huge open world with real earth size playing as a human - so the sections and chunking needs to be a lot more efficient and dynamic and follow the player ships and factions and simulate them for other players - if each player takes care of itself and its environment for other players it will scale very well. recursive aabb which follows the player and its ships and factions.
+>
+> Later used for broad phase physics.
+>
+> reporting system
+> brutal karma and trust - but you still have access to trana so you can build it up again but it takes time and energy
+>
+> say "By playing this you donate your compute to science!"
+>
+> Make ai smarter with objectives and goals
+> Generate procedural asteroids you can mine to get "alloys" - you destroy them and have to pick it up its not instant - they glide towards you and you collect them and its satisfying.
+>
+> make it more physics based instead of this arcade.
+> real build system - build your ships and blueprints.
+>
+>  - look in github in ce-net at all of the spacegame directories and clone them in and work on them with the stuff i said.

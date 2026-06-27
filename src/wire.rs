@@ -197,6 +197,18 @@ pub struct KillView {
     pub victim: String,
 }
 
+/// One floating **alloy nugget** in a snapshot — a mined-ore drop gliding toward (or waiting for) a
+/// ship to vacuum it up. The renderer draws it as a glinting chunk; `amount` can size/brighten it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LootView {
+    pub x: i32,
+    pub y: i32,
+    /// Velocity (rounded) so the client can smear/streak fast-moving nuggets being sucked in.
+    pub vx: i32,
+    pub vy: i32,
+    pub amount: u32,
+}
+
 /// The authoritative state a sector host broadcasts each tick on the sector's `/state` topic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
@@ -222,6 +234,9 @@ pub struct Snapshot {
     /// Rigid-body wreckage drifting in this sector.
     #[serde(default)]
     pub debris: Vec<DebrisView>,
+    /// Floating alloy nuggets (mined-ore loot) drifting / being magnetised to ships.
+    #[serde(default)]
+    pub loot: Vec<LootView>,
     /// Per-player faction summaries (economy + fleet), so clients can track factions.
     #[serde(default)]
     pub factions: Vec<FactionView>,
@@ -345,6 +360,7 @@ mod tests {
             beams: vec![BeamView { x0: 0, y0: 0, x1: 100, y1: 0, hue: 200, kind: 0 }],
             explosions: vec![ExplosionView { x: 50, y: 50, r: 80, hue: 20 }],
             debris: vec![DebrisView { x: 5, y: 6, a: 31, r: 4 }],
+            loot: vec![LootView { x: 7, y: 8, vx: 3, vy: -2, amount: 12 }],
             factions: vec![FactionView {
                 owner: "p1".into(),
                 minerals: 120,

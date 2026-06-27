@@ -1,8 +1,18 @@
 # spacegame
 
-Authoritative, **sector-sharded** mesh backend for **CE Spacegame** — a real-time multiplayer space
-arena, built as a flagship demonstration that **CE is a global supercomputer**, not a single shallow
-game server.
+> **By playing this you donate your compute to science!** Every pilot's machine simulates its own
+> patch of the galaxy for everyone else, so the game *is* the supercomputer — there is no rented
+> server farm, only the players' mesh.
+
+Authoritative, **player-sharded** mesh backend for **CE Spacegame** — a real-time multiplayer space
+arena (and a seamless, real-Earth-sized open world you can roam as a human), built as a flagship
+demonstration that **CE is a global supercomputer**, not a single shallow game server.
+
+> **Note (in migration):** the world model is moving from a *fixed sector grid* (`shard.rs`) to
+> *player-centric authority bubbles that follow you* ([`src/world.rs`](src/world.rs)) — seamless, with
+> no grid lines to cross and planet-scale floating-origin coordinates. See
+> [`docs/world.md`](docs/world.md). The sector path below still operates today; the bubble model is the
+> forward path it is being ported onto.
 
 The galaxy is partitioned into a grid of fixed-size **sectors**. Each sector is an *independent
 authoritative simulation cell* that runs on a mesh node chosen for low latency, rendezvous-hashed so

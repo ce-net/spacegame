@@ -87,6 +87,10 @@ pub struct SectorSnapshot {
     /// missing a beat. (Ephemeral debris is not snapshotted — it is cosmetic and bounded.)
     #[serde(default)]
     pub factions: Vec<Faction>,
+    /// Floating alloy nuggets in flight — carried across failover so a host handover never loses loot
+    /// a player was about to collect. (Debris is cosmetic and dropped; loot has real value.)
+    #[serde(default)]
+    pub loot: Vec<crate::sim::Loot>,
 }
 
 impl SectorSnapshot {
@@ -113,6 +117,7 @@ impl SectorSnapshot {
             bullets: sim.bullets.clone(),
             mined,
             factions,
+            loot: sim.loot.clone(),
         }
     }
 
@@ -131,6 +136,7 @@ impl SectorSnapshot {
         for f in &self.factions {
             sim.factions.insert(f.owner.clone(), f.clone());
         }
+        sim.loot = self.loot.clone();
         sim
     }
 

@@ -11,8 +11,8 @@ use crate::aabb::{Aabb, AabbTree};
 use crate::faction::FactionCommand;
 use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
 use crate::wire::{
-    BeamView, BulletView, ClientMsg, DebrisView, ExplosionView, FactionView, KillView, ShipView, Snapshot,
-    SnapshotTag,
+    BeamView, BulletView, ClientMsg, DebrisView, ExplosionView, FactionView, KillView, LootView, ShipView,
+    Snapshot, SnapshotTag,
 };
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
@@ -199,6 +199,18 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         })
         .collect();
 
+    let loot: Vec<LootView> = sim
+        .loot
+        .iter()
+        .map(|l| LootView {
+            x: l.x.round() as i32,
+            y: l.y.round() as i32,
+            vx: l.vx.round() as i32,
+            vy: l.vy.round() as i32,
+            amount: l.amount,
+        })
+        .collect();
+
     let depleted = sim.depleted_cells().into_iter().map(|(cx, cy, _)| [cx, cy]).collect();
 
     let kills = sim
@@ -217,6 +229,7 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         beams,
         explosions,
         debris,
+        loot,
         factions: faction_views(sim),
         depleted,
         kills,
@@ -293,6 +306,19 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         })
         .collect();
 
+    let loot: Vec<LootView> = sim
+        .loot
+        .iter()
+        .filter(|l| pad.contains_point(l.x, l.y))
+        .map(|l| LootView {
+            x: l.x.round() as i32,
+            y: l.y.round() as i32,
+            vx: l.vx.round() as i32,
+            vy: l.vy.round() as i32,
+            amount: l.amount,
+        })
+        .collect();
+
     let depleted = sim
         .depleted_cells()
         .into_iter()
@@ -320,6 +346,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         beams,
         explosions,
         debris,
+        loot,
         factions: faction_views(sim),
         depleted,
         kills,
