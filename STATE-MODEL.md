@@ -70,6 +70,22 @@ engine, integrated into browser/native/relay, merged by quorum.)
 instance hosting a region (who is contributing compute, which sector each hosts). See the galaxy-map
 work; if it doesn't already show hosts+players live, that monitor is a build item.)
 
+> think like this: browsers and players are the only servers. imagine that there is no relay stable
+> server at all just browsers and players. woudl this system work in this situation? just player to player
+> communication and server hosting together?
+
+(=> The acid test for the architecture: ZERO trusted/stable server — only browsers/players, peer-to-peer,
+hosting + communicating together. The AUTHORITY layer we built (deterministic replicas + quorum merge +
+tick-tagged inputs) is server-free BY DESIGN and passes. The TRANSPORT/IDENTITY layer does NOT yet: today
+every browser tunnels through the ce-serve bridge to the SAME relay node and even shares its NodeId
+[galaxy-peer.js: "a million tabs collapse into one player"]. True P2P needs the in-tab libp2p peer
+[galaxy-peer.js, currently a stub] wired — each browser its own key/identity + WebTransport/wss +
+gossipsub — plus browser<->browser merge/proof exchange and peer snapshot bootstrap. Web reality: browsers
+can't accept inbound, so SOME dumb, stateless, replaceable, NON-authoritative rendezvous/signaling +
+entry URL is irreducible [like Bitcoin's DNS seeds] — but it holds no game authority. So: "no stable
+server" => "no TRUSTED server; only replaceable peer-provided bootstrap." Build items: wire galaxy-peer.js
+transport, browser-side merge, peer bootstrap.)
+
 (=> BINDING: there is NO trusted authority and NO "declare your own position" (the rejected `authored`
 bool / `self_state` — a client telling the host where it is, which is trivially cheatable). The model is
 **deterministic replicated simulation merged by quorum**: every node in a region runs the SAME
