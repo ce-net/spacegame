@@ -231,7 +231,7 @@ mod tests {
         let mut r = Replica::new(Sim::new());
         let p = "p1";
         let t = r.tick();
-        r.schedule(TickInput { tick: t, player: p.into(), seq: 1, msg: ClientMsg::Join { name: "P".into() } });
+        r.schedule(TickInput { tick: t, player: p.into(), seq: 1, msg: ClientMsg::Join { name: "P".into(), cap: None } });
         r.schedule(TickInput {
             tick: t + 1,
             player: p.into(),

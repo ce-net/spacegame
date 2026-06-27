@@ -42,9 +42,17 @@ pub mod topics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t")]
 pub enum ClientMsg {
-    /// Announce presence / set name in this sector.
+    /// Announce presence / set name in this sector. `cap` is an OPTIONAL node-signed vouch capability
+    /// (ce-iam `account:login` + `account:name:<name>`, see `spacegame-wasm/account.js` and
+    /// `ce-iam nodeauth`): when present and valid, the host knows this player's name is vouched for by
+    /// a CE node ("your local node is your login"). Absent for anonymous/legacy joins — the game stays
+    /// open. The field never affects the deterministic sim; the host verifies it at ingest only.
     #[serde(rename = "join")]
-    Join { name: String },
+    Join {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap: Option<String>,
+    },
 
     /// One frame of input: thrust, turn (-1/0/+1), fire, and an optional absolute aim heading.
     #[serde(rename = "in")]
@@ -400,7 +408,7 @@ mod tests {
 
     #[test]
     fn client_join_roundtrips_and_tags() {
-        let m = ClientMsg::Join { name: "Ace".into() };
+        let m = ClientMsg::Join { name: "Ace".into(), cap: None };
         let bytes = m.encode().unwrap();
         assert_eq!(ClientMsg::decode(&bytes).unwrap(), m);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
