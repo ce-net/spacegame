@@ -99,6 +99,12 @@ frontend() {
     cp index.html boot.js galaxy-peer.js "$STAGE/"
     cp galaxy/gateways.json "$STAGE/galaxy/"
     cp -r pkg "$STAGE/pkg"
+    # CACHE-BUST: stamp boot.js with the wasm content hash so the browser loads a fresh, MATCHED glue+wasm
+    # pair every build (defeats stale ES-module caching that LinkErrors a new wasm against an old glue).
+    V=$(sha256sum pkg/spacegame_wasm_bg.wasm | cut -c1-16)
+    sed -i "s/__SGV__/$V/g" "$STAGE/boot.js" "$STAGE/index.html"
+    if grep -rq "__SGV__" "$STAGE/boot.js" "$STAGE/index.html"; then echo "FAILED to stamp cache-bust version"; exit 1; fi
+    echo "    cache-bust version stamped (boot.js + index.html): $V"
     CE_API_TOKEN=$(cat /root/.local/share/ce/api.token) \
       /opt/ce-serve/ce-serve-publish "$STAGE" '"$APP"'.ce-net.com '"$APP"
   echo "==> spacegame frontend live via ce-serve: https://$APP.ce-net.com/"

@@ -23,6 +23,27 @@ each one defines underneath. Keep this file up to date as the design evolves.
 
 > Document this verbatim
 
+> Deploy it globally! Always!
+
+(=> Standing rule: every spacegame iteration is deployed live via `bash deploy/deploy.sh` — backend
+adaptive-galaxy node + wasm frontend published through ce-serve — gated by the live browser smoke test.
+"Always" = make global deploy the default end-step of a change, not an opt-in.)
+
+> Why do we even "predict" at all? the architecture should be we run the full backend server on our local
+> mac AND relay AND on each other player for instant feedback and then merge everything - but for this we
+> need to first properly sync and make sure the server ALWAYS gets all our inputs and stays in sync and rely
+> on local mac backend servers for player inputs and movement with proper auto cheat merging of server
+> states properly. This is very advanced. I hate sector clamping - hte sectors should ADAPT to players and
+> other servers should automatically take over. Document everything i say verbatim!
+
+(=> This supersedes "client-side prediction" as the target. The end-state is NOT predict-then-correct: it
+is **replicated authority** — the full authoritative sim runs locally (Mac) AND on the relay AND on each
+nearby player's node, every replica ingests every input, and the replicas **merge** their states with
+anti-cheat reconciliation. "Instant feedback" comes from the LOCAL authoritative sim, not a guess.
+Prerequisite #1 is INPUT SYNC: every input must reach every replica reliably and in order, and the
+replicas must stay convergent. **No sector clamping / no walls** — sectors ADAPT to where players are and
+neighbouring nodes AUTOMATICALLY TAKE OVER hosting as players move. See `NETCODE.md`.)
+
 ---
 
 ## What these define (the model we are building toward)

@@ -302,6 +302,9 @@ pub async fn run_sector(
     sim.sector = sector_id;
     sim.hazards = crate::hazard::Hazards::for_sector(sector_id);
     sim.apply_ruleset(rules.clone());
+    // Reliable-input layer: turns the lossy `/in` pub/sub into exactly-once, in-order application of
+    // every client action, and tracks the per-player ack stamped into each snapshot (see `NETCODE.md`).
+    let mut insync = room::InputSync::default();
     let mut tick_timer = tokio::time::interval(Duration::from_millis((1000 / hz as u64).max(1)));
     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -362,7 +365,12 @@ pub async fn run_sector(
                         }
                     }
 
-                    let snap = room::build_snapshot(&sim, &cfg.sector, &host_id, now_ms());
+                    let mut snap = room::build_snapshot(&sim, &cfg.sector, &host_id, now_ms());
+                    // Tell each player which of their reliable actions we have applied, so they can stop
+                    // resending acked ones. Cheap: one map lookup per ship.
+                    for sv in &mut snap.ships {
+                        sv.input_ack = insync.ack(&sv.id);
+                    }
                     match snap.encode() {
                         Ok(bytes) => {
                             if let Err(e) = ce.publish(&state_topic, &bytes).await {
@@ -523,9 +531,18 @@ pub async fn run_sector(
                             Err(e) => { tracing::debug!(error = %e, "bad payload hex"); continue; }
                         };
                         if m.topic == in_topic {
-                            match wire::ClientMsg::decode(&payload) {
-                                Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
-                                Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg"),
+                            // Reliable path: a sequenced ClientPacket (current clients). Falls back to a
+                            // bare ClientMsg so a legacy/cached client still works during a rollout.
+                            match wire::ClientPacket::decode(&payload) {
+                                Ok(pkt) => {
+                                    if insync.apply(&mut sim, &m.from, pkt) {
+                                        insync.forget(&m.from); // they said Bye — reset their seq state
+                                    }
+                                }
+                                Err(_) => match wire::ClientMsg::decode(&payload) {
+                                    Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
+                                    Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg/packet"),
+                                },
                             }
                         } else if m.topic == transit_topic {
                             // INFINITE MAP: a ship arrived from a neighbouring sector.
