@@ -55,7 +55,9 @@ THIS: **deterministic simulation, replicated across the players present in a reg
 
 ## Live monitor
 
-- **Galaxy map — LIVE at https://map.ce-net.com/ (2026-06-27).** `galaxymap-web` (folds `galaxymap.rs`'s
+- **Galaxy map — LIVE at https://spa.ce-net.com/map/ (2026-06-27).** Spacegame-specific, so served under
+  the spacegame app (the bare `map.ce-net.com` is reserved for a future ce-net-wide donator map).
+  `galaxymap-web` (folds `galaxymap.rs`'s
   model) published via ce-serve (`deploy/deploy.sh map`): every cell, **which node hosts it** (the server
   instances contributing compute), per-cell player count + load heat, and live cell-splits, fed over the
   mesh bridge. Shows host instances + player COUNTS; individual player dots are a possible enhancement.
