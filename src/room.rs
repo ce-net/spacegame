@@ -12,12 +12,25 @@ use crate::faction::FactionCommand;
 use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
 use crate::wire::{
     BeamView, BulletView, ClientMsg, ClientPacket, DebrisView, ExplosionView, FactionView, KillView, LootView,
-    ShipView, Snapshot, SnapshotTag,
+    PickupView, ShipView, Snapshot, SnapshotTag,
 };
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
 pub fn hue_for(node_id: &str) -> u32 {
     crate::sim::fnv1a(node_id) % 360
+}
+
+/// A display hue per power-up kind (the renderer also colours by `kind`, but a hue keeps older clients
+/// sensible): repair=green, shield=blue, energy=cyan, overcharge=gold, minerals=amber.
+fn pickup_hue(kind: u8) -> u32 {
+    use crate::sim::pickup_kind as pk;
+    match kind {
+        k if k == pk::REPAIR => 130,
+        k if k == pk::SHIELD => 210,
+        k if k == pk::ENERGY => 185,
+        k if k == pk::OVERCHARGE => 45,
+        _ => 40,
+    }
 }
 
 /// Map a legacy build token to its tech-tree node id, so the existing frontend's `"hull"/"speed"/"gun"`
@@ -193,13 +206,15 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         a: (s.a * 100.0).round() as i32,
         hp: s.hp,
         max_hp: s.max_hp,
-        // Shields/energy/effects are not yet simulated in this SDK — emit neutral values (no shield
-        // system, empty effect set). The wire carries them so the renderer/clients are ready.
-        shield: 0,
-        max_shield: 0,
-        energy: 0,
-        max_energy: 0,
-        effects: Vec::new(),
+        shield: s.shield,
+        max_shield: s.max_shield,
+        energy: s.energy,
+        max_energy: s.max_energy,
+        // The codes currently active (remaining ticks > 0) — the renderer folds these into status auras.
+        effects: (0..crate::sim::effects::COUNT)
+            .filter(|&i| s.effects[i] > 0)
+            .map(|i| i as u8)
+            .collect(),
         input_ack: s.input_ack,
         minerals: s.minerals,
         kills: s.kills,
@@ -274,6 +289,12 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         })
         .collect();
 
+    let pickups: Vec<PickupView> = sim
+        .pickups
+        .iter()
+        .map(|p| PickupView { x: p.x.round() as i32, y: p.y.round() as i32, hue: pickup_hue(p.kind), kind: p.kind })
+        .collect();
+
     let depleted = sim.depleted_cells().into_iter().map(|(cx, cy, _)| [cx, cy]).collect();
 
     let kills = sim
@@ -293,10 +314,9 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         explosions,
         debris,
         loot,
-        // Proximity mines and power-up pickups are not yet simulated in this SDK — emitted empty so the
-        // wire shape is complete and the renderer simply draws none.
+        // Proximity mines are not yet simulated; pickups drop on kills (the renderer colours by kind).
         mines: Vec::new(),
-        pickups: Vec::new(),
+        pickups,
         factions: faction_views(sim),
         depleted,
         kills,
@@ -386,6 +406,13 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         })
         .collect();
 
+    let pickups: Vec<PickupView> = sim
+        .pickups
+        .iter()
+        .filter(|p| pad.contains_point(p.x, p.y))
+        .map(|p| PickupView { x: p.x.round() as i32, y: p.y.round() as i32, hue: pickup_hue(p.kind), kind: p.kind })
+        .collect();
+
     let depleted = sim
         .depleted_cells()
         .into_iter()
@@ -414,10 +441,8 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
         explosions,
         debris,
         loot,
-        // Proximity mines and power-up pickups are not yet simulated in this SDK — emitted empty so the
-        // wire shape is complete and the renderer simply draws none.
         mines: Vec::new(),
-        pickups: Vec::new(),
+        pickups,
         factions: faction_views(sim),
         depleted,
         kills,

@@ -86,6 +86,21 @@ pub struct WeaponDef {
     pub turn_rate: f32,
     /// Visual hue offset the frontend may apply to this weapon's shots/beam.
     pub hue_shift: i32,
+    /// Energy drawn per trigger pull. `0` (default) = free to fire. With energy enabled, a ship that
+    /// lacks this much energy cannot fire until it regens — the budget that makes loadout choices matter.
+    #[serde(default)]
+    pub energy_cost: i32,
+    /// Status effect this weapon inflicts on a ship it hits: a code (see [`crate::sim::effects`]) or
+    /// `255` for none (the default). E.g. the laser sets `burn`, a future EMP weapon sets `emp`.
+    #[serde(default = "default_no_effect")]
+    pub inflict: u8,
+    /// Ticks the inflicted effect lasts.
+    #[serde(default)]
+    pub inflict_ticks: u32,
+}
+
+fn default_no_effect() -> u8 {
+    255
 }
 
 impl WeaponDef {
@@ -106,6 +121,9 @@ impl WeaponDef {
             spread: 0.0,
             turn_rate: 0.0,
             hue_shift: 0,
+            energy_cost: 0,
+            inflict: 255,
+            inflict_ticks: 0,
         }
     }
 }
@@ -169,10 +187,64 @@ pub struct Tunables {
     /// faction can impose; excess roster units wait until a slot frees).
     #[serde(default = "default_max_fleet")]
     pub max_fleet: u32,
+
+    // --- Shields: a regenerating buffer absorbed before hull (most damage hits shield first). ---
+    /// Shield capacity at spawn. `0` = no shield system.
+    #[serde(default = "default_base_shield")]
+    pub base_shield: i32,
+    /// Shield points regenerated per tick, once the regen delay since the last hit has elapsed.
+    #[serde(default = "default_shield_regen")]
+    pub shield_regen: f32,
+    /// Ticks after taking damage before the shield begins to recharge.
+    #[serde(default = "default_shield_delay")]
+    pub shield_regen_delay: u64,
+
+    // --- Energy: a regenerating budget weapons draw on to fire. ---
+    /// Energy capacity at spawn. `0` = energy is not a constraint (weapons always fire).
+    #[serde(default = "default_base_energy")]
+    pub base_energy: i32,
+    /// Energy regenerated per tick.
+    #[serde(default = "default_energy_regen")]
+    pub energy_regen: f32,
+
+    // --- Status effects ---
+    /// Burn damage-over-time per tick while the burn effect is active (bypasses shields — it's on the hull).
+    #[serde(default = "default_burn_dps")]
+    pub burn_dps: i32,
+    /// Speed multiplier while slowed.
+    #[serde(default = "default_slow_mult")]
+    pub slow_mult: f32,
+    /// Damage multiplier while overcharged (from an overcharge pickup).
+    #[serde(default = "default_overcharge_mult")]
+    pub overcharge_mult: f32,
 }
 
 fn default_max_fleet() -> u32 {
     24
+}
+fn default_base_shield() -> i32 {
+    60
+}
+fn default_shield_regen() -> f32 {
+    0.7
+}
+fn default_shield_delay() -> u64 {
+    50
+}
+fn default_base_energy() -> i32 {
+    100
+}
+fn default_energy_regen() -> f32 {
+    1.2
+}
+fn default_burn_dps() -> i32 {
+    3
+}
+fn default_slow_mult() -> f32 {
+    0.5
+}
+fn default_overcharge_mult() -> f32 {
+    1.6
 }
 
 impl Default for Tunables {
@@ -190,6 +262,14 @@ impl Default for Tunables {
             max_guns: 5,
             ship_push: 0.5,
             max_fleet: 24,
+            base_shield: default_base_shield(),
+            shield_regen: default_shield_regen(),
+            shield_regen_delay: default_shield_delay(),
+            base_energy: default_base_energy(),
+            energy_regen: default_energy_regen(),
+            burn_dps: default_burn_dps(),
+            slow_mult: default_slow_mult(),
+            overcharge_mult: default_overcharge_mult(),
         }
     }
 }
@@ -273,6 +353,9 @@ impl Ruleset {
                     spread: 0.12,
                     turn_rate: 0.0,
                     hue_shift: 0,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     id: "missile".into(),
@@ -287,6 +370,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.08,
                     hue_shift: 20,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     id: "railgun".into(),
@@ -301,6 +387,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 200,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     id: "laser".into(),
@@ -315,6 +404,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 320,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 // --- homing missile launchers ---
                 WeaponDef {
@@ -331,6 +423,9 @@ impl Ruleset {
                     spread: 0.5,
                     turn_rate: 0.09,
                     hue_shift: 12,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     // A single heavy seeker: slow, hard-turning, hits like a truck.
@@ -346,6 +441,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.13,
                     hue_shift: 350,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 // --- laser weapon types ---
                 WeaponDef {
@@ -362,6 +460,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 290,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     // Scatter laser: a fan of short beams — devastating up close, weak at range.
@@ -377,6 +478,9 @@ impl Ruleset {
                     spread: 0.32,
                     turn_rate: 0.0,
                     hue_shift: 260,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
                 WeaponDef {
                     // Lance: a long, slow, high-damage focused beam pulse.
@@ -392,6 +496,9 @@ impl Ruleset {
                     spread: 0.0,
                     turn_rate: 0.0,
                     hue_shift: 180,
+                    energy_cost: 0,
+                    inflict: 255,
+                    inflict_ticks: 0,
                 },
             ],
             tech: vec![

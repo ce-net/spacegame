@@ -42,6 +42,14 @@ pub struct ShipSnap {
     pub a: f32,
     pub hp: i32,
     pub max_hp: i32,
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    #[serde(default)]
+    pub energy: i32,
+    #[serde(default)]
+    pub max_energy: i32,
     pub minerals: u32,
     pub kills: u32,
     pub speed_lv: u32,
@@ -91,6 +99,9 @@ pub struct SectorSnapshot {
     /// a player was about to collect. (Debris is cosmetic and dropped; loot has real value.)
     #[serde(default)]
     pub loot: Vec<crate::sim::Loot>,
+    /// Floating power-up pickups in flight — carried across failover like loot.
+    #[serde(default)]
+    pub pickups: Vec<crate::sim::Pickup>,
 }
 
 impl SectorSnapshot {
@@ -118,6 +129,7 @@ impl SectorSnapshot {
             mined,
             factions,
             loot: sim.loot.clone(),
+            pickups: sim.pickups.clone(),
         }
     }
 
@@ -137,6 +149,7 @@ impl SectorSnapshot {
             sim.factions.insert(f.owner.clone(), f.clone());
         }
         sim.loot = self.loot.clone();
+        sim.pickups = self.pickups.clone();
         sim
     }
 

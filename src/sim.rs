@@ -123,6 +123,65 @@ pub struct Loot {
     pub born: u64,
 }
 
+/// **Status-effect codes.** A ship carries a per-code remaining-ticks counter (`Ship::effects`); these
+/// indices match the renderer's status auras (EMP / burn / slow / stasis / overcharge), and the wire
+/// [`crate::wire::ShipView::effects`] is the list of codes currently active.
+pub mod effects {
+    /// Electronics scrambled — the ship cannot fire.
+    pub const EMP: usize = 0;
+    /// Hull is burning — damage over time that bypasses shields.
+    pub const BURN: usize = 1;
+    /// Engines fouled — reduced top speed.
+    pub const SLOW: usize = 2;
+    /// Frozen — cannot move or fire.
+    pub const STASIS: usize = 3;
+    /// Overcharged — outgoing weapon damage is boosted (from an overcharge pickup).
+    pub const OVERCHARGE: usize = 4;
+    /// Number of distinct effect slots.
+    pub const COUNT: usize = 5;
+}
+
+/// Power-up kinds a [`Pickup`] can grant. Indices match the renderer's `pickup_color`.
+pub mod pickup_kind {
+    pub const REPAIR: u8 = 0;
+    pub const SHIELD: u8 = 1;
+    pub const ENERGY: u8 = 2;
+    pub const OVERCHARGE: u8 = 3;
+    pub const MINERALS: u8 = 4;
+    pub const COUNT: u8 = 5;
+}
+
+/// A ship within this radius magnetises a pickup toward itself.
+pub const PICKUP_MAGNET_R: f32 = 240.0;
+/// Acceleration applied to a pickup toward the ship attracting it.
+pub const PICKUP_PULL: f32 = 0.55;
+/// A pickup's glide speed cap.
+pub const PICKUP_MAX_SPEED: f32 = 8.5;
+/// Distance at which a ship collects a pickup.
+pub const PICKUP_R: f32 = SHIP_R + 10.0;
+/// Ticks a pickup survives before it dissolves.
+pub const PICKUP_LIFE_TICKS: u64 = 1500;
+/// Ticks an overcharge pickup boosts the collector's damage.
+pub const OVERCHARGE_TICKS: u32 = 240;
+
+/// A floating **power-up** dropped where a ship died: a glinting collectible that drifts, is magnetised
+/// to a nearby ship, and grants a boon on contact (repair hull / recharge shield / recharge energy /
+/// an overcharge buff / minerals). Authoritative, deterministic, snapshotted, and hashed — same as
+/// [`Loot`], but it heals/buffs instead of banking ore.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Pickup {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    /// One of [`pickup_kind`].
+    pub kind: u8,
+    /// Magnitude of the boon (hull/shield/energy points, or minerals).
+    pub amount: u32,
+    /// Tick spawned, for the lifetime cap.
+    pub born: u64,
+}
+
 /// FNV-1a 32-bit hash of a string — the exact field hash the frontend uses, so the renderer and the
 /// authoritative server agree on the asteroid field bit-for-bit.
 pub fn fnv1a(s: &str) -> u32 {
@@ -136,6 +195,59 @@ pub fn fnv1a(s: &str) -> u32 {
 
 fn cell_hash(cx: i32, cy: i32, salt: &str) -> u32 {
     fnv1a(&format!("{cx}:{cy}:{salt}"))
+}
+
+/// Per-collection seeds for the order-independent folds in [`Sim::state_hash`] — distinct so an item
+/// of one kind can never hash-collide with an identical-looking item of another.
+const BULLET_SEED: u64 = 0x9e3779b97f4a7c15;
+const LOOT_SEED: u64 = 0x632be59bd9b4e019;
+const PICKUP_SEED: u64 = 0x2545f4914f6cdd1d;
+
+/// A tiny deterministic field hasher (FNV-1a accumulator) used by [`Sim::state_hash`]: feed it fields,
+/// read the digest with [`get`](Digest::get). Chainable. Floats are quantised so honest replicas that
+/// differ only by sub-unit floating-point noise still produce the same digest.
+#[derive(Clone, Copy)]
+struct Digest(u64);
+
+impl Digest {
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new(seed: u64) -> Self {
+        Digest(seed)
+    }
+
+    /// Mix in a raw integer field.
+    fn int(&mut self, v: u64) -> &mut Self {
+        self.0 ^= v;
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+        self
+    }
+
+    /// Mix in a signed integer field.
+    fn sint(&mut self, v: i64) -> &mut Self {
+        self.int(v as u64)
+    }
+
+    /// Mix in a float, quantised to 1/8 unit so tiny rounding can't cause a false disagreement.
+    fn float(&mut self, v: f32) -> &mut Self {
+        self.int((v * 8.0).round() as i64 as u64)
+    }
+
+    /// Mix in a string by its FNV-1a hash.
+    fn text(&mut self, s: &str) -> &mut Self {
+        self.int(fnv1a(s) as u64)
+    }
+
+    fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Hash each item independently and XOR the results — an **order-independent** digest of a collection
+/// (XOR is commutative, so the iteration order does not affect the total). Used for the Vecs in
+/// [`Sim::state_hash`] whose order is incidental.
+fn xor_fold<T>(items: &[T], hash_one: impl Fn(&T) -> u64) -> u64 {
+    items.iter().map(hash_one).fold(0, |acc, x| acc ^ x)
 }
 
 /// An asteroid in a sector-local grid cell. Computed identically on client and server from the cell
@@ -181,6 +293,22 @@ pub struct Ship {
     pub a: f32,
     pub hp: i32,
     pub max_hp: i32,
+    /// Regenerating shield buffer, absorbed before hull on most hits. `max_shield == 0` = no shield.
+    #[serde(default)]
+    pub shield: i32,
+    #[serde(default)]
+    pub max_shield: i32,
+    /// Regenerating energy budget weapons draw on to fire. `max_energy == 0` = energy is not a constraint.
+    #[serde(default)]
+    pub energy: i32,
+    #[serde(default)]
+    pub max_energy: i32,
+    /// Per-effect remaining ticks (index by [`effects`]). Live-only — combat transients reset on failover.
+    #[serde(skip)]
+    pub effects: [u32; effects::COUNT],
+    /// Tick of the last damage taken, for the shield-regen delay. Live-only.
+    #[serde(skip)]
+    pub last_hit: u64,
     pub minerals: u32,
     pub kills: u32,
     /// Thruster upgrade level (raises max speed & accel).
@@ -224,7 +352,7 @@ pub struct Ship {
 }
 
 impl Ship {
-    fn new(name: String, hue: u32, tick: u64, default_weapon: String, base_hp: i32) -> Self {
+    fn new(name: String, hue: u32, tick: u64, default_weapon: String, base_hp: i32, base_shield: i32, base_energy: i32) -> Self {
         let off = (hue as f32 / 360.0 - 0.5) * SECTOR_SIZE * 0.5;
         Ship {
             name,
@@ -236,6 +364,12 @@ impl Ship {
             a: -std::f32::consts::FRAC_PI_2,
             hp: base_hp,
             max_hp: base_hp,
+            shield: base_shield,
+            max_shield: base_shield,
+            energy: base_energy,
+            max_energy: base_energy,
+            effects: [0; effects::COUNT],
+            last_hit: 0,
             minerals: 0,
             kills: 0,
             speed_lv: 0,
@@ -261,7 +395,8 @@ impl Ship {
     /// fighter can fight) and full hull for its role; its id is the synthetic `npc:<owner>:<seq>`.
     #[allow(clippy::too_many_arguments)]
     fn npc(role: ShipRole, owner: String, x: f32, y: f32, hp: i32, hue: u32, tick: u64) -> Self {
-        let mut s = Ship::new(format!("{role:?}"), hue, tick, "blaster".into(), hp);
+        // NPC fleet ships get a modest shield (half their hull) and a full energy bank so they can fire.
+        let mut s = Ship::new(format!("{role:?}"), hue, tick, "blaster".into(), hp, hp / 2, 100);
         s.x = x;
         s.y = y;
         s.max_hp = hp;
@@ -286,6 +421,12 @@ impl Ship {
             a: snap.a,
             hp: snap.hp,
             max_hp: snap.max_hp,
+            shield: snap.shield,
+            max_shield: snap.max_shield,
+            energy: snap.energy,
+            max_energy: snap.max_energy,
+            effects: [0; effects::COUNT],
+            last_hit: 0,
             minerals: snap.minerals,
             kills: snap.kills,
             speed_lv: snap.speed_lv,
@@ -336,6 +477,10 @@ impl Ship {
             a: self.a,
             hp: self.hp,
             max_hp: self.max_hp,
+            shield: self.shield,
+            max_shield: self.max_shield,
+            energy: self.energy,
+            max_energy: self.max_energy,
             minerals: self.minerals,
             kills: self.kills,
             speed_lv: self.speed_lv,
@@ -375,6 +520,26 @@ pub struct Bullet {
     /// [`Explosion`]. `0.0` = an ordinary bullet that deals point damage and vanishes.
     #[serde(default)]
     pub explode_radius: f32,
+    /// Status effect this round inflicts on a ship it hits (a code in [`effects`], or `255` for none).
+    #[serde(default = "no_effect_code")]
+    pub inflict: u8,
+    /// Ticks the inflicted effect lasts.
+    #[serde(default)]
+    pub inflict_ticks: u32,
+}
+
+fn no_effect_code() -> u8 {
+    255
+}
+
+/// A single damage application: the amount, whether it bypasses shields (burn/DoT goes straight to
+/// hull), and an optional status effect to inflict (`inflict == 255` = none).
+#[derive(Clone, Copy)]
+struct Hit {
+    dmg: i32,
+    bypass_shield: bool,
+    inflict: u8,
+    inflict_ticks: u32,
 }
 
 /// A one-tick explosion (a missile detonation) for the renderer to flash and shake.
@@ -466,6 +631,8 @@ pub struct Sim {
     /// Floating **alloy nuggets** shed by mined asteroids, magnetically collected by ships. Mining is
     /// deferred through these rather than instant (see [`Loot`]).
     pub loot: Vec<Loot>,
+    /// Floating **power-ups** dropped on kills, magnetically collected for a boon (see [`Pickup`]).
+    pub pickups: Vec<Pickup>,
 }
 
 impl Default for Sim {
@@ -485,6 +652,7 @@ impl Default for Sim {
             factions: std::collections::HashMap::new(),
             debris: physics::World::new(),
             loot: Vec::new(),
+            pickups: Vec::new(),
         }
     }
 }
@@ -536,7 +704,8 @@ impl Sim {
         let tick = self.tick;
         let name = sanitize_name(name);
         let dw = self.rules.default_weapon();
-        let base_hp = self.rules.tunables.base_hp;
+        let tun = &self.rules.tunables;
+        let (base_hp, base_shield, base_energy) = (tun.base_hp, tun.base_shield, tun.base_energy);
         self.factions.entry(id.to_string()).or_insert_with(|| Faction::founding(id));
         match self.ships.get_mut(id) {
             Some(s) => {
@@ -545,7 +714,7 @@ impl Sim {
                 s.last_input_tick = tick;
             }
             None => {
-                self.ships.insert(id.to_string(), Ship::new(name, hue, tick, dw, base_hp));
+                self.ships.insert(id.to_string(), Ship::new(name, hue, tick, dw, base_hp, base_shield, base_energy));
             }
         }
     }
@@ -583,12 +752,12 @@ impl Sim {
     pub fn apply_intent(&mut self, id: &str, intent: Intent, hue_fallback: u32) {
         let tick = self.tick;
         let dw = self.rules.default_weapon();
-        let base_hp = self.rules.tunables.base_hp;
-        let turn_rate = self.rules.tunables.turn_rate;
+        let tun = &self.rules.tunables;
+        let (base_hp, base_shield, base_energy, turn_rate) = (tun.base_hp, tun.base_shield, tun.base_energy, tun.turn_rate);
         if !self.ships.contains_key(id) {
             let name = intent.name.clone().unwrap_or_else(|| "pilot".into());
             self.ships
-                .insert(id.to_string(), Ship::new(sanitize_name(&name), hue_fallback, tick, dw, base_hp));
+                .insert(id.to_string(), Ship::new(sanitize_name(&name), hue_fallback, tick, dw, base_hp, base_shield, base_energy));
         }
         if let Some(s) = self.ships.get_mut(id) {
             if let Some(n) = intent.name {
@@ -678,7 +847,8 @@ impl Sim {
         let now = self.tick;
         let respawn_ticks = self.rules.tunables.respawn_ticks;
         let dw = self.rules.default_weapon();
-        let base_hp = self.rules.tunables.base_hp;
+        let tun = &self.rules.tunables;
+        let (base_hp, base_shield, base_energy) = (tun.base_hp, tun.base_shield, tun.base_energy);
         let Some(s) = self.ships.get_mut(id) else { return false };
         if s.alive {
             return false;
@@ -692,7 +862,7 @@ impl Sim {
         // Respawn keeps identity, kills, and unlocked weapons; upgrades reset to base.
         let weapons = s.weapons.clone();
         let owned: Vec<String> = s.owned.iter().filter(|o| o.starts_with("tech-")).cloned().collect();
-        let mut fresh = Ship::new(name, hue, now, dw, base_hp);
+        let mut fresh = Ship::new(name, hue, now, dw, base_hp, base_shield, base_energy);
         fresh.kills = kills;
         fresh.weapons = weapons;
         fresh.owned = owned;
@@ -736,19 +906,24 @@ impl Sim {
                 if !s.alive {
                     continue;
                 }
+                // STATUS: stasis freezes the ship (no turn/thrust, hard damp); slow caps its top speed.
+                let frozen = s.effects[effects::STASIS] > 0;
+                let slowed = s.effects[effects::SLOW] > 0;
                 // Turn (button steering; mouse-aim already applied in apply_intent).
-                s.a = (s.a + s.want_turn as f32 * tun.turn_rate).rem_euclid(std::f32::consts::TAU);
+                if !frozen {
+                    s.a = (s.a + s.want_turn as f32 * tun.turn_rate).rem_euclid(std::f32::consts::TAU);
+                }
                 // Thrust.
-                if s.want_thrust {
+                if s.want_thrust && !frozen {
                     let acc = s.accel_t(&tun) * dt_scale;
                     s.vx += s.a.cos() * acc;
                     s.vy += s.a.sin() * acc;
                 }
                 // Damping + clamp to max speed.
-                s.vx *= tun.damping;
-                s.vy *= tun.damping;
+                s.vx *= if frozen { 0.6 } else { tun.damping };
+                s.vy *= if frozen { 0.6 } else { tun.damping };
                 let spd = (s.vx * s.vx + s.vy * s.vy).sqrt();
-                let max = s.max_speed_t(&tun);
+                let max = s.max_speed_t(&tun) * if frozen { 0.0 } else if slowed { tun.slow_mult } else { 1.0 };
                 if spd > max {
                     let k = max / spd;
                     s.vx *= k;
@@ -898,9 +1073,14 @@ impl Sim {
             self.resolve_ship_collisions(&tree, &tun);
         }
 
-        // --- Pass 4b: magnetic alloy loot. Mined nuggets glide, get pulled to a nearby ship via the
-        // same AABB broad-phase, and are collected on contact — deferred, satisfying mining. ---
+        // --- Pass 4b: magnetic alloy loot + power-up pickups. Both glide, get pulled to a nearby ship
+        // via the same AABB broad-phase, and are collected on contact — satisfying mining + rewards. ---
         self.advance_loot(now, &tree, dt_scale);
+        self.advance_pickups(now, &tree, dt_scale);
+
+        // --- Pass 4c: status effects + shield/energy regen. Burn ticks hull damage; slow/EMP/stasis
+        // count down; shields recharge after a lull and energy refills, so combat has ebb and flow. ---
+        self.tick_status_and_regen(now, &tun);
 
         // --- Pass 5: the always-alive factions tick every step, online or not, then their roster is
         // reconciled into live NPC fleet ships in the world. ---
@@ -1045,6 +1225,124 @@ impl Sim {
         if self.loot.len() > 4096 {
             self.loot.sort_by(|a, b| b.born.cmp(&a.born));
             self.loot.truncate(4096);
+        }
+    }
+
+    /// Advance floating **power-up pickups** (dropped on kills): identical magnet/glide/collect to loot,
+    /// but on contact it grants a boon to the collector — repair hull, recharge shield, recharge energy,
+    /// an overcharge buff, or minerals. Deterministic and bounded.
+    fn advance_pickups(&mut self, now: u64, tree: &AabbTree<String>, dt_scale: f32) {
+        if self.pickups.is_empty() {
+            return;
+        }
+        let mut collected: Vec<(usize, String)> = Vec::new();
+        for (pi, pk) in self.pickups.iter_mut().enumerate() {
+            let mut best: Option<(f32, f32, f32, String)> = None; // (dist2, sx, sy, id)
+            for id in tree.query_circle(pk.x, pk.y, PICKUP_MAGNET_R) {
+                if let Some(s) = self.ships.get(&id) {
+                    if !s.alive {
+                        continue;
+                    }
+                    let d2 = (s.x - pk.x).powi(2) + (s.y - pk.y).powi(2);
+                    if best.as_ref().map(|(bd, _, _, _)| d2 < *bd).unwrap_or(true) {
+                        best = Some((d2, s.x, s.y, id));
+                    }
+                }
+            }
+            if let Some((d2, sx, sy, id)) = best {
+                if d2 <= PICKUP_R * PICKUP_R {
+                    collected.push((pi, id));
+                    continue;
+                }
+                let d = d2.sqrt().max(0.0001);
+                pk.vx += (sx - pk.x) / d * PICKUP_PULL * dt_scale;
+                pk.vy += (sy - pk.y) / d * PICKUP_PULL * dt_scale;
+            } else {
+                pk.vx *= LOOT_DAMPING;
+                pk.vy *= LOOT_DAMPING;
+            }
+            let spd = (pk.vx * pk.vx + pk.vy * pk.vy).sqrt();
+            if spd > PICKUP_MAX_SPEED {
+                let k = PICKUP_MAX_SPEED / spd;
+                pk.vx *= k;
+                pk.vy *= k;
+            }
+            pk.x += pk.vx * dt_scale;
+            pk.y += pk.vy * dt_scale;
+        }
+
+        let mut taken = vec![false; self.pickups.len()];
+        for (pi, id) in collected {
+            let (kind, amount) = (self.pickups[pi].kind, self.pickups[pi].amount as i32);
+            taken[pi] = true;
+            let fid = self.ships.get(&id).map(|s| s.faction_id(&id).to_string()).unwrap_or_else(|| id.clone());
+            if let Some(s) = self.ships.get_mut(&id) {
+                match kind {
+                    k if k == pickup_kind::REPAIR => s.hp = (s.hp + amount).min(s.max_hp),
+                    k if k == pickup_kind::SHIELD => s.shield = (s.shield + amount).min(s.max_shield),
+                    k if k == pickup_kind::ENERGY => s.energy = (s.energy + amount).min(s.max_energy),
+                    k if k == pickup_kind::OVERCHARGE => {
+                        s.effects[effects::OVERCHARGE] = s.effects[effects::OVERCHARGE].max(OVERCHARGE_TICKS);
+                    }
+                    _ => s.minerals = s.minerals.saturating_add(amount as u32), // MINERALS
+                }
+            }
+            if kind == pickup_kind::MINERALS {
+                if let Some(f) = self.factions.get_mut(&fid) {
+                    f.deposit_minerals(amount as u64);
+                }
+            }
+        }
+        let mut i = 0;
+        self.pickups.retain(|pk| {
+            let keep = !taken[i]
+                && now.saturating_sub(pk.born) < PICKUP_LIFE_TICKS
+                && pk.x > -200.0
+                && pk.y > -200.0
+                && pk.x < SECTOR_SIZE + 200.0
+                && pk.y < SECTOR_SIZE + 200.0;
+            i += 1;
+            keep
+        });
+        if self.pickups.len() > 2048 {
+            self.pickups.sort_by(|a, b| b.born.cmp(&a.born));
+            self.pickups.truncate(2048);
+        }
+    }
+
+    /// Tick status effects and regenerate shields/energy for every ship. Burn deals hull damage that
+    /// bypasses shields; every effect counts down; shields recharge after `shield_regen_delay` ticks
+    /// without being hit, and energy refills steadily. This is what gives combat its rhythm.
+    fn tick_status_and_regen(&mut self, now: u64, tun: &Tunables) {
+        // Burn damage is applied through `apply_damage` (so a burn can kill + drop loot), which borrows
+        // self mutably — collect burning victims first, then apply.
+        let mut burning: Vec<String> = Vec::new();
+        let mut ids: Vec<String> = self.ships.keys().cloned().collect();
+        ids.sort();
+        for id in &ids {
+            let Some(s) = self.ships.get_mut(id) else { continue };
+            if !s.alive {
+                continue;
+            }
+            // Count every effect down by one tick.
+            for e in s.effects.iter_mut() {
+                *e = e.saturating_sub(1);
+            }
+            // Shield regen after a lull since the last hit.
+            if s.max_shield > 0 && s.shield < s.max_shield && now.saturating_sub(s.last_hit) >= tun.shield_regen_delay {
+                s.shield = (s.shield as f32 + tun.shield_regen).round().min(s.max_shield as f32) as i32;
+            }
+            // Energy regen, always.
+            if s.max_energy > 0 && s.energy < s.max_energy {
+                s.energy = (s.energy as f32 + tun.energy_regen).round().min(s.max_energy as f32) as i32;
+            }
+            if s.effects[effects::BURN] > 0 {
+                burning.push(id.clone());
+            }
+        }
+        for id in burning {
+            // Burn bypasses shields and credits no killer (attacker "" matches no ship).
+            self.apply_damage(&id, Hit { dmg: tun.burn_dps, bypass_shield: true, inflict: 255, inflict_ticks: 0 }, "", now);
         }
     }
 
@@ -1271,14 +1569,55 @@ impl Sim {
         }
     }
 
+    /// Energy a weapon draws per trigger pull. The ruleset may set `energy_cost` explicitly; `0` means
+    /// "derive from the weapon" so the built-in catalogue feels right without per-weapon data: lasers
+    /// sip (sustained), projectiles are cheap, homing and railguns are expensive bursts.
+    fn weapon_energy_cost(def: &crate::ruleset::WeaponDef) -> i32 {
+        if def.energy_cost > 0 {
+            return def.energy_cost;
+        }
+        match def.kind {
+            WeaponKind::Laser => 2,
+            WeaponKind::Projectile => (1 + def.count as i32).max(2),
+            WeaponKind::Homing => 8 + def.damage / 6,
+            WeaponKind::Railgun => 38,
+        }
+    }
+
+    /// The status effect a weapon inflicts on hit: `(code, ticks)`. The ruleset may set `inflict`
+    /// explicitly (`255` = derive); by default lasers set **burn** and homing missiles set **slow**
+    /// (concussion), which gives the weapon roster tactical texture for free.
+    fn weapon_effect(def: &crate::ruleset::WeaponDef) -> (u8, u32) {
+        if def.inflict != 255 {
+            return (def.inflict, def.inflict_ticks);
+        }
+        match def.kind {
+            WeaponKind::Laser => (effects::BURN as u8, 36),
+            WeaponKind::Homing => (effects::SLOW as u8, 40),
+            _ => (255, 0),
+        }
+    }
+
     /// Fire ship `id`'s selected weapon, dispatching on its kind. Reads the live ruleset, so a hot
     /// reload changes weapon behaviour on the next shot.
     fn fire_weapon(&mut self, id: &str, now: u64, tree: &AabbTree<String>) {
         let rules = self.rules.clone();
-        let (wx, wy, wa, wvx, wvy, hue0, guns, weapon) = {
+        let overcharge_mult = rules.tunables.overcharge_mult;
+        let (wx, wy, wa, wvx, wvy, hue0, guns, weapon, emp, stasis, energy, max_energy, overcharged) = {
             let Some(s) = self.ships.get(id) else { return };
-            (s.x, s.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone())
+            (
+                s.x, s.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone(),
+                s.effects[effects::EMP] > 0,
+                s.effects[effects::STASIS] > 0,
+                s.energy,
+                s.max_energy,
+                s.effects[effects::OVERCHARGE] > 0,
+            )
         };
+        // STATUS: a scrambled (EMP) or frozen (stasis) ship cannot fire.
+        if emp || stasis {
+            return;
+        }
         let def = rules.weapon(&weapon).cloned().unwrap_or_else(crate::ruleset::WeaponDef::fallback);
 
         // Cooldown: the blaster fires faster with more barrels; other weapons use their own cooldown.
@@ -1293,17 +1632,29 @@ impl Sim {
                 return;
             }
         }
+        // ENERGY: weapons draw on a regenerating bank. If the ship can't pay, the shot doesn't go (and
+        // the cooldown is NOT consumed, so it fires the instant the bank refills). Free when no bank.
+        let cost = Self::weapon_energy_cost(&def);
+        if max_energy > 0 && energy < cost {
+            return;
+        }
         if let Some(s) = self.ships.get_mut(id) {
             s.last_fire = now;
+            if max_energy > 0 {
+                s.energy = (s.energy - cost).max(0);
+            }
         }
         let hue = ((hue0 as i32 + def.hue_shift).rem_euclid(360)) as u32;
+        let mult = if overcharged { overcharge_mult } else { 1.0 };
+        let (inflict, inflict_ticks) = Self::weapon_effect(&def);
 
         match def.kind {
             WeaponKind::Projectile | WeaponKind::Homing => {
                 let count = if def.id == "blaster" { guns.max(1) } else { def.count.max(1) };
                 let spread = def.spread;
                 let homing = if def.kind == WeaponKind::Homing { def.turn_rate } else { 0.0 };
-                let dmg = def.damage + if def.id == "blaster" { (guns.saturating_sub(1) as i32) * 2 } else { 0 };
+                let base = def.damage + if def.id == "blaster" { (guns.saturating_sub(1) as i32) * 2 } else { 0 };
+                let dmg = ((base as f32) * mult).round() as i32;
                 // Homing rounds are missiles: they detonate with an AoE blast scaled to their payload.
                 let explode_radius = if def.kind == WeaponKind::Homing { def.damage as f32 * 1.4 + 45.0 } else { 0.0 };
                 for g in 0..count {
@@ -1320,6 +1671,8 @@ impl Sim {
                         die_at: now + def.ttl,
                         homing,
                         explode_radius,
+                        inflict,
+                        inflict_ticks,
                     });
                 }
             }
@@ -1330,6 +1683,7 @@ impl Sim {
                 let beam_kind: u8 = if def.kind == WeaponKind::Railgun { 0 } else { 1 };
                 let count = def.count.max(1);
                 let spread = def.spread;
+                let dmg = ((def.damage as f32) * mult).round() as i32;
                 for g in 0..count {
                     let off = if count > 1 { (g as f32 - (count as f32 - 1.0) / 2.0) * spread } else { 0.0 };
                     let a = wa + off;
@@ -1344,7 +1698,7 @@ impl Sim {
                         kind: beam_kind,
                     });
                     if let Some(victim) = hit {
-                        self.apply_damage(&victim, def.damage, id, now);
+                        self.apply_damage(&victim, Hit { dmg, bypass_shield: false, inflict, inflict_ticks }, id, now);
                     }
                 }
             }
@@ -1457,7 +1811,12 @@ impl Sim {
                 if missile {
                     self.detonate(&b, now, tree); // AoE — the direct target is inside the blast too
                 } else {
-                    self.apply_damage(&victim, b.dmg, &b.owner, now);
+                    self.apply_damage(
+                        &victim,
+                        Hit { dmg: b.dmg, bypass_shield: false, inflict: b.inflict, inflict_ticks: b.inflict_ticks },
+                        &b.owner,
+                        now,
+                    );
                 }
                 continue; // round consumed
             }
@@ -1495,7 +1854,12 @@ impl Sim {
             }
             let falloff = (1.0 - d / radius).max(0.25);
             let dmg = ((b.dmg as f32) * falloff).round() as i32;
-            self.apply_damage(&cid, dmg, &b.owner, now);
+            self.apply_damage(
+                &cid,
+                Hit { dmg, bypass_shield: false, inflict: b.inflict, inflict_ticks: b.inflict_ticks },
+                &b.owner,
+                now,
+            );
         }
         // A little debris kicked out by the blast (deterministic from position + tick).
         let seed = fnv1a(&b.owner) ^ (b.x as u32).wrapping_mul(2654435761) ^ now as u32;
@@ -1532,14 +1896,30 @@ impl Sim {
         best.map(|(_, id)| id)
     }
 
-    /// Apply `dmg` from `attacker` to `victim`, handling kill, mineral drop, kill credit and feed.
-    fn apply_damage(&mut self, victim: &str, dmg: i32, attacker: &str, now: u64) {
+    /// Apply a [`Hit`] from `attacker` to `victim`: shields absorb first (unless the hit bypasses them),
+    /// the overflow hits hull, any status effect is inflicted, and a kill spawns wreckage + a power-up
+    /// drop and credits the killer. Centralising shields/effects here means every weapon and the AoE
+    /// blast get them for free.
+    fn apply_damage(&mut self, victim: &str, hit: Hit, attacker: &str, now: u64) {
         let (killed, victim_name) = {
             let Some(v) = self.ships.get_mut(victim) else { return };
             if !v.alive {
                 return;
             }
+            let mut dmg = hit.dmg.max(0);
+            // SHIELDS: a regenerating buffer soaks damage before the hull (burn/DoT bypasses it).
+            if !hit.bypass_shield && v.max_shield > 0 && v.shield > 0 {
+                let absorbed = dmg.min(v.shield);
+                v.shield -= absorbed;
+                dmg -= absorbed;
+            }
             v.hp -= dmg;
+            v.last_hit = now;
+            // STATUS: inflict the weapon's effect (take the longer of any existing duration).
+            if (hit.inflict as usize) < effects::COUNT && hit.inflict_ticks > 0 {
+                let slot = hit.inflict as usize;
+                v.effects[slot] = v.effects[slot].max(hit.inflict_ticks);
+            }
             (v.hp <= 0, v.name.clone())
         };
         if !killed {
@@ -1582,6 +1962,24 @@ impl Sim {
             victim_name,
             tick: now,
         });
+
+        // REWARD: a wreck sheds a power-up. Kind + amount are deterministic from the victim id + tick
+        // (no rng), so every replica drops the identical pickup. It then drifts and is magnetically
+        // collected like loot (see `advance_pickups`).
+        {
+            let kind = (cell_hash(now as i32, seed as i32, "pk") % pickup_kind::COUNT as u32) as u8;
+            let amount = 20 + (seed >> 5) % 30;
+            let ang = (seed % 628) as f32 / 100.0;
+            self.pickups.push(Pickup {
+                x: vx,
+                y: vy,
+                vx: ang.cos() * 0.8,
+                vy: ang.sin() * 0.8,
+                kind,
+                amount,
+                born: now,
+            });
+        }
 
         // An NPC fleet ship does not respawn: it is removed from the world and struck from its
         // faction's roster (you lose a ship and must build another). Player ships stay dead-but-present
@@ -1656,84 +2054,54 @@ impl Sim {
     /// agree despite tiny rounding, and order-independent fields (bullets, debris) are folded with XOR
     /// so map iteration order never causes a false disagreement. Pairs with [`crate::replication`].
     pub fn state_hash(&self) -> u64 {
-        const PRIME: u64 = 0x100000001b3;
-        fn mix(h: &mut u64, v: u64) {
-            *h ^= v;
-            *h = h.wrapping_mul(PRIME);
-        }
-        fn q(f: f32) -> u64 {
-            // Quantise to 1/8 unit so honest replicas agree despite sub-unit float noise.
-            (f * 8.0).round() as i64 as u64
-        }
-        let mut h: u64 = 0xcbf29ce484222325;
-        mix(&mut h, self.tick);
-        mix(&mut h, self.sector.sx as u64);
-        mix(&mut h, self.sector.sy as u64);
-        mix(&mut h, self.rules.version);
+        // The world hash is built field by field with `Digest`, a tiny FNV-1a accumulator. Two rules
+        // keep honest replicas in agreement:
+        //   * floats are quantised (`.float`) to 1/8 unit, so sub-unit rounding never disagrees;
+        //   * collections whose Vec ORDER is incidental (bullets/loot/pickups) are XOR-folded with
+        //     `xor_fold` — XOR is commutative, so any iteration order yields the same total.
+        // Maps (ships, factions) are walked in sorted-key order so they too are order-stable.
+        let mut world = Digest::new(0xcbf29ce484222325);
+        world.int(self.tick).int(self.sector.sx as u64).int(self.sector.sy as u64).int(self.rules.version);
 
-        // Ships: sorted by id (stable order).
-        let mut ids: Vec<&String> = self.ships.keys().collect();
-        ids.sort();
-        for id in ids {
+        // Ships, in id order.
+        let mut ship_ids: Vec<&String> = self.ships.keys().collect();
+        ship_ids.sort();
+        for id in ship_ids {
             let s = &self.ships[id];
-            mix(&mut h, fnv1a(id) as u64);
-            mix(&mut h, q(s.x));
-            mix(&mut h, q(s.y));
-            mix(&mut h, q(s.vx));
-            mix(&mut h, q(s.vy));
-            mix(&mut h, q(s.a));
-            mix(&mut h, s.hp as i64 as u64);
-            mix(&mut h, s.minerals as u64);
-            mix(&mut h, s.kills as u64);
-            mix(&mut h, s.guns as u64);
-            mix(&mut h, s.alive as u64);
-            mix(&mut h, s.role as u64);
-            mix(&mut h, fnv1a(&s.weapon) as u64);
-            mix(&mut h, fnv1a(s.owner.as_deref().unwrap_or("")) as u64);
+            world
+                .text(id)
+                .float(s.x).float(s.y).float(s.vx).float(s.vy).float(s.a)
+                .sint(s.hp as i64).sint(s.shield as i64).sint(s.energy as i64)
+                .int(s.minerals as u64).int(s.kills as u64).int(s.guns as u64)
+                .int(s.alive as u64).int(s.role as u64)
+                .text(&s.weapon).text(s.owner.as_deref().unwrap_or(""));
+            for &remaining in &s.effects {
+                world.int(remaining as u64);
+            }
         }
 
-        // Bullets: order-independent (XOR fold), since the Vec order is an implementation detail.
-        let mut bsum: u64 = 0;
-        for b in &self.bullets {
-            let mut bh: u64 = 0x9e3779b97f4a7c15;
-            mix(&mut bh, fnv1a(&b.owner) as u64);
-            mix(&mut bh, q(b.x));
-            mix(&mut bh, q(b.y));
-            mix(&mut bh, b.dmg as i64 as u64);
-            mix(&mut bh, b.die_at);
-            bsum ^= bh;
-        }
-        mix(&mut h, bsum);
+        // Order-independent collections (the Vec order is an implementation detail, not game state).
+        world.int(xor_fold(&self.bullets, |b| {
+            Digest::new(BULLET_SEED).text(&b.owner).float(b.x).float(b.y).sint(b.dmg as i64).int(b.die_at).get()
+        }));
+        world.int(xor_fold(&self.loot, |l| {
+            Digest::new(LOOT_SEED).float(l.x).float(l.y).float(l.vx).float(l.vy).int(l.amount as u64).int(l.born).get()
+        }));
+        world.int(xor_fold(&self.pickups, |p| {
+            Digest::new(PICKUP_SEED).float(p.x).float(p.y).float(p.vx).float(p.vy).int(p.kind as u64).int(p.amount as u64).int(p.born).get()
+        }));
 
-        // Alloy loot: order-independent XOR fold (the Vec order is incidental). Folded in so a host
-        // that mints or palms floating loot diverges from the honest replica quorum.
-        let mut lsum: u64 = 0;
-        for lt in &self.loot {
-            let mut lh: u64 = 0x632be59bd9b4e019;
-            mix(&mut lh, q(lt.x));
-            mix(&mut lh, q(lt.y));
-            mix(&mut lh, q(lt.vx));
-            mix(&mut lh, q(lt.vy));
-            mix(&mut lh, lt.amount as u64);
-            mix(&mut lh, lt.born);
-            lsum ^= lh;
-        }
-        mix(&mut h, lsum);
-
-        // Factions: sorted by owner.
+        // Factions, in owner order.
         let mut owners: Vec<&String> = self.factions.keys().collect();
         owners.sort();
         for o in owners {
             let f = &self.factions[o];
-            mix(&mut h, fnv1a(o) as u64);
-            mix(&mut h, f.resources.minerals);
-            mix(&mut h, f.resources.energy);
-            mix(&mut h, f.resources.alloys);
-            mix(&mut h, f.buildings.len() as u64);
-            mix(&mut h, f.units.len() as u64);
-            mix(&mut h, f.power());
+            world
+                .text(o)
+                .int(f.resources.minerals).int(f.resources.energy).int(f.resources.alloys)
+                .int(f.buildings.len() as u64).int(f.units.len() as u64).int(f.power());
         }
-        h
+        world.get()
     }
 
     // ---- snapshot/cooldown plumbing ----
@@ -1856,7 +2224,7 @@ mod tests {
     #[test]
     fn accept_transit_admits_a_ship_with_carried_state() {
         let mut dst = Sim::for_sector(SectorId::new(1, 0), Arc::new(Ruleset::builtin()));
-        let mut snap = Ship::new("Ace".into(), 100, 0, "blaster".into(), 100).snap("n");
+        let mut snap = Ship::new("Ace".into(), 100, 0, "blaster".into(), 100, 0, 0).snap("n");
         snap.x = 5.0;
         snap.y = 1500.0;
         snap.minerals = 99;
@@ -2036,10 +2404,13 @@ mod tests {
             }
         }
         assert!(exploded, "the missile detonated (an explosion was emitted)");
-        let e1_hurt = s.ships.get("e1").map(|e| !e.alive || e.hp < 300).unwrap_or(true);
-        let e2_hurt = s.ships.get("e2").map(|e| !e.alive || e.hp < 300).unwrap_or(true);
+        // The blast may land on shields first, so "hurt" means the total of shield + hull dropped.
+        let hurt = |e: &Ship| !e.alive || (e.hp + e.shield) < (300 + e.max_shield);
+        let e1_hurt = s.ships.get("e1").map(hurt).unwrap_or(true);
+        let e2_hurt = s.ships.get("e2").map(hurt).unwrap_or(true);
         assert!(e1_hurt && e2_hurt, "area-of-effect blast damaged BOTH clustered enemies");
-        assert!(s.ships["g"].alive && s.ships["g"].hp == s.ships["g"].max_hp, "the firer's own ship is unharmed");
+        let g = &s.ships["g"];
+        assert!(g.alive && g.hp == g.max_hp && g.shield == g.max_shield, "the firer's own ship is unharmed");
     }
 
     #[test]
@@ -2183,7 +2554,7 @@ mod tests {
         assert!(b_dead_or_hurt, "the NPC fighter engaged the enemy");
 
         // Now kill the fighter and confirm the roster shrinks and the ship is gone (no respawn).
-        s.apply_damage(&fid, 9999, "B", s.tick);
+        s.apply_damage(&fid, Hit { dmg: 9999, bypass_shield: true, inflict: 255, inflict_ticks: 0 }, "B", s.tick);
         assert!(!s.ships.contains_key(&fid), "destroyed NPC is removed from the world");
         assert!(s.factions["A"].unit_count(UnitKind::Fighter) < before, "the loss struck the faction roster");
     }
@@ -2315,5 +2686,88 @@ mod tests {
         let snap = crate::snapshot::SectorSnapshot::capture(&s);
         let restored = snap.restore();
         assert_eq!(restored.loot.len(), n_loot, "floating loot is carried across a host handover");
+    }
+
+    #[test]
+    fn shields_absorb_before_hull_then_regenerate() {
+        let mut s = arena();
+        solo(&mut s);
+        s.join("v", "victim", 0);
+        let (hp0, sh0) = {
+            let v = &s.ships["v"];
+            (v.hp, v.shield)
+        };
+        assert!(sh0 > 0, "a fresh ship has shields");
+        // A small hit is fully soaked by the shield: hull untouched, shield down.
+        s.apply_damage("v", Hit { dmg: 20, bypass_shield: false, inflict: 255, inflict_ticks: 0 }, "x", s.tick);
+        assert_eq!(s.ships["v"].hp, hp0, "hull is untouched while shields hold");
+        assert_eq!(s.ships["v"].shield, sh0 - 20, "the shield absorbed it");
+        // Overflow past the shield spills into hull.
+        s.apply_damage("v", Hit { dmg: sh0, bypass_shield: false, inflict: 255, inflict_ticks: 0 }, "x", s.tick);
+        assert_eq!(s.ships["v"].shield, 0);
+        assert_eq!(s.ships["v"].hp, hp0 - 20, "the part beyond the shield hit hull");
+        // After the regen delay, the shield ticks back up.
+        let drained = s.ships["v"].shield;
+        for _ in 0..(Tunables::default().shield_regen_delay + 30) {
+            s.tick(1.0);
+        }
+        assert!(s.ships["v"].shield > drained, "shields recharge after a lull");
+    }
+
+    #[test]
+    fn energy_gates_firing_and_refills() {
+        let mut s = arena();
+        solo(&mut s);
+        s.join("g", "gun", 0);
+        // Drain the bank dry; the next shot cannot go.
+        s.ships.get_mut("g").unwrap().energy = 0;
+        let bullets_before = s.bullets.len();
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
+        s.tick(1.0);
+        assert_eq!(s.bullets.len(), bullets_before, "no energy -> the shot is withheld");
+        // Energy refills over time (keep the ship alive with neutral input so it doesn't idle out).
+        for _ in 0..20 {
+            s.apply_intent("g", Intent { fire: false, ..Default::default() }, 0);
+            s.tick(1.0);
+        }
+        assert!(s.ships["g"].energy > 0, "energy regenerates");
+        s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
+        s.tick(1.0);
+        assert!(s.bullets.len() > bullets_before, "with energy restored it fires");
+    }
+
+    #[test]
+    fn a_kill_drops_a_collectible_pickup() {
+        let mut s = arena();
+        solo(&mut s);
+        s.join("killer", "K", 0);
+        s.join("victim", "V", 30);
+        {
+            let v = s.ships.get_mut("victim").unwrap();
+            v.x = 1500.0;
+            v.y = 1500.0;
+        }
+        // A lethal, shield-bypassing hit kills the victim, which sheds a pickup.
+        s.apply_damage("victim", Hit { dmg: 99999, bypass_shield: true, inflict: 255, inflict_ticks: 0 }, "killer", s.tick);
+        assert_eq!(s.pickups.len(), 1, "a wreck drops one power-up");
+        // Park the killer on the drop; the magnet pulls it in and grants its boon.
+        let pk = s.pickups[0];
+        for _ in 0..40 {
+            if let Some(k) = s.ships.get_mut("killer") {
+                k.x = pk.x;
+                k.y = pk.y;
+                k.vx = 0.0;
+                k.vy = 0.0;
+                // pre-damage the killer so a repair pickup is observable
+                k.hp = (k.max_hp - 25).max(1);
+                k.shield = 0;
+                k.energy = 0;
+            }
+            s.tick(1.0);
+            if s.pickups.is_empty() {
+                break;
+            }
+        }
+        assert!(s.pickups.is_empty(), "the pickup was magnetically collected");
     }
 }

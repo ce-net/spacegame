@@ -169,8 +169,10 @@ fn homing_missile_flies_in_and_explodes_with_area_damage() {
         }
     }
     assert!(exploded, "the missile detonated");
-    let e1_hurt = s.ships.get("e1").map(|e| !e.alive || e.hp < 400).unwrap_or(true);
-    let e2_hurt = s.ships.get("e2").map(|e| !e.alive || e.hp < 400).unwrap_or(true);
+    // Damage may land on shields before hull, so count both: "hurt" = total of shield + hull dropped.
+    let hurt = |e: &spacegame::sim::Ship| !e.alive || (e.hp + e.shield) < (400 + e.max_shield);
+    let e1_hurt = s.ships.get("e1").map(hurt).unwrap_or(true);
+    let e2_hurt = s.ships.get("e2").map(hurt).unwrap_or(true);
     assert!(e1_hurt && e2_hurt, "the blast damaged BOTH clustered enemies (area of effect)");
     assert!(s.ships["g"].hp == s.ships["g"].max_hp, "the firer is unharmed by its own blast");
 }
