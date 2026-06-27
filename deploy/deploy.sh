@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # Deploy spacegame as a FIRST-CLASS ce-net app — exactly like ce-hub / ce-serve / drift, and NOT as a
-# bundled "demo". Two halves, both built natively ON the relay (the deploy target), never on the laptop:
+# bundled "demo". Spacegame is a DECENTRALIZED game: the active PLAYERS are the server (each player's node
+# runs the full authoritative Sim for the region it is in; they reconcile by quorum state-hash merge). The
+# relay is NOT the game authority — it is ce-net TRANSPORT (libp2p relay / NAT traversal so players reach
+# each other over the global internet) plus, optionally, one warm genesis SEED replica. Two halves, both
+# built natively ON the relay (the deploy target), never on the laptop:
 #
-#   1. BACKEND  — the adaptive-galaxy node: the real Rust `spacegame` binary, installed to
-#                 /opt/ce-build/spacegame and run as the `spacegame-node` systemd service (genesis host +
-#                 leaderless controller + browser gateway, hot-reloadable ruleset). This is the
-#                 planet-scale server (see GALAXY-SCALE.md) — it hosts the genesis cell and splits a hot
-#                 leaf into four children across the mesh under load.
+#   1. SEED     — a single lightweight, non-authoritative `spacegame host` replica pinned to the genesis
+#                 ring (the `spacegame-seed` systemd service), so the region stays warm and the first
+#                 player always has a peer to bootstrap/merge against. It is one vote in the quorum,
+#                 outvoted by the player majority. This REPLACES the old planet-scale `spacegame-node`
+#                 (gateway + leaderless controller + autoscale); that machinery (see GALAXY-SCALE.md) is
+#                 no longer deployed — players carry the compute.
 #   2. FRONTEND — the browser client (spacegame-wasm: Rust -> WASM + wgpu), built with wasm-pack and
 #                 published to the hub as app id `spa`, so it serves at https://spa.ce-net.com/
 #                 (the *.ce-net.com -> hub app mapping) and https://ce-net.com/apps/spa/.
 #
 # Usage:
 #   bash deploy/deploy.sh            # build + install both halves on the relay
-#   bash deploy/deploy.sh backend    # just the adaptive-galaxy node service
+#   bash deploy/deploy.sh seed       # just the genesis seed replica service (alias: backend)
 #   bash deploy/deploy.sh frontend   # just the browser client -> hub app
 #   bash deploy/deploy.sh dns        # ensure the spa.ce-net.com Cloudflare record
 #
@@ -37,39 +42,45 @@ sync() { # <localdir> <remote-name>
   rsync -az --delete "${EXC[@]}" -e "$RSH" "$1/" "$RELAY:$REMOTE/$2/"
 }
 
-backend() {
-  echo "==> sync the SDK + its ce-rs path dep, build the spacegame host natively on the relay"
-  # The backend binary needs the mesh feature (ce-rs). ce-rs is a sibling path dep (../ce-rs), so place
-  # it beside spacegame under $REMOTE so the relative path resolves on the relay (same as ce-hub).
+seed() {
+  echo "==> sync the SDK + its ce-rs path dep, build the spacegame binary natively on the relay"
+  # The binary needs the mesh feature (ce-rs). ce-rs is a sibling path dep (../ce-rs), so place it beside
+  # spacegame under $REMOTE so the relative path resolves on the relay (same as ce-hub).
   sync "$SIBS/ce-rs"     ce-rs
   sync "$HERE"           spacegame
   "${SSH[@]}" "$RELAY" 'source $HOME/.cargo/env; cd '"$REMOTE"'/spacegame && (cargo build --release > /tmp/spacegame-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-build.log; exit $rc)'
-  echo "==> install binary, seed the hot-reloadable ruleset, install + (re)start the adaptive-galaxy node"
-  rsync -az -e "$RSH" "$HERE"/deploy/spacegame-node.service "$RELAY:/etc/systemd/system/spacegame-node.service"
+  echo "==> install binary, seed the hot-reloadable ruleset, install + (re)start the genesis SEED replica"
+  rsync -az -e "$RSH" "$HERE"/deploy/spacegame-seed.service "$RELAY:/etc/systemd/system/spacegame-seed.service"
   "${SSH[@]}" "$RELAY" '
     # Install runtime artifacts to a dir OUTSIDE the synced source tree, so `deploy.sh frontend` (which
     # re-syncs the sources with rsync --delete) can never delete the running binary or live ruleset.
     mkdir -p /opt/ce-build/spacegame-run &&
     install -m755 '"$REMOTE"'/spacegame/target/release/spacegame /opt/ce-build/spacegame-run/spacegame.new &&
     mv -f /opt/ce-build/spacegame-run/spacegame.new /opt/ce-build/spacegame-run/spacegame &&
-    # Seed the live ruleset file the node watches (built-in template) if it is not there yet, so a
-    # designer can edit /opt/ce-build/spacegame-run/live.json on the relay and hot-reload the galaxy.
+    # Seed the live ruleset file the seed watches (built-in template) if it is not there yet, so a
+    # designer can edit /opt/ce-build/spacegame-run/live.json on the relay and hot-reload every player.
     [ -f /opt/ce-build/spacegame-run/live.json ] || /opt/ce-build/spacegame-run/spacegame ruleset init /opt/ce-build/spacegame-run/live.json &&
-    # Retire the old pinned-sector host if it was ever installed; the adaptive node supersedes it.
+    # DECENTRALIZE: retire the relay-side AUTHORITATIVE game servers. The planet-scale adaptive node
+    # (gateway + controller + autoscale) and the old pinned-sector host are gone; players are the server.
+    # The relay keeps only its TRANSPORT role (ce-relay) + this one warm genesis seed replica.
+    systemctl disable --now spacegame-node >/dev/null 2>&1 || true &&
     systemctl disable --now spacegame-host >/dev/null 2>&1 || true &&
-    # The node makes mutating mesh calls (subscribe/publish/mesh_deploy) that need the local CE node API
-    # token. The unit runs with ProtectHome=true (so it cannot read ~/.local/share/ce/api.token), so we
-    # inject the token via a drop-in the SDK reads from $CE_API_TOKEN — secret kept OUT of the repo unit,
-    # exactly like ce-hub/ce-monitor.
-    mkdir -p /etc/systemd/system/spacegame-node.service.d &&
-    printf "[Service]\nEnvironment=CE_API_TOKEN=%s\n" "$(cat /root/.local/share/ce/api.token)" > /etc/systemd/system/spacegame-node.service.d/api-token.conf &&
-    chmod 600 /etc/systemd/system/spacegame-node.service.d/api-token.conf &&
-    systemctl daemon-reload && systemctl enable spacegame-node >/dev/null 2>&1 &&
-    systemctl restart spacegame-node && sleep 2 &&
-    printf "service: " && systemctl is-active spacegame-node &&
-    journalctl -u spacegame-node -n 8 --no-pager | sed "s/^/    /"'
-  echo "==> spacegame adaptive-galaxy node live on the relay (genesis hosted; controller + gateway running)"
+    rm -f /etc/systemd/system/spacegame-node.service /etc/systemd/system/spacegame-host.service &&
+    rm -rf /etc/systemd/system/spacegame-node.service.d &&
+    # The seed makes mutating mesh calls (subscribe/publish) that need the local CE node API token. The
+    # unit runs with ProtectHome=true (so it cannot read ~/.local/share/ce/api.token), so we inject the
+    # token via a drop-in the SDK reads from $CE_API_TOKEN — secret kept OUT of the repo unit.
+    mkdir -p /etc/systemd/system/spacegame-seed.service.d &&
+    printf "[Service]\nEnvironment=CE_API_TOKEN=%s\n" "$(cat /root/.local/share/ce/api.token)" > /etc/systemd/system/spacegame-seed.service.d/api-token.conf &&
+    chmod 600 /etc/systemd/system/spacegame-seed.service.d/api-token.conf &&
+    systemctl daemon-reload && systemctl enable spacegame-seed >/dev/null 2>&1 &&
+    systemctl restart spacegame-seed && sleep 2 &&
+    printf "service: " && systemctl is-active spacegame-seed &&
+    journalctl -u spacegame-seed -n 8 --no-pager | sed "s/^/    /"'
+  echo "==> spacegame genesis seed live on the relay (warm peer near origin; players are the server)"
 }
+# Back-compat alias: the relay half used to be the authoritative "backend"; it is now just a seed.
+backend() { seed; }
 
 frontend() {
   echo "==> sync the frontend crate + its path deps, build the wasm bundle on the relay"
@@ -169,12 +180,13 @@ smoke() {
 # bare map.ce-net.com — that host is reserved for a future ce-net-wide donator/network map.
 
 case "${1:-all}" in
-  backend)  backend ;;
+  seed)     seed ;;
+  backend)  seed ;;   # back-compat alias
   frontend) frontend ;;
   dns)      dns ;;
   unshadow) unshadow ;;
   smoke)    smoke ;;
-  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; backend; frontend; unshadow; smoke ;;
-  *) echo "usage: deploy.sh [all|backend|frontend|dns|unshadow|smoke]"; exit 1 ;;
+  all)      dns || echo "    (skipped DNS — no CLOUDFLARE_API_TOKEN)"; seed; frontend; unshadow; smoke ;;
+  *) echo "usage: deploy.sh [all|seed|frontend|dns|unshadow|smoke]"; exit 1 ;;
 esac
 echo "==> done"

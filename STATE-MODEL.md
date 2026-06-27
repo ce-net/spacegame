@@ -233,3 +233,23 @@ enrolment via capability-delegated bootstrap / one-time enrol token [fresh VM se
 (3) flip READ enforcement on — require `read:<name>` cap on KV gets [today reads are advisory]; (4) make
 the vault KV a shared node service, not coupled inside ce-cast. Captured in PLAN + the ce-iam memory. The
 distributed harness already has an enroll_account stage; all tests in test/distributed/.)
+
+### Refinement (same session) — simplify the relay to a SEED, don't fully delete it
+
+> We might not want to completely remove the relay but at least simplify it to make all players host the game together globally
+
+> and we need the relay to make the nodes talk to eachtother over global internet of course. but we will have millions of relays in the future
+
+(=> DECISION (Leif picked "lightweight seed peer"). The relay is NOT deleted. Two roles, kept separate:
+  - TRANSPORT (essential, always): the relay is how nodes reach each other over the global internet —
+    libp2p relay / NAT traversal / DCUtR + the `/mesh-bridge` wss + ce-serve static hosting of the wasm.
+    This stays. (Future: millions of relays — transport itself decentralizes; out of scope now.)
+  - SEED (simplified game role): instead of the planet-scale `spacegame node` (gateway + leaderless
+    controller + autoscale + cell-splitting), the relay runs a plain, lightweight genesis seed
+    (`spacegame host` over the genesis ring) so the region stays warm and the first player always has a
+    peer to bootstrap/merge against. The seed holds NO special authority — it is one replica among the
+    players and is outvoted by the player majority through the quorum state-hash merge
+    (`replication::agree` + `merge_to_quorum_if_outvoted`). All active players host the game together; the
+    seed is just an always-on participant near genesis.
+  The teleport-to-centre bug is fixed in the PLAYER clients (cross-sector re-homing in `replica::Replica`),
+  not by the seed — with players hosting, there is no host-side `readmit_coords` to mask it.)

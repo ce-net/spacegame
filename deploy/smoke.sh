@@ -106,8 +106,14 @@ sid=$(curl -s -m 15 -A "Mozilla/5.0 (smoke)" "$BASE/ce/status" | grep -oE '"node
 [ -n "$sid" ] || fail "/ce/status returned no node_id"
 echo "    ok: ce-serve serving + mesh bridge injected; node $sid"
 
-echo "==> smoke 3/3: a joining player's ship is delivered over the live /ce SSE bridge"
-python3 - "$BASE" <<'PY' || fail "joining player's ship never arrived over the public /ce SSE bridge (the no-ship regression)"
+# DECENTRALIZED MODEL: spacegame has no relay game authority — the active PLAYERS are the server (each
+# runs the full Sim and they reconcile by quorum; see NETCODE.md). The relay keeps only ce-net TRANSPORT
+# plus ONE warm genesis SEED replica so a region near origin is never cold. This step proves that seed +
+# the live public bridge: publish a join on the genesis `/in` and assert a `/state` carrying our ship
+# comes back. (The player-hosted cross-sector path — and the teleport fix — is covered deterministically
+# by the `spacegame::replica` unit tests, which a deploy gate can't drive through a real browser.)
+echo "==> smoke 3/3: the genesis seed answers a join with our ship over the live /ce SSE bridge"
+python3 - "$BASE" <<'PY' || fail "joining player's ship never arrived over the public /ce SSE bridge (genesis seed down, or the no-ship bridge regression)"
 import sys, json, binascii, threading, urllib.request
 base = sys.argv[1]
 UA = {"User-Agent": "Mozilla/5.0 (smoke)"}

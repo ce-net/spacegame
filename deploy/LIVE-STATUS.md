@@ -1,22 +1,25 @@
 # spacegame — live deployment status (spa.ce-net.com)
 
-The **adaptive galaxy** (GALAXY-SCALE.md) is wired, built, and deployed live. This file records exactly
-what is running, what is proven, and the honest remaining rungs to literal "millions."
+**DECENTRALIZED (2026-06-27):** spacegame has no relay game authority — the active PLAYERS are the server.
+Each player's node runs the full authoritative `Sim` for its region and they reconcile by quorum
+state-hash merge (NETCODE.md). The relay was demoted from the planet-scale adaptive node to (a) ce-net
+TRANSPORT and (b) one warm, non-authoritative genesis SEED replica. This file records what is running,
+what is proven, and the honest remaining rungs.
 
 ## Live now
 
 - **URL:** https://spa.ce-net.com/ (also https://ce-net.com/apps/spa/). Page, `boot.js`, the wgpu WASM
   bundle (`application/wasm`), and the gateway directory (`/galaxy/gateways.json`) all serve 200.
-- **Backend:** `spacegame-node.service` on the relay (`spacegame node --gateway --region eu-central
-  --hz 20 --max-depth 3 --split-players 60 --ruleset live.json`). It runs the real adaptive-galaxy
-  daemon: hosts the **genesis cell** in-process (on the legacy `0_0` play token so the shipped client
-  connects unchanged), runs the **leaderless controller** (rendezvous-HRW ownership → `Autoscaler::decide`
-  → split/merge over real `mesh_deploy` + gossiped `ShapeCommit`s), heartbeats the control plane, and
-  serves as a browser **gateway**. Hot-reloads `live.json`.
-- **Transport:** the WASM client reaches the genesis cell through the same-origin `/ce` mesh bridge (nginx
-  → relay CE node, token injected server-side). The node **self-delivers** its own `/state` snapshots to
-  the bridged client.
-- **`spacegame galaxy`** prints the live quadtree shape from the shape/control gossip.
+- **Players are the server:** the wasm client ships the full `Sim` and runs it as a `replica::Replica`,
+  advancing to the shared wall-clock tick and rendering from its OWN state — it does not depend on any
+  relay-published `/state`. Players exchange tick-tagged inputs on the sector `/in` topic and merge by
+  quorum hash. Crossing a sector edge re-homes the replica onto the neighbour (no more teleport-to-centre).
+- **Seed:** `spacegame-seed.service` on the relay (`spacegame host --sector 0_0 1_0 -1_0 0_1 0_-1
+  --hz 60 --ruleset live.json`) — one lightweight, non-authoritative replica that keeps the genesis ring
+  warm and is outvoted by the player majority. The planet-scale `spacegame node` (gateway + leaderless
+  controller + autoscale) is **no longer deployed**. Hot-reloads `live.json`.
+- **Transport:** players reach each other (and the seed) through the same-origin `/ce` mesh bridge (nginx
+  → relay CE node, token injected server-side) over the relay's libp2p transport / NAT traversal.
 
 ## Proven (the hard distributed-systems parts)
 
@@ -51,12 +54,14 @@ into four across the relay's cores (and onto donor nodes as they join), bounded 
 
 ```
 ssh-add ~/.ssh/id_ed25519                # or any relay key in your agent
-bash deploy/deploy.sh                     # dns + backend + frontend
+bash deploy/deploy.sh                     # dns + seed + frontend
 ```
 
 Runtime artifacts install to `/opt/ce-build/spacegame-run/` (binary + `live.json`) — OUTSIDE the synced
-source tree, so a `frontend` re-sync can't clobber the running node. The node's API token is injected via
-a systemd drop-in (`/etc/systemd/system/spacegame-node.service.d/api-token.conf`), kept out of the repo.
+source tree, so a `frontend` re-sync can't clobber the running seed. The seed's API token is injected via
+a systemd drop-in (`/etc/systemd/system/spacegame-seed.service.d/api-token.conf`), kept out of the repo.
+The `seed` deploy step also disables + removes the old `spacegame-node` / `spacegame-host` units on the
+relay, so the demotion to a seed is idempotent.
 
 **Serving: ce-serve only.** `spa.ce-net.com` is served by **ce-serve** from a content-addressed bundle
 (`ce-serve-publish`), NOT the hub. ce-serve injects `/__ce/mesh-bridge.js`, so the page gets

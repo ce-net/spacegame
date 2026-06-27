@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::shard::SectorId;
 use crate::sim::Sim;
 use crate::wire::ClientMsg;
 
@@ -80,6 +81,49 @@ impl Replica {
     /// The authoritative simulation (read-only) — render from this; it is the same on every honest replica.
     pub fn sim(&self) -> &Sim {
         &self.sim
+    }
+
+    /// Which sector this replica is currently simulating. Changes when the local player crosses a sector
+    /// edge (see [`rehome_local_player`](Self::rehome_local_player)).
+    pub fn sector(&self) -> SectorId {
+        self.sim.sector
+    }
+
+    /// **Players ARE the server — including across sector edges.** Each player's node runs the full sim
+    /// for the region it is in; when the local player crosses an edge, that node must take over the
+    /// region it moved INTO rather than letting the ship fall off the world. Call this once per tick,
+    /// right after [`advance_to`](Self::advance_to), with the local player's id.
+    ///
+    /// The sim's seamless transit (see [`Sim::tick`]) removes any ship that crossed the edge and queues
+    /// it in `transit_out` (its `x/y` already wrapped into the neighbour's local coordinates). Here we
+    /// drain that queue:
+    /// * if the LOCAL player crossed, we re-home this replica onto the destination sector — a fresh
+    ///   [`Sim::for_sector`] (its own hazards / NPC factions) at the SAME shared tick, carrying the
+    ///   player's ship in with its full state — and return the new [`SectorId`] so the caller can move
+    ///   its `/in` subscription to the new region (where its peers, if any, already publish);
+    /// * any OTHER ship that crossed is simply released — the replicas hosting its destination own it now.
+    ///
+    /// Returns `Some(new_sector)` iff the local player moved (so the caller re-points its subscriptions),
+    /// `None` otherwise. With NO relay authority this is the ONLY place a cross-edge ship is preserved —
+    /// without it the ship vanishes and the next input auto-rejoins it at the sector centre (the
+    /// "teleport back to centre" bug).
+    pub fn rehome_local_player(&mut self, me: &str) -> Option<SectorId> {
+        let transits = self.sim.take_transits();
+        let mut moved = None;
+        for t in transits {
+            if t.ship.id == me {
+                let tick = self.sim.tick;
+                let mut next = Sim::for_sector(t.to, self.sim.rules.clone());
+                next.tick = tick;
+                next.accept_transit(t.ship);
+                self.sim = next;
+                // The old region's queued inputs do not apply in the new one; start its log clean.
+                self.scheduled.clear();
+                moved = Some(t.to);
+            }
+            // Non-local ships that left are not re-admitted here: their destination's replicas host them.
+        }
+        moved
     }
 
     /// This replica's deterministic state hash — its claim about the world, for the quorum merge.
@@ -250,6 +294,40 @@ mod tests {
             .map(|b| ((b.x - ship.x).powi(2) + (b.y - ship.y).powi(2)).sqrt())
             .fold(f32::INFINITY, f32::min);
         assert!(nearest < 150.0, "a bullet spawned from the player's position (nearest {nearest})");
+    }
+
+    #[test]
+    fn local_player_rehomes_across_a_sector_edge_instead_of_teleporting_to_centre() {
+        // The bug this guards: a player crossing a sector edge had their ship deleted (seamless transit
+        // with nothing draining the hand-off), and the next input auto-rejoined them at the sector CENTRE.
+        // With the players as the servers there is no relay to re-admit the ship, so the replica must
+        // re-home itself onto the region it moved into. No test flew a replica to an edge before — which
+        // is exactly why this shipped. This one does.
+        use crate::sim::{SECTOR_SIZE, SHIP_R};
+        let mut sim = Sim::new();
+        sim.join("me", "Me", 0);
+        sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
+        {
+            let s = sim.ships.get_mut("me").unwrap();
+            s.x = SECTOR_SIZE - 2.0;
+            s.y = 1500.0;
+            s.a = 0.0;
+            s.vx = 6.0; // carried velocity pushes it across the east edge on the next tick
+            s.minerals = 7;
+        }
+        let mut r = Replica::new(sim);
+        let start = r.tick();
+        r.advance_to(start + 3);
+        // The ship left this sector's sim — the exact moment the old code dropped it and re-spawned at centre.
+        assert!(!r.sim().ships.contains_key("me"), "the ship transited out of (0,0)");
+        let moved = r.rehome_local_player("me");
+        assert_eq!(moved, Some(SectorId::new(1, 0)), "re-homed east into (1,0)");
+        assert_eq!(r.sector(), SectorId::new(1, 0), "the replica now hosts the neighbour sector");
+        let s = r.sim().ships.get("me").expect("the ship was carried into the new sector, not lost");
+        assert_eq!(s.minerals, 7, "its full state crossed the boundary");
+        // The decisive assertions: entered at the WRAPPED edge coordinate, NOT teleported to the centre.
+        assert!(s.x < SHIP_R + 50.0, "entered at the west edge of the new sector (x={}), not mid-sector", s.x);
+        assert!((s.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT at the sector centre (the teleport bug)");
     }
 
     #[test]
