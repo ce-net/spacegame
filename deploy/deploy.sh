@@ -97,6 +97,10 @@ frontend() {
     STAGE=/opt/ce-build/spa-bundle
     rm -rf "$STAGE" && mkdir -p "$STAGE/galaxy"
     cp index.html boot.js galaxy-peer.js "$STAGE/"
+    # The opt-in in-tab libp2p peer (each tab = its own player over the relay's circuit relay). Pre-bundled
+    # locally with esbuild (npm run build:peer) and committed, so no npm is needed on the relay. boot.js
+    # loads it only with ?peer and falls back to the bridge on failure.
+    [ -f galaxy-peer.bundle.js ] && cp galaxy-peer.bundle.js "$STAGE/" || echo "    (no galaxy-peer.bundle.js — run: npm i && npm run build:peer)"
     cp galaxy/gateways.json "$STAGE/galaxy/"
     cp -r pkg "$STAGE/pkg"
     # CACHE-BUST: stamp boot.js with the wasm content hash so the browser loads a fresh, MATCHED glue+wasm
