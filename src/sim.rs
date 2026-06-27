@@ -2957,8 +2957,10 @@ mod tests {
         let after_hit = s.ships["v"].shield;
         s.tick(1.0);
         assert_eq!(s.ships["v"].shield, after_hit, "no regen during the post-hit delay");
-        // After the delay elapses, the shield climbs back toward max.
+        // After the delay elapses, the shield climbs back toward max. Keep the ship present with a
+        // neutral input each tick so it doesn't idle out (player_ttl) during the long quiet spell.
         for _ in 0..(Tunables::default().shield_delay + 60) {
+            s.apply_intent("v", Intent { fire: false, ..Default::default() }, 0);
             s.tick(1.0);
         }
         assert!(s.ships["v"].shield > after_hit, "shield regenerated out of combat");
