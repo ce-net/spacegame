@@ -92,6 +92,10 @@ pub const MAX_NAME: usize = 16;
 /// Mineral value range of an asteroid.
 pub const ROCK_MIN_VAL: u32 = 5;
 pub const ROCK_MAX_VAL: u32 = 30;
+/// Synthetic owner id for the marauder (hostile PvE) faction. It is *not* a real [`crate::faction::Faction`]
+/// — it owns no economy and never appears in the faction summaries — it is purely a tag that makes a ship
+/// hostile to everyone and aggressive. Marauder ships are `npc:marauders:*` and hunt the nearest target.
+pub const HOSTILE_OWNER: &str = "marauders";
 /// Acquire radius for a homing missile to lock the nearest enemy.
 pub const HOMING_ACQUIRE_R: f32 = 1100.0;
 
@@ -1073,12 +1077,20 @@ impl Sim {
             self.resolve_ship_collisions(&tree, &tun);
         }
 
-        // --- Pass 5: the always-alive factions tick every step, online or not, then their roster is
-        // reconciled into live NPC fleet ships in the world. ---
-        for f in self.factions.values_mut() {
-            f.tick();
+        // --- Pass 5: the always-alive factions tick on the coarse ECONOMY cadence (not every sim frame),
+        // so resources accrue and the fleet grows at a strategy pace instead of ballooning at 60 Hz. The
+        // roster is then reconciled into live NPC fleet ships every frame (cheap, keeps the world in sync
+        // after deaths/transits). ---
+        if tun.econ_interval_ticks <= 1 || now % tun.econ_interval_ticks == 0 {
+            for f in self.factions.values_mut() {
+                f.tick();
+            }
         }
         self.reconcile_fleets(&tun);
+
+        // --- Pass 5b: marauder raids. Periodically send a hostile wave at a sector that holds a live
+        // player, giving the fleet something to fight and turning mined minerals into a real stake. ---
+        self.spawn_enemies(&tun);
 
         // --- Pass 6: LOD rigid-body wreckage. Precision follows the players: debris near a ship is
         // simulated at high precision/iteration; far debris is coarse or merely registered. ---
@@ -1145,7 +1157,12 @@ impl Sim {
                 let Some(s) = self.ships.get(&id) else { continue };
                 (s.role, s.owner.clone().unwrap_or_default(), s.x, s.y)
             };
-            let cmd = self.factions.get(&owner).map(|f| f.command).unwrap_or_default();
+            // Marauders own no faction; they always hunt. Player fleet ships obey their faction's order.
+            let cmd = if owner.as_str() == HOSTILE_OWNER {
+                FactionCommand::AttackNearest
+            } else {
+                self.factions.get(&owner).map(|f| f.command).unwrap_or_default()
+            };
             let (tx, ty, want_fire) = self.npc_goal(&id, role, &owner, x, y, cmd, &tree);
             // ANTI-RAM: never steer an escort INTO its owner. If a unit ends up closer to its commanding
             // player than the standoff radius, push its goal radially outward so the fleet screens you
@@ -1373,6 +1390,60 @@ impl Sim {
         }
         for (id, owner, role, x, y, hp, hue) in spawns {
             let mut s = Ship::npc(role, owner, x, y, hp, hue, now);
+            s.outfit(tun);
+            self.ships.insert(id, s);
+        }
+    }
+
+    /// **Marauder raids** — the PvE threat. On the raid cadence, if the sector holds at least one live
+    /// player and is below the hostile cap, spawn a wave of [`HOSTILE_OWNER`] fighters at range around a
+    /// deterministically-chosen player. They hunt (the [`drive_npcs`](Self::drive_npcs) AttackNearest path)
+    /// and drop minerals on death. Fully deterministic — gated on the shared tick and seeded from it — so
+    /// every replica spawns the identical wave. Disabled when `enemy_wave_ticks == 0`.
+    fn spawn_enemies(&mut self, tun: &Tunables) {
+        if tun.enemy_wave_ticks == 0 || tun.enemy_max == 0 || tun.enemy_wave_size == 0 {
+            return;
+        }
+        let now = self.tick;
+        if now == 0 || now % tun.enemy_wave_ticks != 0 {
+            return;
+        }
+        // Only raid sectors with a live human to fight; and never exceed the alive-hostile cap.
+        let mut players: Vec<(String, f32, f32)> = self
+            .ships
+            .values()
+            .filter(|s| s.alive && s.owner.is_none())
+            .map(|s| (s.name.clone(), s.x, s.y))
+            .collect();
+        if players.is_empty() {
+            return;
+        }
+        let alive_hostiles = self
+            .ships
+            .values()
+            .filter(|s| s.alive && s.owner.as_deref() == Some(HOSTILE_OWNER))
+            .count() as u32;
+        if alive_hostiles >= tun.enemy_max {
+            return;
+        }
+        let room = (tun.enemy_max - alive_hostiles).min(tun.enemy_wave_size);
+
+        // Target a deterministically-chosen player (sorted, indexed by the tick) so all replicas agree.
+        players.sort_by(|a, b| a.0.cmp(&b.0));
+        let (px, py) = {
+            let pick = (now as usize / tun.enemy_wave_ticks.max(1) as usize) % players.len();
+            (players[pick].1, players[pick].2)
+        };
+
+        for k in 0..room {
+            let seed = fnv1a(&format!("raid:{now}:{k}"));
+            let ang = (seed % 3600) as f32 / 3600.0 * std::f32::consts::TAU;
+            let dist = tun.enemy_spawn_dist + ((seed >> 12) % 500) as f32;
+            let sx = (px + ang.cos() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+            let sy = (py + ang.sin() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+            let id = format!("npc:{HOSTILE_OWNER}:{now}:{k}");
+            // Hue 0 = an aggressive red, so marauders read instantly as a threat.
+            let mut s = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), sx, sy, tun.enemy_hp, 0, now);
             s.outfit(tun);
             self.ships.insert(id, s);
         }
@@ -2071,6 +2142,18 @@ impl Sim {
             self.spawn_pickup(victim, vx, vy, now);
         }
 
+        // A destroyed MARAUDER drops a mineral cache where it died — killing raiders is the core reward
+        // loop (fly through the loot to bank it). Player fleet wrecks still drop nothing (no self-farming).
+        let is_hostile = self.ships.get(victim).map(|v| v.owner.as_deref() == Some(HOSTILE_OWNER)).unwrap_or(false);
+        if is_hostile {
+            let value = self.rules.tunables.enemy_loot as f32;
+            if value > 0.0 && self.pickups.len() < 256 {
+                let x = vx.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                let y = vy.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                self.pickups.push(Pickup { kind: PickupKind::Minerals, x, y, value, hue: 40, die_at: now + 1800 });
+            }
+        }
+
         // An NPC fleet ship does not respawn: it is removed from the world and struck from its
         // faction's roster (you lose a ship and must build another). Player ships stay dead-but-present
         // for the respawn cooldown.
@@ -2721,6 +2804,71 @@ mod tests {
         s.apply_damage(&fid, 9999, "B", s.tick);
         assert!(!s.ships.contains_key(&fid), "destroyed NPC is removed from the world");
         assert!(s.factions["A"].unit_count(UnitKind::Fighter) < before, "the loss struck the faction roster");
+    }
+
+    #[test]
+    fn economy_advances_on_the_coarse_cadence_not_every_frame() {
+        // The faction economy must NOT step every 60 Hz sim frame (that is what balloons resources and
+        // hands you a full fleet in seconds) — it steps once per `econ_interval_ticks`.
+        let mut s = arena();
+        s.join("n", "p", 0);
+        let interval = Tunables::default().econ_interval_ticks;
+        assert!(interval > 1, "the default economy cadence is coarser than per-frame");
+        for _ in 0..(interval * 4) {
+            s.tick(1.0);
+        }
+        // In interval*4 sim ticks the economy stepped ~4 times (at multiples of the interval), not once
+        // per frame — so the faction's own clock advanced ~4, proving the gate.
+        let age = s.factions["n"].age_ticks;
+        assert!((3..=5).contains(&age), "economy ran on the coarse cadence (age={age}, interval={interval})");
+    }
+
+    #[test]
+    fn marauders_raid_a_sector_with_a_player_and_drop_loot() {
+        let mut s = arena();
+        let mut rules = crate::ruleset::Ruleset::builtin();
+        rules.tunables.enemy_wave_ticks = 5; // raid quickly so the test is fast
+        rules.tunables.enemy_wave_size = 2;
+        rules.tunables.enemy_max = 4;
+        s.apply_ruleset(std::sync::Arc::new(rules));
+        s.join("n", "p", 0);
+
+        // No raid before a player is present is impossible here (one joined); advance to the first raid.
+        for _ in 0..5 {
+            s.tick(1.0);
+        }
+        let hostiles: Vec<String> = s
+            .ships
+            .iter()
+            .filter(|(_, sh)| sh.owner.as_deref() == Some(HOSTILE_OWNER) && sh.alive)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert!(!hostiles.is_empty(), "a raid spawned marauders into a populated sector");
+        assert!(!s.factions.contains_key(HOSTILE_OWNER), "marauders own no economy/faction");
+
+        // Killing a marauder drops a mineral cache: the kill -> reward -> rebuild loop.
+        s.apply_damage(&hostiles[0], 99_999, "n", s.tick);
+        assert!(!s.ships.contains_key(&hostiles[0]), "the destroyed marauder is removed from the world");
+        assert!(
+            s.pickups.iter().any(|p| matches!(p.kind, PickupKind::Minerals)),
+            "a destroyed marauder dropped a mineral cache"
+        );
+    }
+
+    #[test]
+    fn no_raid_in_an_empty_sector() {
+        // PvE only harasses sectors that actually hold a live player — an empty sector stays quiet.
+        let mut s = arena();
+        let mut rules = crate::ruleset::Ruleset::builtin();
+        rules.tunables.enemy_wave_ticks = 5;
+        s.apply_ruleset(std::sync::Arc::new(rules));
+        for _ in 0..20 {
+            s.tick(1.0);
+        }
+        assert!(
+            !s.ships.values().any(|sh| sh.owner.as_deref() == Some(HOSTILE_OWNER)),
+            "no marauders spawn with no player to raid"
+        );
     }
 
     #[test]

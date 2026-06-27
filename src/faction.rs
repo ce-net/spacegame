@@ -278,7 +278,10 @@ impl Default for AutoPolicy {
             want_solar: 3,
             want_refineries: 2,
             want_factories: 2,
-            fighters_per_factory: 6,
+            // Keep the auto-built standing fleet modest — it should be a screen of escorts you grow into,
+            // not an instant deathball. The player tops it up with explicit orders and earns more by
+            // surviving raids; combined with marauder attrition this keeps the fleet dynamic, not maxed.
+            fighters_per_factory: 3,
             want_shipyard: true,
             enabled: true,
         }
