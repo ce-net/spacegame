@@ -268,10 +268,38 @@ pub struct Tunables {
     /// How far from the targeted player a raid spawns in (world units) — far enough to see them coming.
     #[serde(default = "default_enemy_spawn_dist")]
     pub enemy_spawn_dist: f32,
+    /// **Mining rate.** Hull points a ship grinds off an asteroid each tick it is in reach (rocks have
+    /// 18–48 hp). Lower = mining takes longer and feels more deliberate; the rock shatters into alloy
+    /// nuggets when its hull hits zero. `0` is clamped to 1.
+    #[serde(default = "default_mine_rate")]
+    pub mine_rate: u32,
+    /// **Alloy magnetism — radius.** How close (world units) an alloy nugget must be to a ship before it
+    /// is drawn in and glides toward it.
+    #[serde(default = "default_magnet_radius")]
+    pub magnet_radius: f32,
+    /// **Alloy magnetism — pull.** Base acceleration (world units/tick²) applied to a nugget toward the
+    /// nearest ship; it strengthens as the nugget closes, so the scoop accelerates.
+    #[serde(default = "default_magnet_accel")]
+    pub magnet_accel: f32,
+    /// **Alloy magnetism — terminal speed.** Cap (world units/tick) a magnetised nugget glides at.
+    #[serde(default = "default_magnet_max_speed")]
+    pub magnet_max_speed: f32,
 }
 
 fn default_max_fleet() -> u32 {
     16
+}
+fn default_mine_rate() -> u32 {
+    3
+}
+fn default_magnet_radius() -> f32 {
+    420.0
+}
+fn default_magnet_accel() -> f32 {
+    0.55
+}
+fn default_magnet_max_speed() -> f32 {
+    14.0
 }
 fn default_econ_interval() -> u64 {
     15
@@ -336,6 +364,10 @@ impl Default for Tunables {
             enemy_hp: 70,
             enemy_loot: 40,
             enemy_spawn_dist: 1600.0,
+            mine_rate: 3,
+            magnet_radius: 420.0,
+            magnet_accel: 0.55,
+            magnet_max_speed: 14.0,
         }
     }
 }
@@ -1254,7 +1286,71 @@ fn builtin_blueprints() -> Vec<Blueprint> {
         ])],
     );
 
-    vec![pod, scout, core, wing, engine, nose]
+    // --- Flyable PLAYER ship designs, built from the parts catalogue. These are what `ClientMsg::Fit`
+    // refits you to; their thrust-to-weight (see `crate::shipyard`) makes the light one a darting
+    // interceptor, the heavy ones slow and tough. Each has a command centre + reactor inside a structure
+    // (so it is valid) and at least one engine (so it flies). ---
+
+    // INTERCEPTOR — light hull, twin engines, one gun: top speed and agility, thin armour.
+    let interceptor = bp(
+        "interceptor",
+        "Interceptor",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("reactor", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            Placement::object("thruster", Transform2D::new(-0.8, -1.7, 0.0)),
+            Placement::object("thruster", Transform2D::new(0.8, -1.7, 0.0)),
+            Placement::object("gun", Transform2D::new(0.0, 1.7, 0.0)),
+            Placement::object("armor-wedge", Transform2D::new(0.0, 2.4, 0.0)),
+        ],
+    );
+
+    // GUNSHIP — a heavier weapons platform: twin turrets, a missile rack and armour. Strong but slower.
+    let gunship = bp(
+        "gunship",
+        "Gunship",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("reactor", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            Placement::object("struct-block", Transform2D::new(0.0, 2.4, 0.0)),
+            Placement::object("thruster", Transform2D::new(-0.9, -1.8, 0.0)),
+            Placement::object("thruster", Transform2D::new(0.9, -1.8, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(-2.6, 0.8, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.6, 0.8, 0.0)),
+            Placement::object("missile-rack", Transform2D::new(0.0, 2.0, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(-1.4, 3.4, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(1.4, 3.4, 0.0)),
+        ],
+    );
+
+    // HAULER — a freighter: big cargo, lots of mass, a single defensive gun. Slow, tough, hauls ore.
+    let hauler = bp(
+        "hauler",
+        "Hauler",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("reactor", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            Placement::object("thruster", Transform2D::new(-1.0, -2.0, 0.0)),
+            Placement::object("thruster", Transform2D::new(1.0, -2.0, 0.0)),
+            Placement::object("container", Transform2D::new(-2.2, 0.0, 0.0)),
+            Placement::object("container", Transform2D::new(2.2, 0.0, 0.0)),
+            Placement::object("container", Transform2D::new(-2.2, 2.4, 0.0)),
+            Placement::object("container", Transform2D::new(2.2, 2.4, 0.0)),
+            Placement::object("tank-rect", Transform2D::new(0.0, 2.4, 0.0)),
+            Placement::object("tank-round", Transform2D::new(0.0, 4.2, 0.0)),
+            Placement::object("gun", Transform2D::new(0.0, -0.4, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(-1.4, 4.6, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(1.4, 4.6, 0.0)),
+        ],
+    );
+
+    vec![pod, scout, core, wing, engine, nose, interceptor, gunship, hauler]
 }
 
 /// A small hot-reloadable shape library, referenced by id or edited to restyle many blocks at once.

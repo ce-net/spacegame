@@ -187,6 +187,30 @@ Work items toward the full model above (not yet done):
   released; solo-dev ⇒ resets; crowded region ⇒ continues, held by the players' nodes).
 - **Distributed save** so the aggregate state is the union of per-region slices on players' nodes.
 
+### Entity-anchored authority — "no sector clamping" (2026-06-28)
+
+The seam-free answer to *"I hate sector clamping — the sectors should ADAPT to players"* and to the
+chunk request *"recursive AABB which follows the player and its ships and factions."* New pure core
+`src/domain.rs` (design: `DOMAINS.md`). Authority is anchored to **entities, not coordinates**: each
+player owns a **domain** — a recursive AABB bounding their ship + fleet + faction that **moves with
+them**, so the owner is never transited (no seam under the player to cross). Overlap of two domains *is*
+the interest relation (broad-phase `DomainTree`, `O(log n + k)`); neutral environment (asteroids,
+hazards) is **claimed by the nearest domain** and simulated on that player's node *for everyone who can
+see it* — so each player brings the compute for itself **and its patch of world**, and empty space costs
+nothing. Pure + deterministic (env owner is a sticky function with hysteresis, recomputed each tick — no
+discrete crossing event), so the quorum merge agrees on *who-simulates-what* with no coordinator.
+
+**Wired (2026-06-28):** (1) world-frame bridge `DomainField::from_sim` + `world_pos` + `Bounds::sectors`
+(sector-local f32 sim → absolute f64 domains, ships grouped by authority owner); (2) seamless interest on
+the replica — `Replica::interest_sectors` returns 1 sector mid-sector, 2 on an edge, 4 on a corner,
+growing with the fleet, replacing the fixed 8-neighbour ring; (3) the live map end-to-end — hosts gossip
+`DomainFrame` bubbles on `topics::DOMAINS`, the node loops fold them via `MapModel::on_domains`, and
+`player_domains()` / `MapSummary::live_players` surface the moving "who is where" dots. 239 pure + 248
+mesh lib tests green. **Remaining:** the wasm/native clients must call `interest_sectors` to drive their
+subscriptions, and the tick loop must call `claim_sticky` to assign neutral-environment ownership (see
+the ladder in `DOMAINS.md`). The `galaxy.rs` grid quadtree is kept only as the coarse addressing/
+rendezvous layer; play lives in the moving bubbles.
+
 ---
 
 ## ce-iam = universal identity (verbatim, 2026-06-27)

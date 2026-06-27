@@ -80,6 +80,13 @@ pub enum ClientMsg {
     #[serde(rename = "weapon")]
     Weapon { id: String },
 
+    /// **Build & fit a ship from a blueprint.** `blueprint` is a ship-blueprint id in the live ruleset's
+    /// catalogue (e.g. `"interceptor" | "gunship" | "hauler"`). The host resolves the design's parts,
+    /// derives its loadout, and refits your ship if the design is flyable — otherwise it is ignored and
+    /// you keep your current ship. The single hook from the build system into the live game.
+    #[serde(rename = "fit")]
+    Fit { blueprint: String },
+
     /// Command your faction's NPC fleet. `order` is one of
     /// `"defend" | "follow" | "mine" | "hold" | "attack" | "attackmove"`; `attackmove` uses `x`/`y`.
     #[serde(rename = "command")]
@@ -289,7 +296,8 @@ pub struct PickupView {
     pub y: i32,
     pub hue: u32,
     /// Pickup kind code (see [`crate::sim::PickupKind::code`]):
-    /// `0 = repair, 1 = shield, 2 = energy, 3 = overcharge, 4 = minerals`.
+    /// `0 = repair, 1 = shield, 2 = energy, 3 = overcharge, 4 = minerals, 5 = alloy` (a mined nugget
+    /// that magnetises toward a ship — render it streaking when it has velocity).
     pub kind: u8,
 }
 

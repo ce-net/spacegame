@@ -93,21 +93,15 @@ impl ClientProfile {
         server_tick % d == 0
     }
 
-    /// The sectors this client subscribes to, given its world position: the centre sector and as many
-    /// of its neighbours as the budget allows (9 = full ring, 5 = plus-shaped, else just the centre).
+    /// The sectors this client subscribes to, given its **world** position `(x, y)`. Domain-driven (see
+    /// [`crate::domain`]): the set of sectors the client's viewport bubble — the box `(x, y) ±
+    /// view_radius` — actually overlaps. That is **one** sector when the player is mid-sector, **two** on
+    /// an edge, **four** on a corner, and it slides as the player moves, so interest *follows the player*
+    /// instead of snapping a fixed 3×3 ring at the seam. Replaces the old ring/plus heuristic; the
+    /// `interest_sectors` budget is now expressed as the `view_radius` itself (mobile's smaller radius
+    /// keeps it on one sector longer).
     pub fn interest_set(&self, x: f32, y: f32) -> Vec<SectorId> {
-        let centre = SectorId::containing(x, y);
-        match self.interest_sectors {
-            n if n >= 9 => centre.neighbors(),
-            n if n >= 5 => vec![
-                centre,
-                SectorId::new(centre.sx + 1, centre.sy),
-                SectorId::new(centre.sx - 1, centre.sy),
-                SectorId::new(centre.sx, centre.sy + 1),
-                SectorId::new(centre.sx, centre.sy - 1),
-            ],
-            _ => vec![centre],
-        }
+        crate::domain::Bounds::around(x as f64, y as f64, self.view_radius as f64).sectors()
     }
 }
 

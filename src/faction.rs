@@ -523,6 +523,12 @@ impl Faction {
     pub fn deposit_minerals(&mut self, amount: u64) {
         self.resources.minerals = self.resources.minerals.saturating_add(amount);
     }
+
+    /// Credit refined **alloy** into the stockpile — what a shattered asteroid's nuggets bank to. Alloy
+    /// is the input the shipyard and high-tier buildings consume (see [`Resources`]).
+    pub fn deposit_alloys(&mut self, amount: u64) {
+        self.resources.alloys = self.resources.alloys.saturating_add(amount);
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,114 @@
+# Entity-anchored authority — the world follows the player
+
+> "I hate sector clamping — the sectors should ADAPT to players and other servers should automatically
+> take over." — Leif (`STATE-MODEL.md`, verbatim)
+
+This is the answer to that directive, and to "make chunks/sections seamless — no lag transitions and
+ideally no transition required at all… recursive AABB which follows the player and its ships and
+factions." It is the design and API of `src/domain.rs`.
+
+## The problem with a grid
+
+The adaptive galaxy (`galaxy.rs`) is real and it scales: space is a power-of-two quadtree, hot cells
+split, cold cells merge, no coordinator. But every cut is **fixed in space**. A pilot loitering on a
+cell seam crosses a boundary every few seconds, and every crossing is a hand-off — a `Sim` transit, a
+re-subscription, a snapshot adopt. That is the lag transition. **A grid can never be seamless _for the
+owner_, because the owner moves and the grid does not.** At Earth scale, played as a single human-sized
+ship, you are *always* near some seam.
+
+## The one idea
+
+**Anchor authority to entities, not to coordinates.** Each player owns a **domain**: a recursive AABB
+that bounds the things that player is authoritative for — their ship, their fleet, their faction's
+structures — and therefore **moves with them**. The player sits at the centre of their own bubble and
+**never crosses a boundary**, because the boundary travels with the ship. "Your own node is the server
+for you" is exactly this: your node hosts your domain, your domain is always centred on you, your
+authority is always zero-RTT and is never handed off.
+
+```text
+  faction box  ────────────────────────────────────┐   the Domain's outer bound
+  │   fleet box ───────────────────┐                │   (what others replicate to see you)
+  │   │  ship □ (you)              │   ◦ structure  │
+  │   │     ◦ wingman  ◦ wingman   │     ◦ structure│
+  │   └────────────────────────────┘                │
+  └─────────────────────────────────────────────────┘
+```
+
+The AABB is **recursive** — the faction box is the union of the fleet box and the structure boxes; the
+fleet box is the union of the ship boxes — so the structure literally *follows the player and its ships
+and factions*, each level a union of the level below.
+
+## How it scales: each player brings its own patch of world
+
+Two domains **overlap** exactly when their owners can see each other; overlap *is* the interest relation.
+A `DomainTree` (a recursive AABB over the domains themselves, rebuilt each tick from the moving anchors)
+answers "which bubbles overlap mine" in `O(log n + k)`, never `O(players²)`.
+
+The neutral environment near you — asteroids, hazards, wreckage — is **claimed by your domain** (the
+nearest anchor) and simulated **on your node, on behalf of everyone who can see it**. So each player
+contributes the compute for **itself and the patch of world around it**. Empty space has no domains and
+costs nothing; a crowd is its own server farm, each node carrying its own bubble. This is the
+STATE-MODEL principle made literal: *compute, authority, and storage for a region live on the nodes of
+the players in that region.*
+
+## Why it is seamless (no transition, by construction)
+
+- **The owner is never transited.** Its ship is, by construction, always inside its own domain (the
+  footprint is built around it). There is no seam under the player to cross, ever — at any position,
+  Earth-scale or not. (`domain::tests::the_owner_is_never_outside_its_own_domain`.)
+- **The only thing that changes hands is neutral environment**, and that is decided by a **pure, sticky
+  function** (`DomainField::claim` / `claim_sticky`) recomputed every tick — *not* a discrete
+  edge-crossing event. With hysteresis, an asteroid sitting in the overlap of two equally close bubbles
+  does not flap between owners. Nothing is *scheduled* to transition, so nothing can stutter.
+- **Determinism.** Domains, overlaps, and the environment owner are pure functions of entity positions
+  (no clock, no float-fragile ordering — ties break on `owner` string). Every replica computes the same
+  *who-simulates-what*, so the replicated-authority merge (`replication.rs`) agrees without a
+  coordinator — the same trick `galaxy.rs` uses for cell shape, applied to moving bubbles.
+
+## The API (`src/domain.rs`)
+
+| Item | What it is |
+|---|---|
+| `Bounds` | `f64` world-scale AABB (`union`/`intersects`/`contains`/`expanded`/`around`). The world-frame analogue of the `f32`, sector-local `aabb::Aabb`. |
+| `Owned` | trait: `owner()` + `entity_id()` + `pos()` + `radius()`. Keeps the module pure/testable, like `partition::Positioned`. The sim's `Ship` and faction entities satisfy it. |
+| `Domain` | one player's bubble: `{ owner, anchor, bounds, interest, entities }`. `Domain::build` unions the owned entity boxes (the recursive footprint) and grows it by the view radius. |
+| `DomainField` | all domains + the broad-phase `DomainTree`. `from_entities` groups by owner; `interest(owner)` → overlapping domains; `claim`/`claim_sticky` → environment owner. |
+
+## Relationship to the grid quadtree
+
+Domains **replace the grid as the unit of authority and interest** (who simulates what, who you receive).
+The `galaxy.rs` `CellId` quadtree is **not deleted** — it stays as the coarse, stable **addressing /
+rendezvous / bootstrap** layer: a name for a patch of space to discover peers and seed a region. You
+join by resolving a cell, then live inside moving domains. Grid for *addressing*; bubbles for *play*.
+
+## Integration ladder (status)
+
+`domain.rs` is the pure, tested core. The wiring through the live game is now in place; what's done and
+what remains:
+
+1. **World-frame bridge — DONE.** `domain::world_pos(sector, lx, ly)` + `DomainField::from_sim(sim,
+   view_radius)` turn a sector's sector-local-`f32` `Sim` into absolute-`f64` domains, grouping every
+   ship by its authority owner (a human ship by its pilot, an NPC fleet unit by its faction's player) so
+   a player's ship + fleet + faction fold into one bubble. `Bounds::sectors()` resolves a bubble to the
+   sectors it overlaps. Tested.
+2. **`Replica` interest — DONE (engine).** `Replica::domain_field()` and `Replica::interest_sectors(me,
+   view_radius)` give the seamless interest set — one sector mid-sector, two on an edge, four on a
+   corner, growing with the fleet — replacing `SectorId`'s fixed 8-neighbour ring. Tested
+   (`replica::tests::interest_grows_to_the_neighbour_as_the_bubble_nears_a_seam`). **Remaining:** the
+   wasm/native clients must *call* `interest_sectors` to drive their `/in` + `/state` subscriptions
+   (cross-repo: `spacegame-wasm`, `spacegame-native`).
+3. **Live map — DONE (end to end).** Hosts publish a `galaxywire::DomainFrame` (compact `DomainView`
+   bubbles) on `topics::DOMAINS` once per advertise interval (`run_sector`); the node control loop and
+   `observe_galaxy` subscribe and fold via `MapModel::on_domains`; `MapModel::player_domains()` and
+   `MapSummary::live_players` expose the moving "who is where" dots, and the `spacegame galaxy` ASCII
+   dump shows the bubble count. Tested (`galaxymap::tests::domain_frames_track_moving_player_bubbles`).
+4. **Environment authority — API ready, not yet driving the tick.** `DomainField::claim` /
+   `claim_sticky` decide which node simulates each neutral entity; remaining is to call it in the sim/
+   host loop to actually assign neutral-entity ownership and report owner-change deltas to
+   `replication.rs`. (Deferred: it touches the per-tick sim path, currently being reworked by another
+   agent.)
+
+The hard part — a seam-free, deterministic, coordinator-free authority partition that follows the
+player, plus its world-frame bridge, replica interest, and the live-map path — is designed, compiled,
+unit-tested, and wired. What's left is the two clients calling the interest API and the tick-loop
+environment-ownership assignment.

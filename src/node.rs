@@ -35,7 +35,7 @@ use crate::director;
 use crate::fleet::{CapacitySource, Fleet, HostNode, NodeId, RegionHint};
 use crate::galaxy::{CellId, CellLoad, Galaxy, MAX_DEPTH};
 use crate::galaxymap::MapModel;
-use crate::galaxywire::{topics as gtopics, ControlView, Heartbeat, LoadFrame, ShapeCommit, ShapeOp};
+use crate::galaxywire::{topics as gtopics, ControlView, DomainFrame, Heartbeat, LoadFrame, ShapeCommit, ShapeOp};
 use crate::gateway::{Gateway, GatewayDirectory};
 use crate::orchestrator::Orchestrator;
 use crate::{run_sector, SectorConfig};
@@ -468,6 +468,9 @@ pub async fn run_node(
     if let Err(e) = ce.subscribe(gtopics::CONTROL).await {
         tracing::debug!(error = %e, "control subscribe failed (continuing)");
     }
+    if let Err(e) = ce.subscribe(gtopics::DOMAINS).await {
+        tracing::debug!(error = %e, "domains subscribe failed (continuing)");
+    }
 
     // Calibrate the autoscaler, optionally lowering the split threshold for a small/demo deployment.
     let mut policy = AutoscalePolicy::default();
@@ -578,6 +581,10 @@ pub async fn run_node(
                             {
                                 node.control.observe(hb);
                             }
+                        } else if m.topic == gtopics::DOMAINS {
+                            if let Ok(f) = serde_json::from_slice::<DomainFrame>(&payload) {
+                                node.map.on_domains(f);
+                            }
                         } else if m.topic.starts_with("ce-game/spacegame/") && m.topic.ends_with("/load") {
                             if let Ok(f) = serde_json::from_slice::<LoadFrame>(&payload)
                                 && f.host != node.me
@@ -600,6 +607,7 @@ pub async fn run_node(
 pub async fn observe_galaxy(ce: &CeClient, window: Duration) -> Result<(Galaxy, ControlView, MapModel)> {
     ce.subscribe(gtopics::SHAPE).await?;
     let _ = ce.subscribe(gtopics::CONTROL).await;
+    let _ = ce.subscribe(gtopics::DOMAINS).await;
 
     let mut galaxy = Galaxy::genesis();
     let mut control = ControlView::default();
@@ -622,6 +630,10 @@ pub async fn observe_galaxy(ce: &CeClient, window: Duration) -> Result<(Galaxy, 
                 } else if m.topic == gtopics::CONTROL {
                     if let Ok(hb) = serde_json::from_slice::<Heartbeat>(&payload) {
                         control.observe(hb);
+                    }
+                } else if m.topic == gtopics::DOMAINS {
+                    if let Ok(f) = serde_json::from_slice::<DomainFrame>(&payload) {
+                        map.on_domains(f);
                     }
                 } else if m.topic.ends_with("/load") {
                     if let Ok(f) = serde_json::from_slice::<LoadFrame>(&payload) {

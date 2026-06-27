@@ -131,6 +131,29 @@ impl Replica {
         self.sim.state_hash()
     }
 
+    /// The **entity-anchored authority bubbles** for everything this replica simulates — the local
+    /// player, their fleet, and any NPC factions present — in the absolute world frame, each grown by
+    /// `view_radius`. See [`crate::domain`]: a domain follows its owner, so the partition moves with the
+    /// players instead of being a grid they cross.
+    pub fn domain_field(&self, view_radius: f64) -> crate::domain::DomainField {
+        crate::domain::DomainField::from_sim(&self.sim, view_radius)
+    }
+
+    /// The set of sectors the local player's interest bubble currently overlaps — the **seamless
+    /// interest set** that replaces [`SectorId`]'s fixed 8-neighbour ring. It is **one** sector when the
+    /// player is mid-sector, **two** on an edge, **four** on a corner, and it grows with the player's
+    /// fleet; the caller subscribes to exactly these regions' `/in` + `/state` topics. Because the bubble
+    /// slides, crossing a seam *adds* the neighbour before you reach it and *drops* the old one once your
+    /// bubble clears it — there is no discrete transition to feel. Falls back to just the current sector
+    /// if the player isn't present yet.
+    pub fn interest_sectors(&self, me: &str, view_radius: f64) -> std::collections::BTreeSet<SectorId> {
+        let field = self.domain_field(view_radius);
+        match field.get(me) {
+            Some(d) => d.interest.sectors().into_iter().collect(),
+            None => std::iter::once(self.sim.sector).collect(),
+        }
+    }
+
     /// Schedule a tick-tagged input received from the region's input stream (the network). An input for a
     /// tick already simulated is dropped — it is too late to apply deterministically; the quorum merge is
     /// what repairs a replica that fell behind, not a late-applied input that would itself cause a divergence.
@@ -328,6 +351,40 @@ mod tests {
         // The decisive assertions: entered at the WRAPPED edge coordinate, NOT teleported to the centre.
         assert!(s.x < SHIP_R + 50.0, "entered at the west edge of the new sector (x={}), not mid-sector", s.x);
         assert!((s.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT at the sector centre (the teleport bug)");
+    }
+
+    #[test]
+    fn interest_grows_to_the_neighbour_as_the_bubble_nears_a_seam() {
+        // The seamless-interest property: a player mid-sector subscribes to one sector; as they near the
+        // east edge their bubble overlaps the neighbour, so the interest set picks it up BEFORE they
+        // cross — no transition, the bubble just slides. Replaces the fixed 8-neighbour ring.
+        use crate::sim::SECTOR_SIZE;
+        let view = 1500.0; // ~a screen
+        let mut sim = Sim::new();
+        sim.join("me", "Me", 0);
+        sim.factions.values_mut().for_each(|f| f.units.clear()); // isolate the player's own bubble
+        {
+            let s = sim.ships.get_mut("me").unwrap();
+            s.x = SECTOR_SIZE * 0.5; // dead centre
+            s.y = SECTOR_SIZE * 0.5;
+        }
+        let r = Replica::new(sim);
+        let mid = r.interest_sectors("me", view);
+        assert_eq!(mid.len(), 1, "mid-sector: interest is exactly the home sector");
+        assert!(mid.contains(&SectorId::new(0, 0)));
+
+        // Now sit near the east edge (within `view` of it): the neighbour (1,0) joins the interest set.
+        let mut sim2 = Sim::new();
+        sim2.join("me", "Me", 0);
+        sim2.factions.values_mut().for_each(|f| f.units.clear());
+        {
+            let s = sim2.ships.get_mut("me").unwrap();
+            s.x = SECTOR_SIZE - 100.0; // 100 units from the east seam, inside a 1500 view
+            s.y = SECTOR_SIZE * 0.5;
+        }
+        let edge = Replica::new(sim2).interest_sectors("me", view);
+        assert!(edge.contains(&SectorId::new(0, 0)) && edge.contains(&SectorId::new(1, 0)));
+        assert_eq!(edge.len(), 2, "near the east edge: home + the eastern neighbour, nothing else");
     }
 
     #[test]

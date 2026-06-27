@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::galaxy::{CellId, CellLoad, Galaxy, WorldRect};
-use crate::galaxywire::{LoadFrame, ShapeOp};
+use crate::galaxywire::{DomainFrame, DomainView, LoadFrame, ShapeOp};
 
 /// A cell rendered on the map: where it is, who hosts it, how hot it is.
 #[derive(Debug, Clone)]
@@ -59,6 +59,10 @@ pub struct MapModel {
     pub galaxy: Galaxy,
     hosts: HashMap<CellId, String>,
     loads: HashMap<CellId, CellLoad>,
+    /// Latest player bubbles per host (from the `/domains` topic). Keyed by host, each value the full
+    /// snapshot that host last gossiped — so a player leaving drops out when its host's next frame omits
+    /// it. This is the moving "who is where" layer the grid `cells()` can't express.
+    domains: HashMap<String, Vec<DomainView>>,
     pub events: std::collections::VecDeque<MapEvent>,
     event_cap: usize,
 }
@@ -72,6 +76,24 @@ impl MapModel {
     pub fn on_load(&mut self, f: LoadFrame) {
         self.hosts.insert(f.cell, f.host);
         self.loads.insert(f.cell, f.load);
+    }
+
+    /// Fold a host's player-bubble snapshot in (from the `/domains` topic). Replaces that host's previous
+    /// set wholesale, so departures are handled implicitly.
+    pub fn on_domains(&mut self, f: DomainFrame) {
+        if f.domains.is_empty() {
+            self.domains.remove(&f.host);
+        } else {
+            self.domains.insert(f.host, f.domains);
+        }
+    }
+
+    /// Every player bubble currently on the map, across all hosts — the moving "who is where" dots. Sorted
+    /// by owner so the render order is stable.
+    pub fn player_domains(&self) -> Vec<DomainView> {
+        let mut out: Vec<DomainView> = self.domains.values().flatten().cloned().collect();
+        out.sort_by(|a, b| a.owner.cmp(&b.owner));
+        out
     }
 
     /// Apply a committed reshape (from the `/galaxy` topic): mutate the shape, retarget hosts, and push
@@ -132,7 +154,8 @@ impl MapModel {
         let players: u32 = cells.iter().filter_map(|c| c.load.map(|l| l.players)).sum();
         let hosts: std::collections::BTreeSet<&String> = cells.iter().filter_map(|c| c.host.as_ref()).collect();
         let max_depth = cells.iter().map(|c| c.cell.depth).max().unwrap_or(0);
-        MapSummary { leaf_cells: cells.len(), players, host_nodes: hosts.len(), max_depth }
+        let live_players = self.domains.values().map(|v| v.len()).sum();
+        MapSummary { leaf_cells: cells.len(), players, host_nodes: hosts.len(), max_depth, live_players }
     }
 
     /// A compact ASCII quadtree dump for `spacegame galaxy` — the galaxy at a glance from a terminal.
@@ -143,8 +166,8 @@ impl MapModel {
         let mut out = String::new();
         let s = self.summary();
         out.push_str(&format!(
-            "galaxy: {} leaf cells, {} players, {} host nodes, depth {}\n",
-            s.leaf_cells, s.players, s.host_nodes, s.max_depth
+            "galaxy: {} leaf cells, {} players ({} bubbles), {} host nodes, depth {}\n",
+            s.leaf_cells, s.players, s.live_players, s.host_nodes, s.max_depth
         ));
         for c in cells {
             let heat = c.heat(policy_players, policy_tick_us, policy_bps);
@@ -162,9 +185,12 @@ impl MapModel {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MapSummary {
     pub leaf_cells: usize,
+    /// Players summed from per-cell host load reports (the coarse, grid view).
     pub players: u32,
     pub host_nodes: usize,
     pub max_depth: u8,
+    /// Individual player bubbles tracked on the `/domains` layer (the precise, moving "who is where").
+    pub live_players: usize,
 }
 
 #[cfg(test)]
@@ -189,5 +215,37 @@ mod tests {
         // The ascii dump renders without panicking and names the children.
         let s = m.ascii(150, 35_000, 12_000_000);
         assert!(s.contains("1.0.0") || s.contains("1.1.1"));
+    }
+
+    #[test]
+    fn domain_frames_track_moving_player_bubbles() {
+        let mut m = MapModel::new();
+        // Two hosts each report their players' bubbles.
+        m.on_domains(DomainFrame {
+            host: "h1".into(),
+            domains: vec![
+                DomainView { owner: "alice".into(), x: 10.0, y: 0.0, span: 200.0, entities: 3 },
+                DomainView { owner: "bob".into(), x: 9000.0, y: 0.0, span: 100.0, entities: 1 },
+            ],
+        });
+        m.on_domains(DomainFrame {
+            host: "h2".into(),
+            domains: vec![DomainView { owner: "cara".into(), x: -5000.0, y: 1.0, span: 50.0, entities: 1 }],
+        });
+        assert_eq!(m.summary().live_players, 3, "three player bubbles across two hosts");
+        let dots = m.player_domains();
+        assert_eq!(dots.iter().map(|d| d.owner.as_str()).collect::<Vec<_>>(), vec!["alice", "bob", "cara"]);
+
+        // bob leaves: h1's next frame omits him. The bubble disappears without an explicit removal.
+        m.on_domains(DomainFrame {
+            host: "h1".into(),
+            domains: vec![DomainView { owner: "alice".into(), x: 12.0, y: 0.0, span: 220.0, entities: 4 }],
+        });
+        assert_eq!(m.summary().live_players, 2, "bob dropped out when his host stopped reporting him");
+        assert!(m.player_domains().iter().all(|d| d.owner != "bob"));
+
+        // A host that empties out entirely is forgotten.
+        m.on_domains(DomainFrame { host: "h2".into(), domains: vec![] });
+        assert_eq!(m.summary().live_players, 1, "only alice remains");
     }
 }
