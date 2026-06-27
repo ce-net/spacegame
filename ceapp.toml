@@ -18,5 +18,10 @@ net        = "loopback"
 capability = "inherit"
 [daemon]
 enabled = true
-args    = ["host"]   # host sector(s) locally; authoritative sim runs in this process
+# A warm genesis SEED: host the origin plus-ring (0_0 + the 4 edge neighbours) as ordinary
+# non-authoritative replicas, so a new player always has a peer to bootstrap/merge against and crossing
+# a sector edge near genesis lands on a warm host. Players are the real servers; this is one quorum vote.
+# Negative sectors use the `n` token form (SectorId::token: -1 -> "n1"); a leading-dash "-1_0" is parsed
+# by clap as a flag and crashes the host. The old systemd seed had this latent bug (never came up).
+args    = ["host", "--sector", "0_0", "--sector", "1_0", "--sector", "n1_0", "--sector", "0_1", "--sector", "0_n1"]
 restart = "on-failure"
