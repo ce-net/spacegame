@@ -66,6 +66,38 @@ engine, integrated into browser/native/relay, merged by quorum.)
 > spacegame map function to monitor the entire mesh and all servers contributing? document what i say
 > verbatim
 
+> Record my words verbatim. The browser node should find the local ce node on my machine for spacegame
+> and try to create an account connected to my local node id to save my progress and player properly - my
+> devices and node and identlity is connected to spacegame. And when going to spa.ce-net.com you are given
+> a popup before entering the game (simple start menu) with your listed accounts linked to your identity
+> and browser sessions if you had them and ce-iam should properly store all values needed for this and it
+> should be secure and easy.
+
+(=> IDENTITY + ACCOUNTS + PERSISTENCE: spacegame identity is the player's REAL CE identity, not an
+ephemeral in-tab key. The browser should DISCOVER the local `ce` node on the user's machine and bind the
+player account to that local node id, so progress/player persist and are tied to the user's devices/node/
+identity. spa.ce-net.com opens with a START MENU popup BEFORE the game: lists the accounts linked to your
+identity + any prior browser sessions, pick one (or make one) then enter. ce-iam stores all needed values
+(account records, keys, session) — secure AND easy. Supersedes the ephemeral in-tab libp2p identity as the
+account root: the in-tab peer is transport; ce-iam + local node id is WHO you are. Build items: local-node
+discovery from the browser, ce-iam account model + secure store, start-menu UI, session restore.)
+
+> Yes upgrade ce-iam to support all of this + browser to local node security and auth. in the future you
+> will never have to login to websites because you verify your indentity with your local running node on
+> all your devices. record this verbatim
+
+(=> NORTH STAR for ce-iam: your LOCAL running node on each of your devices IS your identity. The browser
+authenticates to a site by getting a node-signed assertion from your local node — no passwords, no
+website logins, ever. ce-iam upgrade scope: (1) browser↔local-node secure channel + auth (web-safe: the
+browser cannot reach localhost over http, so use mesh discovery + a challenge/response, or an explicit
+pair, so the page holds a node-signed capability proving WHO you are); (2) device enrollment so all your
+devices share one identity (your node key as root, ce-iam devices linked); (3) a verify primitive a site
+calls to accept "this session is <identity>" from a node-signed challenge (builds on ce-iam verify +
+ce-auth challenge-response). Spacegame is the first consumer: account = your CE node identity, bound via
+this. The passwordless-web-auth-via-your-node vision is the real product. See the ce-iam repo.)
+
+---
+
 (=> Wants a live mesh-monitor view: the whole galaxy, every active player, and every node/server
 instance hosting a region (who is contributing compute, which sector each hosts). See the galaxy-map
 work; if it doesn't already show hosts+players live, that monitor is a build item.)
@@ -154,3 +186,50 @@ Work items toward the full model above (not yet done):
 - **Minimum-K replication** tuned to "survive host exit" and **population-driven drop** (empty region ⇒
   released; solo-dev ⇒ resets; crowded region ⇒ continues, held by the players' nodes).
 - **Distributed save** so the aggregate state is the union of per-region slices on players' nodes.
+
+---
+
+## ce-iam = universal identity (verbatim, 2026-06-27)
+
+> the ce-iam sdks and packages should allow doing this in any situation and environment. All local apps on
+> all your devices. all browser tabs and everything should securely already be logged in. in the future we
+> will have google, bankid, apple and other login account connections / relays connected to your ce-iam to
+> auto login you to all sites - the node is your trust and id. document this verbatim.
+
+(=> ce-iam is THE universal identity/auth layer for every environment — native apps, every browser tab,
+all your devices — everything ALREADY securely logged in because your node is your trust + id. The SDKs
+must make it drop-in anywhere. FUTURE: external IdPs (Google, BankID, Apple, ...) connect to ce-iam as
+login CONNECTIONS/RELAYS so ce-iam auto-logs you into all sites — it federates them behind your node
+identity. The node is the root of trust; ce-iam brokers everything else.)
+
+> So this should also be available:
+> 1. Turnkey Rust SDK — this IS your "very easy to integrate" ask. Today an app must hand-wire DeviceKey +
+>    MeshKvStore::connect + Vault::new. The TS side is openVault().get(name); Rust has no equivalent. The
+>    fix is one helper:
+>    let key = ce_iam::open_vault_default().await?.get("crosspost-linkedin-default").await?;
+>    Add the dep, call one function, you get the owner's keys mesh-wide by identity. Once this exists,
+>    crosspost's VaultTokenStore is ~10 lines on the existing TokenStore trait. Lowest risk, highest
+>    leverage — do it first.
+> 2. Headless device enrolment — the blocker for fresh-VM same-account. Pairing is interactive today: the
+>    VM runs ce-iam device request, a human approves with ce-iam device approve. A freshly provisioned VM
+>    can't self-join your account unattended. Fix: a capability-delegated bootstrap — you pre-authorise the
+>    VM's device key (or issue a one-time enrol token) so it auto-enrols, no human in the loop. This is what
+>    makes the distributed E2E hands-free.
+> 3. Read enforcement is OFF. secret grant issues real capabilities and verify_grant checks them, but the
+>    mesh KV only gates writes (and write-enforcement is in migration mode kv_enforce=false). Reads aren't
+>    capability-checked yet — a granted read is currently advisory. Fix: require the read:<name> cap on KV
+>    gets, flip enforcement on. Needed before any vault is exposed.
+> 4. The vault KV lives inside ce-cast. It should be a standard shared/node service any app binds to, so the
+>    account vault isn't coupled to one app.
+> Gaps 1, 3, 4 are ce-iam work (cross-repo); gap 2 too. crosspost owns only the VaultTokenStore that sits
+> on top of gap 1.
+> // any app, any device, same account — one dep, one line:
+> let key = ce_iam::open_vault_default().await?.get("some-key").await?;
+
+(=> THE ce-iam ROADMAP. North star: `ce_iam::open_vault_default().await?.get(name)` — one dep, one line,
+any app/device/tab, same account. Four gaps, ORDER: (1) turnkey Rust `open_vault_default()` [DO FIRST,
+lowest risk/highest leverage — wraps DeviceKey + MeshKvStore::connect + Vault::new]; (2) headless device
+enrolment via capability-delegated bootstrap / one-time enrol token [fresh VM self-joins, no human];
+(3) flip READ enforcement on — require `read:<name>` cap on KV gets [today reads are advisory]; (4) make
+the vault KV a shared node service, not coupled inside ce-cast. Captured in PLAN + the ce-iam memory. The
+distributed harness already has an enroll_account stage; all tests in test/distributed/.)
