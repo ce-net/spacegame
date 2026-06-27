@@ -223,6 +223,36 @@ mod tests {
     }
 
     #[test]
+    fn the_browser_server_fires_bullets_from_the_player() {
+        // Headless proof of the fix that started this whole thread: a player who fires gets bullets
+        // spawned AT their own ship. The `Replica` IS the server the browser (or a headless donor node)
+        // runs, so this verifies "shoot from the player" with NO browser and NO frontend — exactly the
+        // testability Leif asked for, and the same code path a donation node would run.
+        let mut r = Replica::new(Sim::new());
+        let p = "p1";
+        let t = r.tick();
+        r.schedule(TickInput { tick: t, player: p.into(), seq: 1, msg: ClientMsg::Join { name: "P".into() } });
+        r.schedule(TickInput {
+            tick: t + 1,
+            player: p.into(),
+            seq: 2,
+            msg: ClientMsg::Input { thrust: false, turn: 0, fire: true, aim: Some(0.0), name: None },
+        });
+        // Check right after the shot is fired, before it has flown far (bullets travel ~30/tick).
+        r.advance_to(t + 3);
+        let sim = r.sim();
+        let ship = sim.ships.get(p).expect("the server spawned the player's ship");
+        let mine: Vec<_> = sim.bullets.iter().filter(|b| b.owner == p).collect();
+        assert!(!mine.is_empty(), "firing produced a bullet owned by the player");
+        // The just-fired bullet originates at the player (not at some divergent host-side position).
+        let nearest = mine
+            .iter()
+            .map(|b| ((b.x - ship.x).powi(2) + (b.y - ship.y).powi(2)).sqrt())
+            .fold(f32::INFINITY, f32::min);
+        assert!(nearest < 150.0, "a bullet spawned from the player's position (nearest {nearest})");
+    }
+
+    #[test]
     fn schedule_local_targets_the_input_delay_tick() {
         let mut r = Replica::new(Sim::new());
         r.advance_to(100);
