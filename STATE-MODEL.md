@@ -44,6 +44,30 @@ Prerequisite #1 is INPUT SYNC: every input must reach every replica reliably and
 replicas must stay convergent. **No sector clamping / no walls** — sectors ADAPT to where players are and
 neighbouring nodes AUTOMATICALLY TAKE OVER hosting as players move. See `NETCODE.md`.)
 
+> No authored bool please thats stupid... we must have proper state merging ! people will try to cheat
+> when there are millions of players. the state merging and the one server per player goes hand in hand.
+> We dont even need the relay backend server - the players machines can themselves be servers and that
+> should be enough so when there are no players the state is lost which is perfect for deelopment. and
+> proves something: in ce-net apps scales on demand by having each user host a part of it.
+
+> What the fuck is self state
+
+> do proper state merging
+
+> redo
+
+(=> BINDING: there is NO trusted authority and NO "declare your own position" (the rejected `authored`
+bool / `self_state` — a client telling the host where it is, which is trivially cheatable). The model is
+**deterministic replicated simulation merged by quorum**: every node in a region runs the SAME
+deterministic sim from the SAME ordered input log (Stage 0), and replicas AGREE on a periodic state hash
+(`Sim::state_hash` + `replication::agree`); a node whose state differs is a cheater/faulty and is
+re-synced to the quorum or excluded. Movement isn't trusted — it is RE-COMPUTED by every replica from
+inputs, so a liar diverges from the majority and loses. **One-server-per-player == the merge**: each
+player's own machine hosts the region it's in and is one replica among the players present; remove the
+relay backend as an authority. **No players in a region => its state is dropped** (perfect for solo dev:
+resets), which is the whole point — it proves ce-net apps scale on demand because each user hosts a part
+of the app. See `NETCODE.md`.)
+
 ---
 
 ## What these define (the model we are building toward)

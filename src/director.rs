@@ -140,7 +140,7 @@ pub async fn replicate_snapshot(ce: &CeClient, sector: &str, sim: &Sim) -> Resul
     if let Err(e) = ce.advertise_service(&snapshot_service(sector)).await {
         tracing::debug!(error = %e, sector, "snapshot-service advertise failed (continuing)");
     }
-    let ann = SnapshotAnnounce { cid: cid.clone(), tick: snap.tick };
+    let ann = SnapshotAnnounce { cid: cid.clone(), tick: snap.tick, hash: sim.state_hash() };
     if let Ok(b) = serde_json::to_vec(&ann)
         && let Err(e) = ce.publish(&snapshot_topic(sector), &b).await
     {
@@ -171,11 +171,15 @@ pub fn snapshot_topic(sector: &str) -> String {
 }
 
 /// An announcement that a fresh snapshot exists. Published on [`snapshot_topic`] after each
-/// [`replicate_snapshot`].
+/// [`replicate_snapshot`]. `hash` is the snapshot's deterministic [`Sim::state_hash`], so a replica
+/// that the quorum has out-voted can fetch the CID whose state matches the **agreed** hash and merge to
+/// it — the snapshot is addressed by the truth the replicas agreed on, not merely "the latest".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SnapshotAnnounce {
     pub cid: String,
     pub tick: u64,
+    #[serde(default)]
+    pub hash: u64,
 }
 
 /// **Consensus:** seal the galaxy's current standings against the PoW chain and broadcast the
