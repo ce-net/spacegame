@@ -31,6 +31,21 @@ use crate::wire::ClientMsg;
 /// every replica — including yours — agrees to simulate, so they never diverge.)
 pub const INPUT_DELAY: u64 = 6;
 
+/// Milliseconds per simulation tick (60 Hz) — the rate every replica advances at.
+pub const TICK_MS: f64 = 1000.0 / 60.0;
+
+/// A fixed epoch (ms since the Unix epoch) the shared tick clock counts from. Arbitrary, but it MUST be
+/// the same constant on every replica so they all derive the same tick number from wall-clock time. This
+/// is the "shared clock": with roughly NTP-synced wall clocks, every node agrees what tick it is now, so
+/// a tick-tagged input lands on the same tick everywhere.
+pub const TICK_EPOCH_MS: f64 = 1_700_000_000_000.0;
+
+/// The canonical simulation tick for a wall-clock time (ms since the Unix epoch). Saturates at 0.
+pub fn tick_at(now_ms: f64) -> u64 {
+    let t = (now_ms - TICK_EPOCH_MS) / TICK_MS;
+    if t < 0.0 { 0 } else { t as u64 }
+}
+
 /// One tick-tagged input: apply `msg` from `player` at simulation `tick` on every replica. `seq` is the
 /// author's monotonic sequence (from [`crate::wire::ClientPacket`]), used only to order multiple inputs
 /// from the same player within one tick — deterministically and identically on every replica.
@@ -93,11 +108,34 @@ impl Replica {
         at
     }
 
+    /// Apply one of THIS node's own inputs to the local sim IMMEDIATELY (zero input delay for your own
+    /// ship). Pair it with broadcasting the same input tick-tagged at `tick + INPUT_DELAY` so the OTHER
+    /// replicas apply it deterministically; your screen shows your ship "now", everyone else sees it a few
+    /// ticks behind — the standard, correct trade. No-op concerns: `apply_client_msg` auto-joins an unknown
+    /// player, so this also creates your ship on first input.
+    pub fn apply_local_now(&mut self, player: &str, msg: ClientMsg) {
+        crate::room::apply_client_msg(&mut self.sim, player, msg);
+    }
+
+    /// Set this replica's tick directly (e.g. to the shared wall-clock tick at creation, or after adopting
+    /// a snapshot), so `advance_to(tick_at(now))` only steps the elapsed ticks rather than from zero.
+    pub fn set_tick(&mut self, tick: u64) {
+        self.sim.tick = tick;
+    }
+
     /// Advance the simulation up to (but not including) `target`, applying each tick's scheduled inputs in
     /// canonical `(player, seq)` order before stepping that tick. Deterministic: given the same scheduled
     /// inputs, every replica ends in the same state regardless of arrival order or host. No-op if already
     /// at or past `target`.
     pub fn advance_to(&mut self, target: u64) {
+        // A long stall (backgrounded tab, or first frame against the wall-clock tick) must not spin
+        // through millions of ticks. Cap the catch-up; if we're further behind than that, jump the clock
+        // forward (the gap is a desync the quorum merge / a fresh snapshot repairs) and simulate the cap.
+        const MAX_CATCHUP: u64 = 12;
+        if target.saturating_sub(self.sim.tick) > MAX_CATCHUP {
+            self.scheduled.retain(|&t, _| t >= target.saturating_sub(MAX_CATCHUP));
+            self.sim.tick = target.saturating_sub(MAX_CATCHUP);
+        }
         while self.sim.tick < target {
             let t = self.sim.tick;
             if let Some(mut inputs) = self.scheduled.remove(&t) {
@@ -152,9 +190,10 @@ mod tests {
         for ti in inputs.iter().rev().cloned() {
             b.schedule(ti);
         }
-        a.advance_to(20);
-        b.advance_to(20);
-        assert_eq!(a.tick(), 20);
+        // Advance within one catch-up window so every scheduled input is applied (not jumped past).
+        a.advance_to(11);
+        b.advance_to(11);
+        assert_eq!(a.tick(), 11);
         assert_eq!(a.state_hash(), b.state_hash(), "same inputs => same state, independent of arrival order");
     }
 

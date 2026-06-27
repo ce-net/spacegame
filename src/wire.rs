@@ -139,6 +139,30 @@ impl ClientPacket {
     }
 }
 
+/// REPLICATED-AUTHORITY wire form (netcode: every player runs the full server). A node broadcasts each of
+/// its inputs tick-tagged on the sector `/in` topic; every replica schedules it to apply at the SAME
+/// `tick` (the shared wall-clock tick, see [`crate::replica`]), so all replicas simulate the same world.
+/// The author is the authenticated `AppMessage.from` — NOT carried here, so it can't be spoofed. `seq`
+/// only orders multiple inputs from one author within a tick. A `TaggedInput` is NOT a [`ClientPacket`]
+/// (`deny_unknown_fields` on both), so the two models can coexist on `/in` during the transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaggedInput {
+    pub tick: u64,
+    pub seq: u64,
+    pub msg: ClientMsg,
+}
+
+impl TaggedInput {
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
 /// One ship as broadcast in a [`Snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShipView {
