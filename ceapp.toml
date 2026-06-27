@@ -1,0 +1,22 @@
+# spacegame — host CE Spacegame sectors over the mesh. Installed + supervised by the one `ce` node via ce-appmgr.
+[app]
+name    = "spacegame"
+version = "0.1.0"
+summary = "Authoritative per-sector multiplayer space arena host; runs the sim in-process and serves it over the mesh."
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+[native]
+bin = "spacegame"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+[deps]
+# local CE node for mesh discovery/placement; in-process authoritative sector simulation.
+[sandbox]
+tier       = "none"
+net        = "loopback"
+capability = "inherit"
+[daemon]
+enabled = true
+args    = ["host"]   # host sector(s) locally; authoritative sim runs in this process
+restart = "on-failure"
