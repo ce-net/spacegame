@@ -128,8 +128,11 @@ frontend() {
     sed -i "s/__SGV__/$V/g" "$STAGE/boot.js" "$STAGE/index.html"
     if grep -rq "__SGV__" "$STAGE/boot.js" "$STAGE/index.html"; then echo "FAILED to stamp cache-bust version"; exit 1; fi
     echo "    cache-bust version stamped (boot.js + index.html): $V"
+    # Publish via the ce-publish app (web-bundle mode). Falls back to the legacy ce-serve-publish binary
+    # still on the box until ce-publish is installed here, so the deploy never breaks mid-migration.
+    if command -v ce-publish >/dev/null 2>&1; then PUB="ce-publish bundle"; else PUB="/opt/ce-serve/ce-serve-publish"; fi
     CE_API_TOKEN=$(cat /root/.local/share/ce/api.token) \
-      /opt/ce-serve/ce-serve-publish "$STAGE" '"$APP"'.ce-net.com '"$APP"
+      $PUB "$STAGE" '"$APP"'.ce-net.com '"$APP"
   echo "==> spacegame frontend live via ce-serve: https://$APP.ce-net.com/"
 }
 
