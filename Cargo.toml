@@ -22,7 +22,7 @@ required-features = ["mesh"]
 [features]
 default = ["mesh"]
 # The mesh backend: sector hosting, replication, hot-reload distribution, the CLI. Off for wasm SDK use.
-mesh = ["dep:ce-rs", "dep:tokio", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "dep:clap"]
+mesh = ["dep:ce-rs", "dep:tokio", "dep:futures-util", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:ce-cap", "dep:hex"]
 
 [dependencies]
 # Pure-SDK deps (always on).
@@ -31,6 +31,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Mesh-only deps (optional; enabled by the `mesh` feature).
 ce-rs = { path = "../ce-rs", optional = true }
+# Capability VERIFY only (offline) for the node-vouch account check at ingest. No minting here.
+ce-cap = { path = "../ce/crates/ce-cap", optional = true }
+hex = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"], optional = true }
 futures-util = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }

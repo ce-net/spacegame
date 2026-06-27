@@ -185,8 +185,8 @@ mod tests {
     fn busy_sim() -> Sim {
         let mut s = Sim::new();
         s.seamless = false; // keep ships inside one sector for a clean round-trip comparison
-        apply_client_msg(&mut s, "nodeA", ClientMsg::Join { name: "Ace".into() });
-        apply_client_msg(&mut s, "nodeB", ClientMsg::Join { name: "Bee".into() });
+        apply_client_msg(&mut s, "nodeA", ClientMsg::Join { name: "Ace".into(), cap: None });
+        apply_client_msg(&mut s, "nodeB", ClientMsg::Join { name: "Bee".into(), cap: None });
         let rock = (0..40)
             .flat_map(|cx| (0..40).map(move |cy| (cx, cy)))
             .find_map(|(cx, cy)| rock_in_cell(cx, cy))

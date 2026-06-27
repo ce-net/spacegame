@@ -79,6 +79,11 @@ pub mod verify;
 pub mod worldgen;
 
 // --- Mesh I/O (behind the default `mesh` feature; pulls ce-rs/tokio) ---
+// Host-side verification of the node-signed account vouch a client presents in its Join ("your local
+// node is your login"). Mesh-only: it runs at ingest on the authoritative host, never in the
+// deterministic replica sim.
+#[cfg(feature = "mesh")]
+pub mod auth;
 #[cfg(feature = "mesh")]
 pub mod director;
 // The live adaptive-galaxy daemon: hosts assigned cells, runs the leaderless controller (observe load →
@@ -98,6 +103,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use ruleset::Ruleset;
 pub use wire::topics;
+
+/// Verify any account-vouch capabilities carried in this batch of client messages from `from`, and log
+/// the outcome. Additive and side-effect-free w.r.t. the sim: a present+valid cap proves "a CE node
+/// vouches this player's name" (the basis for a verified badge / name reservation); an absent or
+/// invalid cap is fine — the game stays open. Runs at ingest on the host only (not in the replica sim).
+#[cfg(feature = "mesh")]
+fn note_join_vouches<'a>(from: &str, msgs: impl Iterator<Item = &'a wire::ClientMsg>) {
+    for msg in msgs {
+        if let wire::ClientMsg::Join { name, cap: Some(cap) } = msg {
+            match auth::verify_join(name, cap) {
+                Ok(v) => tracing::info!(from = %from, name = %v.name, node = %v.node, "account vouched by node"),
+                Err(e) => tracing::warn!(from = %from, %name, error = %e, "account vouch failed (joining anonymously)"),
+            }
+        }
+    }
+}
 
 /// Configuration for one hosted sector.
 #[cfg(feature = "mesh")]
@@ -588,13 +609,23 @@ pub async fn run_sector(
                             // bare ClientMsg so a legacy/cached client still works during a rollout.
                             match wire::ClientPacket::decode(&payload) {
                                 Ok(pkt) => {
+                                    note_join_vouches(&m.from, pkt.input.iter().chain(pkt.reliable.iter().map(|s| &s.msg)));
                                     if insync.apply(&mut sim, &m.from, pkt) {
                                         insync.forget(&m.from); // they said Bye — reset their seq state
                                     }
                                 }
                                 Err(_) => match wire::ClientMsg::decode(&payload) {
-                                    Ok(msg) => { room::apply_client_msg(&mut sim, &m.from, msg); }
-                                    Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg/packet"),
+                                    Ok(msg) => {
+                                        note_join_vouches(&m.from, std::iter::once(&msg));
+                                        room::apply_client_msg(&mut sim, &m.from, msg);
+                                    }
+                                    // Replicated-authority wire: a tick-tagged input. The host verifies any
+                                    // vouch it carries (note-only — application of TaggedInput is the
+                                    // replica path's job, not this authoritative ingest).
+                                    Err(_) => match wire::TaggedInput::decode(&payload) {
+                                        Ok(ti) => note_join_vouches(&m.from, std::iter::once(&ti.msg)),
+                                        Err(e) => tracing::debug!(error = %e, from = %m.from, "undecodable client msg/packet"),
+                                    },
                                 },
                             }
                         } else if m.topic == transit_topic {
