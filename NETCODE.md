@@ -62,23 +62,47 @@ THIS: **deterministic simulation, replicated across the players present in a reg
   instances contributing compute), per-cell player count + load heat, and live cell-splits, fed over the
   mesh bridge. Shows host instances + player COUNTS; individual player dots are a possible enhancement.
 
-## What remains (this is where the visible fixes live)
+## Players host their region — DONE (2026-06-27)
 
-The merge engine is real but **inert in solo play**, because today only ONE node (the relay) hosts a
-region — there's nothing to cross-check, and the lone host's view is still the only authority, so the
-old divergence (the teleport, bullets firing from the host's stale copy of you) persists in solo. The
-merge only does work once a region has ≥2 player-replicas. So the companion slice — the one Leif says goes
-hand-in-hand — is next:
+The browser now runs the full authoritative `Sim` itself (`spacegame-wasm`: a `replica::Replica` advanced
+to the shared wall-clock tick, rendered from directly), exchanging tick-tagged inputs on the sector `/in`
+topic with whoever else is present. **YOUR node is one of the servers**, so your ship is zero-RTT and your
+bullets fire from your real position; the quorum merge keeps you honest against the other players. There is
+no relay game authority any more (see below). This is the change that makes the merge visible and kills the
+teleport for good.
 
-- **Players host their region (no relay authority).** Each player's own node runs the authoritative `Sim`
-  replica for the region it's in; the relay is at most a bootstrap/rendezvous, never the source of truth.
-  Then YOUR node authoritatively simulates YOUR ship from YOUR inputs (zero-RTT, bullets from your real
-  position), and the merge keeps your node honest against the other players' replicas. This is the change
-  that makes the merge visible and kills the teleport for good.
-  - Open design fork (browser players): the authoritative replica runs in the browser's wasm `Sim` itself,
-    or in the player's local native `ce` node, with replicas talking over the mesh bridge. The browser
-    does not currently run the full `Sim` (only the render view-model), so this is the substantial lift.
-- **Region hand-off as players move** (sectors adapt; nearest replica takes over) and **population-driven
-  drop** (last player leaves ⇒ region released). Builds on `replication::{ReplicaSet, ReplicationPlan}`.
+- **Cross-sector hand-off — DONE.** `replica::Replica::rehome_local_player` drains the sim's seamless
+  transit each tick: when the local player crosses a sector edge, the replica re-homes onto the
+  destination sector (a fresh `Sim::for_sector` at the same shared tick, carrying the ship in with full
+  state) and the client re-points its `/in` subscription there. Without this the ship was deleted at the
+  edge and the next input re-spawned it at the sector centre — that WAS the "teleport back to centre" bug,
+  and with no relay there is no host-side `readmit_coords` to mask it. Tested:
+  `replica::tests::local_player_rehomes_across_a_sector_edge_instead_of_teleporting_to_centre` — the
+  edge-crossing test that was missing (every prior transit test exercised the `Sim` primitive or the
+  relay host loop, never a `Replica` flown to an edge, which is exactly why it shipped).
+
+## The relay: TRANSPORT + a warm genesis SEED (not an authority)
+
+The relay is no longer a game server. Its roles:
+
+- **Transport (essential).** libp2p relay / NAT traversal / DCUtR + the `/mesh-bridge` wss + ce-serve
+  static hosting of the wasm bundle — this is how players reach each other over the global internet.
+  (Future: many relays; transport itself decentralizes.)
+- **Genesis seed (lightweight).** One non-authoritative `spacegame host` replica pinned to the genesis
+  ring (`spacegame-seed` service) keeps the origin region warm so the first player always has a peer to
+  bootstrap/merge against. It is one vote in the quorum, outvoted by the player majority. The old
+  planet-scale `spacegame node` (gateway + leaderless controller + autoscale) is no longer deployed.
+
+**Empty region ⇒ state dropped** still holds away from genesis: no players hosting it ⇒ no compute, no
+storage ⇒ it's gone. Near genesis the seed keeps it warm — by deliberate choice (STATE-MODEL.md).
+
+## What remains
+
+- **Joining-state adoption.** A player entering a populated region currently starts a fresh `Sim` for it
+  and converges via the merge; adopting the quorum's latest snapshot on entry (a `SnapshotAnnounce` the
+  region already publishes) would make the first second seamless. Builds on `replication::{ReplicaSet,
+  ReplicationPlan}` + `lib::adopt_latest_snapshot`.
+- **Native client self-hosts.** The native desktop client still renders the seed's `/state` as a thin
+  client; porting it to run its own `Replica` (like the browser) makes native players servers too.
 
 No declared positions. No trusted server. The world is whatever the players present compute and agree on.

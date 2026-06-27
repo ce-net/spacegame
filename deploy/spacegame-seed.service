@@ -1,0 +1,43 @@
+[Unit]
+Description=spacegame genesis SEED peer (a warm, non-authoritative replica near the origin)
+# Spacegame is a DECENTRALIZED game over ce-net: the active players ARE the server. Each player's node
+# (browser wasm or native ce node) runs the full authoritative Sim for the region it is in, and the set
+# of players present in a region collectively host it, reconciling by quorum state-hash merge. This unit
+# is NOT that authority — it is a single lightweight SEED replica pinned to the genesis ring, so the
+# region stays warm and the first player to arrive always has a peer to bootstrap and merge against. It
+# holds no special power: it is one vote in the quorum and is outvoted by the player majority. When no
+# players are near a non-genesis region, that region's state is simply dropped (the ce-net "scales on
+# demand" property). See spacegame/NETCODE.md + STATE-MODEL.md.
+#
+# The seed talks to the mesh through the relay's own CE node (ce-relay, libp2p transport / NAT traversal /
+# gossipsub fan-out — the thing that lets players reach each other over the global internet), so it comes
+# up after the node and the hub.
+After=network.target ce-relay.service ce-hub.service
+Wants=ce-relay.service
+
+[Service]
+Type=simple
+# Runtime artifacts (binary + live ruleset) live OUTSIDE the synced source tree (/opt/ce-build/spacegame),
+# so a `deploy.sh frontend` re-sync of the sources (rsync --delete) can never clobber the running binary.
+WorkingDirectory=/opt/ce-build/spacegame-run
+# A plain genesis seed: host the 3x3-ish plus-ring around the origin as ordinary replicas so crossing a
+# sector edge near genesis lands on a warm peer. NO gateway, NO leaderless controller, NO autoscale / cell
+# splitting — that planet-scale machinery (`spacegame node`, see GALAXY-SCALE.md) is intentionally NOT run
+# here; players carry the compute. --hz 60 so a player who renders against this seed's /state (the native
+# thin client, and joining-state adoption) gets realtime granularity. --ruleset watches live.json so
+# editing weapons / tech / tunables / shaders hot-reloads every participant with no restart.
+ExecStart=/opt/ce-build/spacegame-run/spacegame host \
+  --sector 0_0 --sector 1_0 --sector -1_0 --sector 0_1 --sector 0_-1 \
+  --hz 60 --ruleset /opt/ce-build/spacegame-run/live.json
+Restart=always
+RestartSec=3
+# The seed holds no secrets and only reaches the local CE node. Keep the box locked down; it only needs to
+# read its own working dir (the binary + the live ruleset file the watcher reads).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ce-build/spacegame-run
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
