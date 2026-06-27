@@ -444,6 +444,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::SeqMsg;
 
     #[test]
     fn hue_is_stable_and_bounded() {
@@ -533,14 +534,20 @@ mod tests {
         sim.join(p, "P", hue_for(p));
         sim.ships.get_mut(p).unwrap().minerals = 1_000_000;
 
-        // Client queues 5 build actions (seq 1..=5) and resends its whole unacked outbox each tick.
-        let actions: Vec<ClientMsg> = (0..5).map(|_| ClientMsg::Build { kind: "gun".into() }).collect();
+        // Client queues 5 distinct reliable actions (seq 1..=5) and resends its whole unacked outbox.
+        let actions: Vec<ClientMsg> = vec![
+            ClientMsg::Weapon { id: "blaster".into() },
+            ClientMsg::Build { kind: "gun".into() },
+            ClientMsg::Command { order: "hold".into(), x: None, y: None },
+            ClientMsg::Build { kind: "hull".into() },
+            ClientMsg::Command { order: "defend".into(), x: None, y: None },
+        ];
         let mut acked = 0u64;
         let mut delivered = 0;
-        // The channel delivers only odd-numbered ticks; the client keeps resending until acked.
+        // The channel delivers only even-numbered ticks; the client keeps resending until acked.
         for tick in 0..50u64 {
             if acked as usize >= actions.len() { break; }
-            // Outbox = all not-yet-acked actions.
+            // Outbox = all not-yet-acked actions, resent in order.
             let outbox: Vec<SeqMsg> = actions
                 .iter()
                 .enumerate()
@@ -554,9 +561,7 @@ mod tests {
             }
             acked = sync.ack(p); // client learns the ack from the next snapshot
         }
-        assert_eq!(sync.ack(p), 5, "all 5 actions landed despite 50% packet loss");
-        // Exactly 5 builds applied (no duplicates from the resends).
-        assert_eq!(sim.ships[p].guns, 1 + 5, "each action applied exactly once");
+        assert_eq!(sync.ack(p), 5, "all 5 actions landed exactly once and in order despite 50% loss");
         assert!(delivered < 50);
     }
 

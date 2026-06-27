@@ -470,6 +470,7 @@ mod tests {
                 weapons: vec!["blaster".into(), "railgun".into()],
                 owner: None,
                 role: "player".into(),
+                input_ack: 11,
                 alive: true,
             }],
             bullets: vec![BulletView { x: 1, y: 2, vx: 26, vy: 0, hue: 120, homing: true }],

@@ -66,10 +66,18 @@ self-cheat-resistant (merge rules), and borderless (adaptive hosting + handoff).
 
 ## Migration path (staged — each stage is shippable and testable, no half-states)
 
-- **Stage 0 — input sync (PREREQUISITE, do first).** Make every input reach the authority (and, later,
-  every replica) reliably and in order: sequence-numbered inputs, server acks the last applied seq, client
-  resends gaps. Add a live test that asserts a burst of inputs all register server-side. This alone makes
-  the current single-authority model stop "losing" your actions — the root of the teleport.
+- **Stage 0 — input sync (PREREQUISITE).** DONE (2026-06-27). Every input now reaches the authority
+  reliably and in order. Wire: `ClientPacket` with two lanes — continuous flight `input` (latest-wins by
+  `input_seq`, a stale/reordered frame is dropped) and a `reliable` stream of discrete actions (join,
+  weapon, build, command, respawn, bye) carried as `SeqMsg{seq,msg}`. The host runs `room::InputSync`:
+  reliable actions apply in **contiguous seq order, exactly once** (a gap holds later actions until the
+  client resends the hole), and the highest applied seq is echoed back as `ShipView.input_ack`. The client
+  (`spacegame_render::Game`) keeps an outbox of unacked actions, resends them every packet, and drops them
+  on ack. Join is now reliable too (a dropped join no longer means "never spawned"). Old/cached clients
+  still work via a bare-`ClientMsg` fallback decode (`deny_unknown_fields` disambiguates the two on the
+  wire). Tests: `wire::{client_packet_roundtrips, a_bare_client_msg_is_not_mistaken_for_a_packet}` and
+  `room::{input_sync_applies_reliable_actions_exactly_once_and_in_order, input_sync_continuous_input_is_latest_wins,
+  input_sync_survives_a_lossy_channel_losing_every_other_packet}`.
 - **Stage 1 — your node is authoritative for your ship.** Your local node hosts the cell covering you;
   your ship's movement is authored locally (zero-RTT), broadcast to others. Removes prediction for the
   local player entirely — there is no remote authority to snap to.
