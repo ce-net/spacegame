@@ -10,9 +10,11 @@
 use crate::aabb::{Aabb, AabbTree};
 use crate::faction::FactionCommand;
 use crate::sim::{Intent, ShipRole, Sim, SECTOR_SIZE};
+use std::collections::HashMap;
+
 use crate::wire::{
-    BeamView, BulletView, ClientMsg, DebrisView, ExplosionView, FactionView, KillView, ShipView, Snapshot,
-    SnapshotTag,
+    BeamView, BulletView, ClientMsg, ClientPacket, DebrisView, ExplosionView, FactionView, KillView,
+    ShipView, Snapshot, SnapshotTag,
 };
 
 /// Derive a stable, unspoofable hue (0..360) from a player's NodeId hex.
@@ -128,6 +130,72 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
     false
 }
 
+/// Per-player input-reliability state for one sector host. Sits BETWEEN the lossy mesh and the [`Sim`]:
+/// it turns the best-effort `/in` stream into an exactly-once, in-order application of every client
+/// action, and reports an ack the client uses to stop resending. This is the substrate the whole
+/// "your inputs always reach the authority" guarantee rests on (see `NETCODE.md`).
+///
+/// Two lanes, mirroring [`ClientPacket`]:
+/// * continuous `input` — latest-wins; a frame with a stale `input_seq` is dropped.
+/// * `reliable` actions — applied only when contiguous, so nothing is skipped and nothing double-applies.
+#[derive(Default)]
+pub struct InputSync {
+    /// player -> highest contiguous reliable seq APPLIED (also the value acked to that player).
+    applied: HashMap<String, u64>,
+    /// player -> highest continuous `input_seq` applied, to discard reordered/stale flight frames.
+    last_input: HashMap<String, u64>,
+}
+
+impl InputSync {
+    /// The reliable-input ack for `player`: the highest contiguous action seq applied. `0` = none yet.
+    pub fn ack(&self, player: &str) -> u64 {
+        self.applied.get(player).copied().unwrap_or(0)
+    }
+
+    /// Forget a player's reliability state (call when they leave / their ship is gone), so a rejoin
+    /// starts its sequence fresh instead of being rejected as "already applied".
+    pub fn forget(&mut self, player: &str) {
+        self.applied.remove(player);
+        self.last_input.remove(player);
+    }
+
+    /// Apply one packet from `from` (the authenticated sender). Returns `true` if it contained a `Bye`
+    /// (so the host can drop the player). Continuous input is latest-wins; reliable actions apply in
+    /// contiguous `seq` order, exactly once — a gap stops application until the client resends the hole.
+    pub fn apply(&mut self, sim: &mut Sim, from: &str, pkt: ClientPacket) -> bool {
+        // Lane 1: continuous flight input — newest wins, stale/reordered frames discarded.
+        if let Some(msg) = pkt.input {
+            let last = self.last_input.get(from).copied().unwrap_or(0);
+            // seq 0 = unsequenced (legacy / flush-only) -> always apply.
+            if pkt.input_seq == 0 || pkt.input_seq > last {
+                if pkt.input_seq != 0 {
+                    self.last_input.insert(from.to_string(), pkt.input_seq);
+                }
+                apply_client_msg(sim, from, msg);
+            }
+        }
+        // Lane 2: reliable actions — contiguous, exactly-once. Defensive sort (the client sends ascending).
+        let mut reliable = pkt.reliable;
+        reliable.sort_by_key(|m| m.seq);
+        let mut said_bye = false;
+        for sm in reliable {
+            let expected = self.applied.get(from).copied().unwrap_or(0) + 1;
+            if sm.seq == expected {
+                if apply_client_msg(sim, from, sm.msg) {
+                    said_bye = true;
+                }
+                self.applied.insert(from.to_string(), sm.seq);
+            } else if sm.seq < expected {
+                // A resend of something already applied — ignore (idempotent).
+            } else {
+                // A gap: an earlier seq is still missing. Stop; the client keeps resending it.
+                break;
+            }
+        }
+        said_bye
+    }
+}
+
 fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
     ShipView {
         id: id.to_string(),
@@ -150,6 +218,7 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         weapons: s.weapons.clone(),
         owner: s.owner.clone(),
         role: role_str(s.role).to_string(),
+        input_ack: 0, // stamped by the host loop from its InputSync after the snapshot is built
         alive: s.alive,
     }
 }
@@ -382,6 +451,113 @@ mod tests {
         assert_eq!(a, hue_for("deadbeef"));
         assert!(a < 360);
         assert_ne!(hue_for("aaaa"), hue_for("bbbb"));
+    }
+
+    fn reliable(seq: u64, msg: ClientMsg) -> ClientPacket {
+        ClientPacket { input: None, input_seq: 0, reliable: vec![SeqMsg { seq, msg }] }
+    }
+
+    #[test]
+    fn input_sync_applies_reliable_actions_exactly_once_and_in_order() {
+        let mut sim = Sim::new();
+        let mut sync = InputSync::default();
+        let p = "p";
+        sim.join(p, "P", hue_for(p));
+        sim.ships.get_mut(p).unwrap().minerals = 100_000;
+
+        // seq 1 builds twin-guns; applied, acked.
+        sync.apply(&mut sim, p, reliable(1, ClientMsg::Build { kind: "gun".into() }));
+        assert_eq!(sync.ack(p), 1);
+
+        // A DUPLICATE seq 1 (a resend that crossed an in-flight ack) is ignored — ack stays put.
+        sync.apply(&mut sim, p, reliable(1, ClientMsg::Build { kind: "gun".into() }));
+        assert_eq!(sync.ack(p), 1, "ack unchanged on a duplicate (no re-apply)");
+
+        // seq 3 arrives BEFORE seq 2 (a drop): it must be HELD, not applied, ack stays at 1.
+        sync.apply(&mut sim, p, reliable(3, ClientMsg::Weapon { id: "blaster".into() }));
+        assert_eq!(sync.ack(p), 1, "a gap blocks later seqs — nothing skipped");
+
+        // The client resends both 2 and 3 in one packet: now both apply, ack advances to 3.
+        sync.apply(
+            &mut sim,
+            p,
+            ClientPacket {
+                input: None,
+                input_seq: 0,
+                reliable: vec![
+                    SeqMsg { seq: 2, msg: ClientMsg::Build { kind: "gun".into() } },
+                    SeqMsg { seq: 3, msg: ClientMsg::Weapon { id: "blaster".into() } },
+                ],
+            },
+        );
+        assert_eq!(sync.ack(p), 3, "the hole filled, the stream caught up — no input lost");
+    }
+
+    #[test]
+    fn input_sync_continuous_input_is_latest_wins() {
+        let mut sim = Sim::new();
+        let mut sync = InputSync::default();
+        let p = "p";
+        sim.join(p, "P", hue_for(p));
+
+        let thrust = |seq: u64| ClientPacket {
+            input: Some(ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None }),
+            input_seq: seq,
+            reliable: vec![],
+        };
+        sync.apply(&mut sim, p, thrust(5));
+        assert!(sim.ships[p].want_thrust);
+        // A LATER frame turns thrust off.
+        sync.apply(
+            &mut sim,
+            p,
+            ClientPacket {
+                input: Some(ClientMsg::Input { thrust: false, turn: 0, fire: false, aim: None, name: None }),
+                input_seq: 6,
+                reliable: vec![],
+            },
+        );
+        assert!(!sim.ships[p].want_thrust);
+        // A STALE frame (seq 4, arriving reordered after 6) must be ignored — not re-enable thrust.
+        sync.apply(&mut sim, p, thrust(4));
+        assert!(!sim.ships[p].want_thrust, "a stale reordered frame is dropped");
+    }
+
+    #[test]
+    fn input_sync_survives_a_lossy_channel_losing_every_other_packet() {
+        // The directive: the server ALWAYS gets all our inputs. Model a 50%-loss channel and assert that
+        // resend makes every reliable action land exactly once, in order.
+        let mut sim = Sim::new();
+        let mut sync = InputSync::default();
+        let p = "p";
+        sim.join(p, "P", hue_for(p));
+        sim.ships.get_mut(p).unwrap().minerals = 1_000_000;
+
+        // Client queues 5 build actions (seq 1..=5) and resends its whole unacked outbox each tick.
+        let actions: Vec<ClientMsg> = (0..5).map(|_| ClientMsg::Build { kind: "gun".into() }).collect();
+        let mut acked = 0u64;
+        let mut delivered = 0;
+        // The channel delivers only odd-numbered ticks; the client keeps resending until acked.
+        for tick in 0..50u64 {
+            if acked as usize >= actions.len() { break; }
+            // Outbox = all not-yet-acked actions.
+            let outbox: Vec<SeqMsg> = actions
+                .iter()
+                .enumerate()
+                .map(|(i, m)| SeqMsg { seq: i as u64 + 1, msg: m.clone() })
+                .filter(|sm| sm.seq > acked)
+                .collect();
+            let pkt = ClientPacket { input: None, input_seq: 0, reliable: outbox };
+            if tick % 2 == 0 {
+                sync.apply(&mut sim, p, pkt); // delivered
+                delivered += 1;
+            }
+            acked = sync.ack(p); // client learns the ack from the next snapshot
+        }
+        assert_eq!(sync.ack(p), 5, "all 5 actions landed despite 50% packet loss");
+        // Exactly 5 builds applied (no duplicates from the resends).
+        assert_eq!(sim.ships[p].guns, 1 + 5, "each action applied exactly once");
+        assert!(delivered < 50);
     }
 
     #[test]

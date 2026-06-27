@@ -92,6 +92,53 @@ pub enum ClientMsg {
     Bye,
 }
 
+/// One reliably-delivered client action tagged with a per-player monotonic sequence number. The host
+/// applies each `seq` exactly once and in order, even when the underlying pub/sub drops or reorders
+/// packets — the client keeps resending unacked actions until the host's [`ShipView::input_ack`] covers
+/// them. Continuous flight input is NOT carried here (it is latest-wins; see [`ClientPacket::input`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeqMsg {
+    pub seq: u64,
+    pub msg: ClientMsg,
+}
+
+/// What a client publishes on a sector's `/in` topic each send-tick. It has two lanes with different
+/// reliability, because they need different guarantees:
+///
+/// * `input` — the latest continuous flight control (thrust/turn/fire/aim). **Unreliable, latest-wins**:
+///   a dropped frame is harmless because a newer one supersedes it; `input_seq` lets the host ignore a
+///   stale/reordered frame. No acks, no resend.
+/// * `reliable` — discrete actions (join, weapon switch, build, fleet command, respawn, bye) that must
+///   **never be lost**. Sequenced, applied exactly once and in order, and **resent every packet until
+///   acked**. This is what makes "the server ALWAYS gets all our inputs" true over a lossy mesh.
+///
+/// A bare legacy [`ClientMsg`] is NOT a valid packet (`deny_unknown_fields`), so a host can tell the two
+/// apart on the wire and still accept old clients via a fallback decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPacket {
+    /// Latest continuous flight input — normally a [`ClientMsg::Input`]. `None` on a packet that only
+    /// flushes reliable actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ClientMsg>,
+    /// Monotonic sequence for `input` so the host drops a stale/reordered frame. `0` = unsequenced.
+    #[serde(default)]
+    pub input_seq: u64,
+    /// Still-unacked reliable actions, ascending by `seq`. Resent until [`ShipView::input_ack`] covers them.
+    #[serde(default)]
+    pub reliable: Vec<SeqMsg>,
+}
+
+impl ClientPacket {
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
 /// One ship as broadcast in a [`Snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShipView {
@@ -135,6 +182,11 @@ pub struct ShipView {
     /// `"player" | "drone" | "fighter" | "hauler"`.
     #[serde(default)]
     pub role: String,
+    /// Reliable-input acknowledgement: the highest contiguous client-action sequence the host has
+    /// APPLIED for this player (see [`ClientPacket`]). The owning client drops acked actions from its
+    /// resend outbox. Only meaningful on the viewer's own ship; `0` for everyone else / NPCs.
+    #[serde(default)]
+    pub input_ack: u64,
     pub alive: bool,
 }
 
@@ -358,6 +410,36 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(ClientMsg::decode(b"not json").is_err());
         assert!(ClientMsg::decode(br#"{"t":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn client_packet_roundtrips() {
+        let pkt = ClientPacket {
+            input: Some(ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(0.5), name: None }),
+            input_seq: 42,
+            reliable: vec![
+                SeqMsg { seq: 7, msg: ClientMsg::Build { kind: "tech-railgun".into() } },
+                SeqMsg { seq: 8, msg: ClientMsg::Respawn },
+            ],
+        };
+        let bytes = pkt.encode().unwrap();
+        assert_eq!(ClientPacket::decode(&bytes).unwrap(), pkt);
+    }
+
+    #[test]
+    fn a_bare_client_msg_is_not_mistaken_for_a_packet() {
+        // The host tries ClientPacket first, then falls back to a bare ClientMsg. A legacy bare message
+        // MUST fail packet decode (deny_unknown_fields) so it is not silently swallowed as an empty packet.
+        let bare = ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None }.encode().unwrap();
+        assert!(ClientPacket::decode(&bare).is_err(), "bare ClientMsg must not decode as a ClientPacket");
+        assert!(ClientMsg::decode(&bare).is_ok(), "bare ClientMsg still decodes on the fallback path");
+    }
+
+    #[test]
+    fn an_empty_packet_is_valid() {
+        // A packet that only flushes reliable actions (no continuous input) is legal.
+        let pkt = ClientPacket::default();
+        assert_eq!(ClientPacket::decode(&pkt.encode().unwrap()).unwrap(), pkt);
     }
 
     #[test]
