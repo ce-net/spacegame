@@ -47,10 +47,12 @@ spacegame (SDK, default-features=false = wasm-clean, no mesh/tokio)
 > **IMPORTANT (git/GitHub policy): keep GitHub in sync with local, always — but cleanly.** All four
 > crates are separate public GitHub repos under the `ce-net` org, each with a `development` branch.
 > They are ALSO synced across the fleet by **ce-gitsync over the mesh**, so the local working trees
-> accumulate gitsync `live: ...` WIP snapshot commits. GitHub must mirror the local tree at all times;
-> local is the source of truth. Before each push, **scrub the gitsync `live: ...` WIP commits** so the
-> published history stays clean (every commit Leif-authored with a real message, tree byte-identical to
-> local HEAD), then **force-push local `development` over GitHub**. See §8 for the one-command flow.
+> accumulate gitsync `live: ...` WIP snapshot commits. GitHub must stay in sync with local; push
+> whenever you have new work. Before each push, **scrub the gitsync `live: ...` WIP commits** so the
+> published history stays clean (every commit Leif-authored with a real message). Then the normal flow
+> is **`git pull` (merge converging work) then `git push`** — expect to merge, since multiple
+> devices/agents push to the same branch. **Do NOT routinely force-push** — it clobbers others' work
+> and breaks healthy convergence; reserve it for exceptional recovery (see §8).
 
 ---
 
@@ -261,18 +263,20 @@ The clean push (every repo, same flow):
    re-snapshot each kept (non-gitsync) commit's tree onto a fresh linear history (each kept commit's
    tree already subsumes the WIP snapshots before it, so nothing is lost) and verify
    `git diff <old-HEAD> <new-HEAD>` is empty before moving the branch.
-3. **Force-push** local `development` over GitHub: `git push --force origin development`.
+3. **Pull, then push** — converge with whatever is already on GitHub:
 
 ```bash
-# After the scrub, sync each repo:
 for r in spacegame spacegame-render spacegame-native spacegame-wasm; do
-  git -C ~/ce-net/$r push --force origin development
+  git -C ~/ce-net/$r pull --rebase origin development   # merge converging work first
+  git -C ~/ce-net/$r push origin development
 done
 ```
 
 Notes:
-- Force-push is expected and correct — local is truth, GitHub mirrors it. There is no "curated
-  divergence" to protect anymore.
+- **Force-push is NOT routine.** GitHub is a shared remote — other devices/agents push too, so expect
+  healthy convergence and resolve it with a normal pull/merge. Force-pushing clobbers their work and
+  is dangerous. Use `git push --force` ONLY for exceptional recovery — e.g. a bad/garbage history got
+  onto the remote and the local tree is the agreed source of truth — and confirm that before doing it.
 - The pushed range must contain **zero** `ce-gitsync` commits (that is what "cleanly" means); the
   pre-push guard passes because the new commits are all real. gitsync itself still never touches
   GitHub — it syncs mesh + local only.
@@ -295,6 +299,6 @@ Notes:
 | Frontend only | `bash deploy/deploy.sh frontend` |
 | Smoke gate only | `bash deploy/deploy.sh smoke` |
 | Hot-reload rules | edit `/opt/ce-build/spacegame-run/live.json` on the relay |
-| Keep GitHub in sync | scrub gitsync `live:` WIP, then `git push --force origin development` (see §8) |
+| Keep GitHub in sync | scrub gitsync `live:` WIP, then `git pull --rebase` + `git push` (see §8) |
 
 Relay: `root@178.105.145.170` · App: `spa` -> `https://spa.ce-net.com/` · Map: `/map`.
