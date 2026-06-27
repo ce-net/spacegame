@@ -45,6 +45,7 @@ pub mod hazard;
 pub mod leaderboard;
 pub mod physics;
 pub mod procgen;
+pub mod replica;
 pub mod replication;
 pub mod room;
 pub mod ruleset;
