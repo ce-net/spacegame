@@ -95,7 +95,26 @@ they **commit** to, instead of recomputing a fresh goal every tick (which made t
   gains a `SHIPYARD` line next to `BUILD`. (Alloy count was already shown in the fleet HUD line.)
 - **`spacegame-native`**: **Shift+1..4** latches the same fit. Plain digits still buy tech on both.
 
-### 1.6 Tests
+### 1.6 Ship editor (compose parts → fit → hot reload)
+
+The authoring half of the build system, so designing a ship is hands-on, not hand-written JSON.
+
+- **`src/editor.rs`** — `ShipEditor`, a pure, tested model: place/remove/rotate parts on an integer
+  grid (`PlacedPart`), `to_blueprint()` lowers the grid into a `Blueprint` (one placement per part at
+  `cell * grid`), and `preview(catalog)` returns the live `Loadout` so a UI shows the ship's stats
+  (mass, top speed, agility, hull, guns, cargo, problems) **as you build**. It is plain serde JSON
+  (`to_json`/`from_json`) and ships a flyable `starter()` design.
+- **Custom fit** — `ClientMsg::FitDesign { design }` carries a whole composed `Blueprint` (not just a
+  named ruleset id). `Sim::fit_design` resolves it against the live parts catalogue (`resolve_design`),
+  bounds it (`editor::MAX_PARTS`, also after expansion), and refits the ship only if it is flyable — so
+  a malformed or brick design can never strand the player. Deterministic across replicas.
+- **Hot reload (native)** — a design is a file (`SPACEGAME_SHIP`, default
+  `<data-dir>/spacegame-ship.json`). The native client seeds a starter on first run, then watches the
+  file's mtime every frame (B forces a reload): edit-and-save and it parses the `ShipEditor`, prints the
+  previewed loadout as build feedback, and broadcasts `FitDesign` so the ship rebuilds live. The clean,
+  literal "easy to hot reload" loop: save the file, watch your ship change.
+
+### 1.7 Tests
 
 - `shipyard.rs` and `ai.rs` are fully unit-tested (loadout derivation, validity, lighter-is-faster;
   objective transitions, retreat/recover, vein commitment, target leading).
@@ -126,13 +145,19 @@ accidentally-committed build artifacts). Clients git-dep `spacegame`/`spacegame-
 
 ## 3. Remainders / follow-ups
 
-Build system
-- **No in-client ship editor yet.** The clients expose four fixed presets (`ship_slots()`); the SDK
-  already supports arbitrary nested blueprints, so a real "place parts → blueprint → Fit" UI is the
-  natural next step. `ship_slots()` is hardcoded in `spacegame-render`; consider a data-driven list
-  (e.g. a `Ruleset::fittable_ships()` helper that returns blueprints whose `Loadout` is flyable).
-- **Fitting is free.** Consider gating `fit_blueprint` on a cost in faction `alloys` (a real sink for
-  the mining loop) and/or only at a station/when stationary.
+Build system / editor
+- **Ship editor: model + native hot-reload shipped; richer UIs remain.** `src/editor.rs` + the native
+  file-watch deliver compose-parts → preview → fit-live. Still to do: an **interactive in-game editor**
+  (drag/click parts on a canvas) — native could render the `ShipEditor` grid and bind mouse placement;
+  and a **browser editor** for `spacegame-wasm` (it has no filesystem, so drive `ShipEditor` from a
+  canvas/localStorage/textarea and send `FitDesign`). The wasm/render fixed presets (`ship_slots()`)
+  still work alongside.
+- **Custom hull is not rendered as its design.** A `FitDesign` ship flies correctly (its `Loadout`
+  fields persist) but draws with the default/procgen shape, because only the loadout — not the part
+  layout — reaches the renderer. To draw the actual design, the host would need to expose the resolved
+  craft shape (e.g. `craft_to_shape_blueprint`) to clients, or the client keeps its own local design.
+- **Fitting is free.** Consider gating `fit_blueprint`/`fit_design` on a cost in faction `alloys` (a
+  real sink for the mining loop) and/or only at a station/when stationary.
 - **Native has no SHIPYARD HUD line** (only wasm does) — add the hint to `spacegame-native`'s HUD text.
 
 Mining / alloy
