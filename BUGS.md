@@ -122,6 +122,29 @@ Verbatim:
 Status: ❌ Stars need to be drawn fainter + smaller, and scale with zoom only partially (a reduced zoom
 response vs the foreground — a parallax-like feel). Related to B11.
 
+## Session outcome (after the "fix B2/B3/B4/B5/B10/B11 at once" order)
+Deployed: frontend `16fe95a7`, seed on new SDK. SDK 7459993 / render 5dd45fc / wasm ad6dfcb.
+- B2 ◐ — bullets now traverse the seam (no longer dropped at the sector edge; expire by `die_at`).
+  The deeper "enemies stop chasing across the seam" (cross-sim AI) + fully dynamic sectors still need
+  the SectorHost→single continuous frame change.
+- B3 ✅ — in-canvas parts palette with category-tab submenus, parts rendered real-time (verified live).
+- B4 ◐ — live blueprint previews render (bottom row) from real parts; the row overlaps the HUD bars and
+  needs repositioning.
+- B5 ✅ — editor now fits via `apply_local_now(me_id, …)` so it lands on YOUR OWN ship only (verify
+  in-game). Enemy ships keep their own designs (B6).
+- B10 ◐ — asteroids brightened; could not reproduce "never visible" headlessly (renders fine).
+- B11 ✅ — nebula + stars now scale with zoom (gently, less than foreground).
+- Note: `deploy/deploy.sh seed` exits 255 at its install step; worked around with a manual
+  `ce app install spacegame --yes && ce app daemon enable spacegame`. deploy.sh needs fixing.
+
+## Directive (verbatim, 2026-06-28)
+> "Yes the sectors should be dynamic and not chunks AND they should be able to transparently traverse chunks without noticing. the api should handle it for them. document verbatim.  Just to be clear: when you edit ships ONLY YOUR OWN SHIP is supposed to be modified. YOUR BUILDING YOUR OWN SHIP THE REST OF THE ENEMIES AND WORLD STAYS THE SAME. FIX ALL OF THESE ITEMS AT ONCE. DONT COMPILE AND VERIFY UNTIL THE END. ALL OF THE B2, B3, B4, B5, B10 AND B11 SHOULD ALL BE DONE AT ONCE. THIS IS AN ORDER"
+
+Clarifications captured:
+- B2: sectors must be DYNAMIC, not fixed chunks; bullets/ships/AI traverse boundaries transparently;
+  the API (SectorHost) handles traversal so callers never notice a seam.
+- B5: editing a ship modifies ONLY YOUR OWN ship — enemies and the world are untouched.
+
 ## Ops requests (verbatim)
 > "Push and merge everything"
 > "and then commit push and deploy"
