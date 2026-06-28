@@ -91,6 +91,12 @@ pub enum ClientMsg {
         y: Option<f32>,
     },
 
+    /// Fit a custom ship design composed in the in-canvas editor: resolve the [`crate::build::Blueprint`]
+    /// against the live parts catalogue, derive its loadout, and re-fit this player's ship (see
+    /// [`crate::sim::Sim::fit_design`]). Deterministic — every replica applies it identically.
+    #[serde(rename = "fit")]
+    FitDesign { design: crate::build::Blueprint },
+
     /// Request a respawn after death (honoured only once the cooldown elapsed).
     #[serde(rename = "respawn")]
     Respawn,

@@ -122,6 +122,9 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
                 sim.command_faction(from, cmd);
             }
         }
+        ClientMsg::FitDesign { design } => {
+            sim.fit_design(from, &design);
+        }
         ClientMsg::Respawn => {
             sim.respawn(from);
         }
