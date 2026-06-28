@@ -21,7 +21,7 @@ replica so the origin region is never cold.
    (IS a server:       │     ce-serve resolves Host→bundle (ce-hub), serves blobs, injects the mesh bridge │
     runs the full Sim) │     window.__ceNode  ⇄  /mesh-bridge (WS)  ⇄  ce node :8844  ⇄  the mesh         │
         │  WebSocket    │     players exchange tick-tagged /in inputs + quorum hashes over the mesh         │
-        └───────────────┤  ce-relay (`ce start`, TRANSPORT)  ←→  spacegame-seed.service (one warm,         │
+        └───────────────┤  ce-relay (`ce start`, TRANSPORT)  ←→  spacegame ceapp daemon (one warm,         │
                         │     :8844 mesh node                       NON-authoritative genesis replica)      │
                         └────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -30,7 +30,7 @@ replica so the origin region is never cold.
 
 | Half | What runs | Where | How |
 |---|---|---|---|
-| **Seed** | one lightweight, non-authoritative `spacegame host` replica on the genesis ring (keeps origin warm; one vote in the quorum) | `spacegame-seed.service` on the relay, `/opt/ce-build/spacegame-run/` | `deploy.sh seed` |
+| **Seed** | one lightweight, non-authoritative `spacegame host` replica on the genesis ring (keeps origin warm; one vote in the quorum) | the `spacegame` **ceapp daemon** (`ce app install`, supervised by `ce`; NEVER systemd) on the relay | `deploy.sh seed` |
 | **Frontend** | the browser client (`spacegame-wasm`: Rust→WASM + wgpu) — a FULL self-hosting replica, published as a **content-addressed bundle** | ce-serve (`spa.ce-net.com`) | `deploy.sh frontend` |
 
 Both build natively on the relay. The frontend is published with **`ce-serve-publish <dir> spa.ce-net.com spa`**:
@@ -57,7 +57,7 @@ joining player's ship comes back over the bridge. A red gate fails the deploy. S
 
 The world advances because the PLAYERS run it: the wasm bundle ships the full `Sim` and each browser is a
 `replica::Replica` advancing to the shared wall-clock tick, exchanging tick-tagged `/in` inputs and merging
-by quorum. So no server-class authority is needed — the relay's `spacegame-seed.service` is just one warm
+by quorum. So no server-class authority is needed — the relay's `spacegame` ceapp daemon is just one warm
 replica near genesis so the first arrival has a peer. Empty regions away from genesis are simply dropped
 (ce-net "scales on demand"). The old planet-scale adaptive node (`spacegame node`, see `../GALAXY-SCALE.md`)
 is no longer deployed; that machinery remains in the binary for a future where one box must carry a hot

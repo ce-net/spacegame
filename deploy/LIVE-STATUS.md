@@ -14,10 +14,11 @@ what is proven, and the honest remaining rungs.
   advancing to the shared wall-clock tick and rendering from its OWN state — it does not depend on any
   relay-published `/state`. Players exchange tick-tagged inputs on the sector `/in` topic and merge by
   quorum hash. Crossing a sector edge re-homes the replica onto the neighbour (no more teleport-to-centre).
-- **Seed:** `spacegame-seed.service` on the relay (`spacegame host --sector 0_0 1_0 -1_0 0_1 0_-1
-  --hz 60 --ruleset live.json`) — one lightweight, non-authoritative replica that keeps the genesis ring
-  warm and is outvoted by the player majority. The planet-scale `spacegame node` (gateway + leaderless
-  controller + autoscale) is **no longer deployed**. Hot-reloads `live.json`.
+- **Seed:** the `spacegame` **ceapp daemon** on the relay (`ce app install spacegame`, supervised by the
+  single `ce` node — NEVER systemd; `spacegame host --sector 0_0 1_0 n1_0 0_1 0_n1`, negative sectors in
+  the `n` token form) — one lightweight, non-authoritative replica that keeps the genesis ring warm and is
+  outvoted by the player majority. The planet-scale `spacegame node` (gateway + leaderless controller +
+  autoscale) is **no longer deployed**.
 - **Transport:** players reach each other (and the seed) through the same-origin `/ce` mesh bridge (nginx
   → relay CE node, token injected server-side) over the relay's libp2p transport / NAT traversal.
 
@@ -57,11 +58,12 @@ ssh-add ~/.ssh/id_ed25519                # or any relay key in your agent
 bash deploy/deploy.sh                     # dns + seed + frontend
 ```
 
-Runtime artifacts install to `/opt/ce-build/spacegame-run/` (binary + `live.json`) — OUTSIDE the synced
-source tree, so a `frontend` re-sync can't clobber the running seed. The seed's API token is injected via
-a systemd drop-in (`/etc/systemd/system/spacegame-seed.service.d/api-token.conf`), kept out of the repo.
-The `seed` deploy step also disables + removes the old `spacegame-node` / `spacegame-host` units on the
-relay, so the demotion to a seed is idempotent.
+The seed is a **ceapp**: `deploy.sh seed` builds the binary on the relay, `ce-publish app` uploads it as a
+content-addressed blob + stamps its digest into `ceapp.toml` + publishes the signed manifest to ce-hub, and
+`ce app install spacegame` materializes it; the single `ce` node supervises the daemon (`restart=on-failure`)
+and it inherits the node's mesh access (no systemd, no token drop-in). The hot-reloadable `live.json` lives
+in `/opt/ce-build/spacegame-run/` (outside the synced tree). The step also removes any legacy
+`spacegame-seed`/`spacegame-node`/`spacegame-host` **systemd** units, so migrating an old box is idempotent.
 
 **Serving: ce-serve only.** `spa.ce-net.com` is served by **ce-serve** from a content-addressed bundle
 (`ce-serve-publish`), NOT the hub. ce-serve injects `/__ce/mesh-bridge.js`, so the page gets

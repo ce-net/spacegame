@@ -172,11 +172,13 @@ bash deploy/deploy.sh smoke               # run the post-deploy smoke gate only
 What each stage does:
 
 - **seed** — rsyncs `../ce-rs` + `spacegame` to `/opt/ce-build` on the relay, `cargo build --release`
-  there, installs the binary to `/opt/ce-build/spacegame-run/spacegame` (outside the synced tree so a
-  later `frontend --delete` can't clobber it), seeds `live.json` if absent, installs/starts
-  `spacegame-seed.service`, injects the node `api.token` via a `systemd` drop-in
-  (`ProtectHome=true` blocks reading it directly), and retires the old authoritative
-  `spacegame-node`/`spacegame-host` units. The seed is **one vote**, outvoted by the player majority.
+  there, then publishes the binary as a **ceapp** (`ce-publish app ceapp.toml --bin target/release/spacegame
+  --target linux-amd64`: blob-upload + digest-stamp + signed manifest to ce-hub) and `ce app install
+  spacegame` + `ce app daemon enable`, so the single `ce` node supervises it (`restart=on-failure`,
+  inheriting the node's mesh access) — **NEVER systemd** (Leif's mandate). Seeds `live.json` in
+  `/opt/ce-build/spacegame-run/` if absent, and removes any legacy
+  `spacegame-seed`/`spacegame-node`/`spacegame-host` systemd units. The seed is **one vote**, outvoted by
+  the player majority.
 - **frontend** — rsyncs `ce-rs`, `spacegame`, `spacegame-render`, `spacegame-wasm`, builds the wasm
   with `RUSTFLAGS="-C link-arg=--growable-table"` (recent rust-lld emits a fixed-max function table;
   without this flag `table.grow()` fails at boot), stages a clean bundle (`index.html`, `boot.js`,
@@ -192,9 +194,9 @@ What each stage does:
 
 **Relay layout after deploy:**
 ```
-/opt/ce-build/spacegame-run/spacegame     # the host binary
+~/.local/share/ce/apps/spacegame/0.1.0/spacegame  # the seed binary (materialized ceapp artifact)
 /opt/ce-build/spacegame-run/live.json      # hot-reloadable ruleset (edit -> all clients reload)
-/etc/systemd/system/spacegame-seed.service # the genesis seed unit
+# seed runs as the `spacegame` ceapp daemon supervised by `ce` (ce app daemon ls) — NO systemd unit
 /opt/ce-build/spa-bundle/                  # staged browser bundle (published to ce-hub)
 ```
 

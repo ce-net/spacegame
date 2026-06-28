@@ -7,7 +7,8 @@
 # built natively ON the relay (the deploy target), never on the laptop:
 #
 #   1. SEED     — a single lightweight, non-authoritative `spacegame host` replica pinned to the genesis
-#                 ring (the `spacegame-seed` systemd service), so the region stays warm and the first
+#                 ring (the `spacegame` CEAPP daemon — `ce app install`, supervised by `ce`; NEVER
+#                 systemd), so the region stays warm and the first
 #                 player always has a peer to bootstrap/merge against. It is one vote in the quorum,
 #                 outvoted by the player majority. This REPLACES the old planet-scale `spacegame-node`
 #                 (gateway + leaderless controller + autoscale); that machinery (see GALAXY-SCALE.md) is
@@ -49,35 +50,39 @@ seed() {
   sync "$SIBS/ce-rs"     ce-rs
   sync "$HERE"           spacegame
   "${SSH[@]}" "$RELAY" 'source $HOME/.cargo/env; cd '"$REMOTE"'/spacegame && (cargo build --release > /tmp/spacegame-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-build.log; exit $rc)'
-  echo "==> install binary, seed the hot-reloadable ruleset, install + (re)start the genesis SEED replica"
-  rsync -az -e "$RSH" "$HERE"/deploy/spacegame-seed.service "$RELAY:/etc/systemd/system/spacegame-seed.service"
+  echo "==> publish spacegame as a CEAPP + (re)install its supervised genesis-seed daemon (NO systemd)"
+  # CE services are CEAPPS, never systemd units (Leif's mandate — see ../OPERATIONS.md). ce-publish
+  # blob-uploads the freshly built binary, stamps its content digest into ceapp.toml's [native.artifacts],
+  # signs + uploads the manifest to ce-hub; then `ce app install` materializes (fetch + sha256-verify) the
+  # binary and the single `ce` node supervises the daemon (restart=on-failure). The daemon args in
+  # ceapp.toml host the genesis plus-ring; negative sectors use the `n` token form (n1_0/0_n1).
   "${SSH[@]}" "$RELAY" '
-    # Install runtime artifacts to a dir OUTSIDE the synced source tree, so `deploy.sh frontend` (which
-    # re-syncs the sources with rsync --delete) can never delete the running binary or live ruleset.
-    mkdir -p /opt/ce-build/spacegame-run &&
-    install -m755 '"$REMOTE"'/spacegame/target/release/spacegame /opt/ce-build/spacegame-run/spacegame.new &&
-    mv -f /opt/ce-build/spacegame-run/spacegame.new /opt/ce-build/spacegame-run/spacegame &&
-    # Seed the live ruleset file the seed watches (built-in template) if it is not there yet, so a
-    # designer can edit /opt/ce-build/spacegame-run/live.json on the relay and hot-reload every player.
-    [ -f /opt/ce-build/spacegame-run/live.json ] || /opt/ce-build/spacegame-run/spacegame ruleset init /opt/ce-build/spacegame-run/live.json &&
-    # DECENTRALIZE: retire the relay-side AUTHORITATIVE game servers. The planet-scale adaptive node
-    # (gateway + controller + autoscale) and the old pinned-sector host are gone; players are the server.
-    # The relay keeps only its TRANSPORT role (ce-relay) + this one warm genesis seed replica.
-    systemctl disable --now spacegame-node >/dev/null 2>&1 || true &&
-    systemctl disable --now spacegame-host >/dev/null 2>&1 || true &&
-    rm -f /etc/systemd/system/spacegame-node.service /etc/systemd/system/spacegame-host.service &&
-    rm -rf /etc/systemd/system/spacegame-node.service.d &&
-    # The seed makes mutating mesh calls (subscribe/publish) that need the local CE node API token. The
-    # unit runs with ProtectHome=true (so it cannot read ~/.local/share/ce/api.token), so we inject the
-    # token via a drop-in the SDK reads from $CE_API_TOKEN — secret kept OUT of the repo unit.
-    mkdir -p /etc/systemd/system/spacegame-seed.service.d &&
-    printf "[Service]\nEnvironment=CE_API_TOKEN=%s\n" "$(cat /root/.local/share/ce/api.token)" > /etc/systemd/system/spacegame-seed.service.d/api-token.conf &&
-    chmod 600 /etc/systemd/system/spacegame-seed.service.d/api-token.conf &&
-    systemctl daemon-reload && systemctl enable spacegame-seed >/dev/null 2>&1 &&
-    systemctl restart spacegame-seed && sleep 2 &&
-    printf "service: " && systemctl is-active spacegame-seed &&
-    journalctl -u spacegame-seed -n 8 --no-pager | sed "s/^/    /"'
-  echo "==> spacegame genesis seed live on the relay (warm peer near origin; players are the server)"
+    set -e
+    export CE_API_TOKEN=$(cat /root/.local/share/ce/api.token)
+    cd '"$REMOTE"'/spacegame
+    # Seed the hot-reloadable ruleset OUTSIDE the synced tree (a frontend re-sync cannot clobber it), so a
+    # designer can edit /opt/ce-build/spacegame-run/live.json on the relay. (The ceapp host loads it from
+    # there via the daemon CWD; see ceapp.toml.)
+    mkdir -p /opt/ce-build/spacegame-run
+    [ -f /opt/ce-build/spacegame-run/live.json ] || ./target/release/spacegame ruleset init /opt/ce-build/spacegame-run/live.json
+    # MIGRATE off every legacy systemd unit (the old systemd seed + the retired authoritative node/host).
+    for u in spacegame-seed spacegame-node spacegame-host; do
+      systemctl disable --now "$u" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$u.service"; rm -rf "/etc/systemd/system/$u.service.d"
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Publish the ceapp (upload the fresh binary as a blob + stamp its digest + sign + upload manifest),
+    # then re-install so `ce app install` materializes the NEW digest (uninstall first: install skips an
+    # already-installed app, and uninstall does not stop a running instance, so we also pkill it).
+    ce-publish app ceapp.toml --bin target/release/spacegame --target linux-amd64 --hub '"$HUB"'
+    ce app uninstall spacegame >/dev/null 2>&1 || true
+    pkill -f "apps/spacegame/.*/spacegame host" >/dev/null 2>&1 || true
+    ce app install spacegame --yes --registry '"$HUB"'
+    ce app daemon enable spacegame >/dev/null 2>&1 || true
+    sleep 6
+    printf "daemon supervised: "; ce app daemon ls 2>/dev/null | grep -q spacegame && echo yes || echo NO
+    ps -eo pid,etimes,cmd | grep "spacegame host" | grep -v grep | sed "s/^/    /"'
+  echo "==> spacegame genesis seed live as a ceapp daemon (warm peer near origin; players are the server)"
 }
 # Back-compat alias: the relay half used to be the authoritative "backend"; it is now just a seed.
 backend() { seed; }
