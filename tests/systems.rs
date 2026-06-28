@@ -144,8 +144,8 @@ fn replica_set_promotes_and_re_replicates_on_failure() {
 fn busy_sim() -> Sim {
     let mut s = Sim::new();
     s.seamless = false;
-    apply_client_msg(&mut s, "a", ClientMsg::Join { name: "Ace".into(), cap: None });
-    apply_client_msg(&mut s, "b", ClientMsg::Join { name: "Bee".into(), cap: None });
+    apply_client_msg(&mut s, "a", ClientMsg::Join { name: "Ace".into() });
+    apply_client_msg(&mut s, "b", ClientMsg::Join { name: "Bee".into() });
     s.ships.get_mut("a").unwrap().minerals = 500;
     apply_client_msg(&mut s, "a", ClientMsg::Build { kind: "tech-missile".into() });
     apply_client_msg(&mut s, "a", ClientMsg::Weapon { id: "missile".into() });
@@ -240,8 +240,8 @@ fn fleet_obeys_a_command() {
 fn a_mobile_viewport_only_receives_nearby_entities() {
     let mut s = Sim::new();
     s.seamless = false;
-    apply_client_msg(&mut s, "near", ClientMsg::Join { name: "N".into(), cap: None });
-    apply_client_msg(&mut s, "far", ClientMsg::Join { name: "F".into(), cap: None });
+    apply_client_msg(&mut s, "near", ClientMsg::Join { name: "N".into() });
+    apply_client_msg(&mut s, "far", ClientMsg::Join { name: "F".into() });
     s.ships.get_mut("near").unwrap().x = 200.0;
     s.ships.get_mut("near").unwrap().y = 200.0;
     s.ships.get_mut("far").unwrap().x = 2800.0;

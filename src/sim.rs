@@ -73,9 +73,6 @@ impl ShipRole {
 pub const SECTOR_SIZE: f32 = 9000.0;
 /// Grid cell size for the shared deterministic asteroid field (sector-local).
 pub const ROCK_CELL: f32 = 300.0;
-/// Collision radius of an asteroid — used when a projectile strikes a rock (you can shoot rocks apart,
-/// not only grind them by flying into them).
-pub const ROCK_R: f32 = 26.0;
 /// Ship collision / pickup radius.
 pub const SHIP_R: f32 = 18.0;
 /// Canonical max speed (world units / tick). The single source of truth that both the authoritative
@@ -84,11 +81,8 @@ pub const SHIP_R: f32 = 18.0;
 pub const MAX_SPEED: f32 = 16.0;
 /// Canonical thrust accel (world units / tick^2) — snappy off-the-line response.
 pub const THRUST: f32 = 0.95;
-/// Canonical per-tick velocity damping. Higher = more glide/momentum (still self-arresting). Tuned up
-/// from the old arcade `0.965` toward true Newtonian drift: a ship now coasts on its momentum and you
-/// fly it by managing inertia (thrust to build speed, thrust against it to shed it) rather than stopping
-/// dead the instant you release thrust. Still <1 so a drifting ship eventually settles.
-pub const DAMPING: f32 = 0.984;
+/// Canonical per-tick velocity damping. Higher = more glide/momentum (still self-arresting).
+pub const DAMPING: f32 = 0.965;
 /// Canonical turn rate (radians / tick) — tight mouse-aim tracking.
 pub const TURN_RATE: f32 = 0.22;
 /// Base hull / max hull at spawn (reference base; live value from [`Tunables::base_hp`]).
@@ -183,23 +177,6 @@ pub struct Ship {
     pub speed_lv: u32,
     /// Number of blaster barrels (the legacy multi-gun spread), 1..=`max_guns`.
     pub guns: u32,
-    /// **Built design — physical mass.** `1.0` is the stock hull; a ship fitted from a blueprint takes
-    /// the design's total mass, which drives `a = F/m` thrust and the momentum traded in a collision.
-    #[serde(default = "one_f32")]
-    pub mass: f32,
-    /// **Built design — max-speed multiplier** from the design's thrust-to-weight (`1.0` = stock).
-    #[serde(default = "one_f32")]
-    pub speed_mult: f32,
-    /// **Built design — acceleration/agility multiplier** from the design's thrust-to-weight.
-    #[serde(default = "one_f32")]
-    pub thrust_mult: f32,
-    /// **Built design — cargo capacity** from the design's tanks/containers.
-    #[serde(default)]
-    pub cargo: f32,
-    /// Blueprint id this ship was built from, or `""` for the stock hull. Lets the renderer draw the
-    /// player's actual design and the HUD name it.
-    #[serde(default)]
-    pub hull: String,
     /// Currently selected weapon id (into the live ruleset's catalogue).
     pub weapon: String,
     /// Weapon ids the ship has unlocked and may select.
@@ -233,15 +210,6 @@ pub struct Ship {
     pub want_fire: bool,
     #[serde(skip)]
     pub last_input_tick: u64,
-    /// Objective-driven NPC brain (server-owned, transient — recomputed each tick with commitment, never
-    /// serialized). Ignored for human players.
-    #[serde(skip)]
-    pub ai: crate::ai::Objective,
-}
-
-/// serde default for the built-design multipliers/mass: the stock hull is `1.0`.
-fn one_f32() -> f32 {
-    1.0
 }
 
 impl Ship {
@@ -266,11 +234,6 @@ impl Ship {
             kills: 0,
             speed_lv: 0,
             guns: 1,
-            mass: 1.0,
-            speed_mult: 1.0,
-            thrust_mult: 1.0,
-            cargo: 0.0,
-            hull: String::new(),
             weapon: default_weapon.clone(),
             weapons: vec![default_weapon],
             owned: Vec::new(),
@@ -285,7 +248,6 @@ impl Ship {
             want_turn: 0,
             want_fire: false,
             last_input_tick: tick,
-            ai: crate::ai::Objective::Idle,
         }
     }
 
@@ -327,11 +289,6 @@ impl Ship {
             kills: snap.kills,
             speed_lv: snap.speed_lv,
             guns: snap.guns,
-            mass: if snap.mass > 0.0 { snap.mass } else { 1.0 },
-            speed_mult: if snap.speed_mult > 0.0 { snap.speed_mult } else { 1.0 },
-            thrust_mult: if snap.thrust_mult > 0.0 { snap.thrust_mult } else { 1.0 },
-            cargo: snap.cargo,
-            hull: snap.hull.clone(),
             weapon: if snap.weapon.is_empty() { "blaster".into() } else { snap.weapon.clone() },
             weapons: if snap.weapons.is_empty() { vec![snap.weapon.clone()] } else { snap.weapons.clone() },
             owned: snap.owned.clone(),
@@ -346,53 +303,17 @@ impl Ship {
             want_turn: 0,
             want_fire: false,
             last_input_tick: tick,
-            ai: crate::ai::Objective::Idle,
         }
     }
 
-    /// Effective max speed after thruster upgrades AND the built design's thrust-to-weight, given the
-    /// live tunables.
+    /// Effective max speed after thruster upgrades, given the live tunables.
     pub fn max_speed_t(&self, tun: &Tunables) -> f32 {
-        tun.max_speed * (1.0 + self.speed_lv as f32 * tun.thruster_step) * self.speed_mult
+        tun.max_speed * (1.0 + self.speed_lv as f32 * tun.thruster_step)
     }
 
-    /// Effective thrust accel after thruster upgrades AND the built design's thrust-to-weight.
+    /// Effective thrust accel after thruster upgrades, given the live tunables.
     pub fn accel_t(&self, tun: &Tunables) -> f32 {
-        tun.thrust * (1.0 + self.speed_lv as f32 * tun.thruster_step) * self.thrust_mult
-    }
-
-    /// **Apply a built [`Loadout`](crate::shipyard::Loadout)** to this ship — the moment a design becomes
-    /// the craft you fly. Hull, mass, handling, weapon mounts, shield and capacitor all come from the
-    /// parts. Hull is healed to the new max so refitting at a station fixes you up; current minerals,
-    /// kills, tech and position are kept. The caller (the sim) only applies *flyable* loadouts.
-    pub fn apply_loadout(&mut self, lo: &crate::shipyard::Loadout, hull: &str) {
-        self.max_hp = lo.max_hp;
-        self.hp = lo.max_hp;
-        self.mass = lo.mass.max(0.05);
-        self.speed_mult = lo.speed_mult;
-        self.thrust_mult = lo.thrust_mult;
-        self.cargo = lo.cargo;
-        self.hull = hull.to_string();
-        if !lo.weapons.is_empty() {
-            // Union the design's mounts into the unlocked set, and select the primary.
-            for w in &lo.weapons {
-                if !self.weapons.contains(w) {
-                    self.weapons.push(w.clone());
-                }
-            }
-            if let Some(p) = &lo.primary {
-                self.weapon = p.clone();
-            }
-            self.guns = lo.guns.clamp(1, 8);
-        }
-        if lo.shield > 0 {
-            self.max_shield = lo.shield;
-            self.shield = lo.shield;
-        }
-        if lo.energy > 0.0 {
-            self.max_energy = lo.energy;
-            self.energy = lo.energy;
-        }
+        tun.thrust * (1.0 + self.speed_lv as f32 * tun.thruster_step)
     }
 
     /// Reference max speed using the legacy default constants (kept for tests / callers without a
@@ -423,11 +344,6 @@ impl Ship {
             kills: self.kills,
             speed_lv: self.speed_lv,
             guns: self.guns,
-            mass: self.mass,
-            speed_mult: self.speed_mult,
-            thrust_mult: self.thrust_mult,
-            cargo: self.cargo,
-            hull: self.hull.clone(),
             weapon: self.weapon.clone(),
             weapons: self.weapons.clone(),
             owned: self.owned.clone(),
@@ -522,9 +438,6 @@ pub enum PickupKind {
     Overcharge,
     /// A cache of salvaged minerals.
     Minerals,
-    /// A nugget of **alloy** shattered off a mined asteroid — the satisfying loot of the mining loop.
-    /// It magnetises toward a nearby ship and is scooped up, banking to the ship's haul + faction alloys.
-    Alloy,
 }
 
 impl PickupKind {
@@ -535,7 +448,6 @@ impl PickupKind {
             PickupKind::EnergyCell => 2,
             PickupKind::Overcharge => 3,
             PickupKind::Minerals => 4,
-            PickupKind::Alloy => 5,
         }
     }
 }
@@ -546,13 +458,7 @@ pub struct Pickup {
     pub kind: PickupKind,
     pub x: f32,
     pub y: f32,
-    /// Velocity — alloy nuggets fly off a shattered rock and then glide (magnetise) toward a nearby
-    /// ship. `0` for static powerups. `#[serde(default)]` so older snapshots decode.
-    #[serde(default)]
-    pub vx: f32,
-    #[serde(default)]
-    pub vy: f32,
-    /// Effect-specific magnitude (hull/shield/energy points, overcharge fraction, mineral/alloy count).
+    /// Effect-specific magnitude (hull/shield/energy points, overcharge fraction, mineral count).
     pub value: f32,
     pub hue: u32,
     /// Tick at which the pickup despawns if uncollected.
@@ -639,11 +545,6 @@ pub struct Sim {
     /// from the sector coordinate. Empty for the calm home sector `(0,0)` and for `Sim::new()`.
     pub hazards: Hazards,
     mined: HashMap<(i32, i32), u64>,
-    /// **In-progress mining damage:** remaining hull of a rock that has been hit but not yet shattered,
-    /// keyed by its cell. A rock you are chipping at lives here until its hp reaches 0 (it then shatters
-    /// into alloy nuggets and the cell moves to `mined` for the regen cooldown). Absent = full health.
-    /// Deterministic — every replica chips the same rock by the same amount on the same tick.
-    rock_dmg: HashMap<(i32, i32), u32>,
     pub kill_feed: Vec<KillEvent>,
     /// Beams emitted this tick (railgun/laser) for the wire snapshot. Cleared each tick.
     pub beams: Vec<BeamEvent>,
@@ -672,7 +573,6 @@ impl Default for Sim {
             pickups: Vec::new(),
             hazards: Hazards::empty(),
             mined: HashMap::new(),
-            rock_dmg: HashMap::new(),
             kill_feed: Vec::new(),
             beams: Vec::new(),
             explosions: Vec::new(),
@@ -749,64 +649,6 @@ impl Sim {
 
     pub fn leave(&mut self, id: &str) {
         self.ships.remove(id);
-    }
-
-    /// **Build & fit a ship from a blueprint.** Resolves the named blueprint against the live ruleset's
-    /// parts catalogue ([`crate::build::resolve_blueprint`]), derives its gameplay
-    /// [`Loadout`](crate::shipyard::Loadout), and — only if the design is *flyable* (has a command centre
-    /// and an engine) — re-fits the player's ship to it. A live (alive) ship is refitted in place; a
-    /// dead one keeps the design for its next respawn. Returns `false` (and changes nothing) for an
-    /// unknown blueprint or an unflyable design, so a player can never strand themselves in a brick.
-    ///
-    /// Authoritative and deterministic: the catalogue is part of the shared ruleset, so every replica
-    /// resolves the identical loadout.
-    pub fn fit_blueprint(&mut self, id: &str, blueprint: &str) -> bool {
-        let craft = match self.rules.resolve_craft(blueprint, &std::collections::BTreeMap::new()) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let lo = crate::shipyard::loadout_from_craft(&craft);
-        if !lo.is_flyable() {
-            return false;
-        }
-        match self.ships.get_mut(id) {
-            Some(s) => {
-                s.apply_loadout(&lo, blueprint);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// **Build & fit a CUSTOM design** the player composed in the ship editor (see [`crate::editor`]).
-    /// Resolves the provided [`Blueprint`](crate::build::Blueprint) against the live parts catalogue
-    /// (not a named ruleset entry), derives its [`Loadout`](crate::shipyard::Loadout), and re-fits the
-    /// ship — only if it resolves, stays within the part bound, and is flyable. Returns `false` (no
-    /// change) otherwise, so a malformed or brick design can never strand the player. Authoritative and
-    /// deterministic: every replica resolves the same bytes to the same loadout.
-    pub fn fit_design(&mut self, id: &str, design: &crate::build::Blueprint) -> bool {
-        // Bound the work an over-the-wire design can impose before resolving it.
-        if design.root.len() > crate::editor::MAX_PARTS {
-            return false;
-        }
-        let craft = match crate::build::resolve_design(&self.rules.catalog(), design, &std::collections::BTreeMap::new()) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        if craft.parts.len() > crate::editor::MAX_PARTS {
-            return false; // a nested design could expand past the bound
-        }
-        let lo = crate::shipyard::loadout_from_craft(&craft);
-        if !lo.is_flyable() {
-            return false;
-        }
-        match self.ships.get_mut(id) {
-            Some(s) => {
-                s.apply_loadout(&lo, "custom");
-                true
-            }
-            None => false,
-        }
     }
 
     /// Accept a ship handed off from a neighbouring sector (the other end of [`take_transits`]).
@@ -1003,8 +845,7 @@ impl Sim {
                 continue;
             }
 
-            // Cells this ship is in mining reach of this tick: (cx, cy, rock value, rock base hp).
-            let mut mine_cells: Vec<(i32, i32, u32, u32)> = Vec::new();
+            let mut mined_now: Vec<(i32, i32, u32)> = Vec::new();
             let mut transit: Option<Transit> = None;
             {
                 let s = self.ships.get_mut(id).expect("present");
@@ -1117,9 +958,7 @@ impl Sim {
                     }
                 }
 
-                // Mining: a ship overlapping a live asteroid grinds it down — it is NOT instant. Each
-                // tick chips the rock's hull; when it breaks it shatters into alloy nuggets you then
-                // scoop up. Collect the cells in reach here; apply the damage after the `s` borrow ends.
+                // Mining: a ship overlapping a live asteroid mines it out.
                 if transit.is_none() {
                     let (sx, sy) = (s.x, s.y);
                     let reach = SHIP_R + 22.0;
@@ -1138,7 +977,7 @@ impl Sim {
                             let ddx = r.x - sx;
                             let ddy = r.y - sy;
                             if ddx * ddx + ddy * ddy <= reach * reach {
-                                mine_cells.push((cx, cy, r.val, r.hp));
+                                mined_now.push((cx, cy, r.val));
                             }
                         }
                     }
@@ -1150,10 +989,21 @@ impl Sim {
                 self.transit_out.push(t);
                 continue;
             }
-            // Grind each rock in reach by the mining rate; a shattered rock drops alloy nuggets.
-            let mine_rate = tun.mine_rate.max(1);
-            for (cx, cy, val, base_hp) in mine_cells {
-                self.damage_rock(cx, cy, base_hp, val, mine_rate, now);
+            for (cx, cy, val) in mined_now {
+                self.mined.insert((cx, cy), now);
+                // The faction credited is the ship's owner (so an NPC drone banks to your faction, and
+                // a player's own mining banks to theirs).
+                let fid = self
+                    .ships
+                    .get(id)
+                    .map(|s| s.faction_id(id).to_string())
+                    .unwrap_or_else(|| id.to_string());
+                if let Some(s) = self.ships.get_mut(id) {
+                    s.minerals = s.minerals.saturating_add(val);
+                }
+                if let Some(f) = self.factions.get_mut(&fid) {
+                    f.deposit_minerals(val as u64);
+                }
             }
         }
 
@@ -1264,11 +1114,6 @@ impl Sim {
             let regen = tun.rock_regen_ticks;
             self.mined.retain(|_, &mut t| now.saturating_sub(t) < regen);
         }
-        // Drop in-progress mining damage for rocks that have since gone onto the regen cooldown (they
-        // were shattered), so a half-mined rock left alone does not pin an entry forever.
-        if self.rock_dmg.len() > 2048 {
-            self.rock_dmg.retain(|cell, _| !self.mined.contains_key(cell));
-        }
     }
 
     /// Build the recursive AABB tree over alive ships, keyed by ship id. Rebuilt every tick from final
@@ -1318,7 +1163,7 @@ impl Sim {
             } else {
                 self.factions.get(&owner).map(|f| f.command).unwrap_or_default()
             };
-            let (obj, tx, ty, want_fire) = self.npc_decide(&id, role, &owner, x, y, cmd, &tree);
+            let (tx, ty, want_fire) = self.npc_goal(&id, role, &owner, x, y, cmd, &tree);
             // ANTI-RAM: never steer an escort INTO its owner. If a unit ends up closer to its commanding
             // player than the standoff radius, push its goal radially outward so the fleet screens you
             // instead of piling on and crashing. (Engaging an enemy overrides this — that's real combat.)
@@ -1336,7 +1181,6 @@ impl Sim {
                 }
             }
             if let Some(s) = self.ships.get_mut(&id) {
-                s.ai = obj; // commit the chosen objective for next tick's hysteresis
                 let dx = tx - x;
                 let dy = ty - y;
                 let dist = (dx * dx + dy * dy).sqrt();
@@ -1357,11 +1201,10 @@ impl Sim {
         }
     }
 
-    /// **Decide an NPC's next objective and steer to it.** Wraps the pure policy in [`crate::ai`] with
-    /// the world queries it needs (nearest enemy *with velocity*, nearest mineable rock) and commits to
-    /// the result via the ship's transient brain, so units press an attack, strip a vein, or break off
-    /// instead of dithering. Returns `(objective, goal_x, goal_y, want_fire)`. Pure read of the world.
-    fn npc_decide(
+    /// Decide an NPC's goal point and whether to open fire, from its role and its faction's standing
+    /// [`FactionCommand`]. Fighters engage enemies (any ship of another faction); drones seek asteroids;
+    /// haulers escort. The "owner" anchor is the commanding player's own ship if present.
+    fn npc_goal(
         &self,
         id: &str,
         role: ShipRole,
@@ -1370,137 +1213,55 @@ impl Sim {
         y: f32,
         cmd: FactionCommand,
         tree: &AabbTree<String>,
-    ) -> (crate::ai::Objective, f32, f32, bool) {
-        use crate::ai::{self, Contact, Objective, Senses, ENGAGE_KEEP};
-        let now = self.tick;
-        let cur = self.ships.get(id).map(|s| s.ai.clone()).unwrap_or_default();
-        let (hp, max_hp) = self.ships.get(id).map(|s| (s.hp, s.max_hp)).unwrap_or((1, 1));
-        let hp_frac = (hp.max(0) as f32) / (max_hp.max(1) as f32);
-
-        // The engage radius this fighter uses under its current order (0 for non-combat roles).
-        let engage_r = if role == ShipRole::Fighter {
-            match cmd {
-                FactionCommand::AttackNearest => 4000.0,
-                FactionCommand::Defend => 950.0,
-                FactionCommand::Hold => 700.0,
-                FactionCommand::AttackMove { .. } => 1100.0,
-                _ => 850.0,
-            }
-        } else {
-            0.0
-        };
-
-        // Nearest enemy as a full contact (carries velocity, for target leading). Searched a touch beyond
-        // the nominal range so a committed lock can be HELD out to ENGAGE_KEEP before it is dropped.
-        let enemy = if engage_r > 0.0 {
-            self.nearest_enemy_of(owner, x, y, engage_r * ENGAGE_KEEP, tree).and_then(|eid| {
-                self.ships.get(&eid).map(|e| Contact {
-                    id: eid.clone(),
-                    x: e.x,
-                    y: e.y,
-                    vx: e.vx,
-                    vy: e.vy,
-                    dist: ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt(),
-                })
-            })
-        } else {
-            None
-        };
-
-        let rock = if role == ShipRole::Drone { self.nearest_live_rock_cell(x, y, 1400.0) } else { None };
-        let current_rock_live = match &cur {
-            Objective::Mine { cx, cy } => self.rock_cell_live(*cx, *cy),
-            _ => false,
-        };
-        let current_target_held = match &cur {
-            Objective::Engage { target, .. } => self
-                .ships
-                .get(target)
-                .map(|t| t.alive && ((t.x - x).powi(2) + (t.y - y).powi(2)).sqrt() <= (engage_r * ENGAGE_KEEP).max(1.0))
-                .unwrap_or(false),
-            _ => false,
-        };
-
-        let senses = Senses { now, hp_frac, enemy: enemy.clone(), rock, current_rock_live, current_target_held, engage_r };
-        let obj = ai::next_objective(role, cmd, &cur, &senses);
-        let (tx, ty, fire) = self.objective_goal(&obj, id, owner, x, y, enemy.as_ref());
-        (obj, tx, ty, fire)
-    }
-
-    /// Translate a chosen [`Objective`](crate::ai::Objective) into a concrete steer-toward point and a
-    /// fire decision. Engaging leads the target ([`crate::ai::lead_target`]) using the ship's own weapon
-    /// muzzle speed; retreating flees directly away from the threat; everything else falls back to the
-    /// formation ring around the owner.
-    fn objective_goal(
-        &self,
-        obj: &crate::ai::Objective,
-        id: &str,
-        owner: &str,
-        x: f32,
-        y: f32,
-        enemy: Option<&crate::ai::Contact>,
     ) -> (f32, f32, bool) {
-        use crate::ai::{self, Objective};
-        let anchor =
-            self.ships.get(owner).map(|s| (s.x, s.y)).unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
-        match obj {
-            Objective::Idle => (x, y, false),
-            Objective::Move { x: mx, y: my } => (*mx, *my, false),
-            Objective::Escort => {
-                let e = self.escort_slot(id, anchor);
-                (e.0, e.1, false)
-            }
-            Objective::Mine { cx, cy } => match rock_in_cell(*cx, *cy) {
-                Some(r) => (r.x, r.y, false),
-                None => {
-                    let e = self.escort_slot(id, anchor);
-                    (e.0, e.1, false)
-                }
-            },
-            Objective::Retreat { .. } => {
-                if let Some(c) = enemy {
-                    // Run directly away from the threat.
-                    let ang = (y - c.y).atan2(x - c.x);
-                    let r = 1200.0;
-                    ((x + ang.cos() * r).clamp(0.0, SECTOR_SIZE), (y + ang.sin() * r).clamp(0.0, SECTOR_SIZE), false)
-                } else {
-                    let e = self.escort_slot(id, anchor);
-                    (e.0, e.1, false)
-                }
-            }
-            Objective::Engage { target, .. } => match self.ships.get(target) {
-                Some(e) => {
-                    let proj = self.npc_proj_speed(id);
-                    let (lx, ly) = ai::lead_target(x, y, e.x, e.y, e.vx, e.vy, proj);
+        let anchor = self
+            .ships
+            .get(owner)
+            .map(|s| (s.x, s.y))
+            .unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+        // A stable slot on a ring around the owner: each unit holds a distinct angle (hashed from its id)
+        // and the whole screen drifts slowly, so the fleet forms a defensive ring AROUND you rather than
+        // converging on your exact position and crashing into you.
+        let escort = self.escort_slot(id, anchor);
+        match role {
+            ShipRole::Fighter => {
+                let engage_r = match cmd {
+                    FactionCommand::AttackNearest => 4000.0,
+                    FactionCommand::Defend => 950.0,
+                    FactionCommand::Hold => 700.0,
+                    FactionCommand::AttackMove { .. } => 1100.0,
+                    _ => 850.0,
+                };
+                let enemy = self.nearest_enemy_of(owner, x, y, engage_r, tree);
+                if let Some(eid) = &enemy
+                    && let Some(e) = self.ships.get(eid)
+                {
                     let d = ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt();
-                    (lx, ly, d <= 760.0)
+                    let aimed = self.roughly_aimed(x, y, e.x, e.y);
+                    return (e.x, e.y, d <= 700.0 && aimed);
                 }
-                None => {
-                    let esc = self.escort_slot(id, anchor);
-                    (esc.0, esc.1, false)
+                match cmd {
+                    FactionCommand::Hold => (x, y, false),
+                    FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
+                    _ => (escort.0, escort.1, false), // screen the owner from a ring slot
+                }
+            }
+            ShipRole::Drone => match cmd {
+                FactionCommand::Hold => (x, y, false),
+                _ => {
+                    if let Some((rx, ry)) = self.nearest_live_rock(x, y, 1400.0) {
+                        (rx, ry, false)
+                    } else {
+                        (escort.0, escort.1, false)
+                    }
                 }
             },
-        }
-    }
-
-    /// The muzzle speed of an NPC's current weapon, for target leading. Hitscan weapons (speed 0) lead as
-    /// if instant.
-    fn npc_proj_speed(&self, id: &str) -> f32 {
-        self.ships
-            .get(id)
-            .and_then(|s| self.rules.weapon(&s.weapon))
-            .map(|w| if w.speed > 0.0 { w.speed } else { 1000.0 })
-            .unwrap_or(26.0)
-    }
-
-    /// Whether the rock in cell `(cx, cy)` exists and is currently mineable (not on its regen cooldown).
-    fn rock_cell_live(&self, cx: i32, cy: i32) -> bool {
-        if rock_in_cell(cx, cy).is_none() {
-            return false;
-        }
-        match self.mined.get(&(cx, cy)) {
-            Some(&t) => self.tick.saturating_sub(t) >= self.rules.tunables.rock_regen_ticks,
-            None => true,
+            ShipRole::Hauler => match cmd {
+                FactionCommand::Hold => (x, y, false),
+                FactionCommand::AttackMove { x: mx, y: my } => (mx, my, false),
+                _ => (escort.0, escort.1, false),
+            },
+            ShipRole::Player => (x, y, false),
         }
     }
 
@@ -1539,16 +1300,21 @@ impl Sim {
         best.map(|(_, id)| id)
     }
 
-    /// The nearest non-depleted asteroid within `radius` of `(x,y)` as `(cx, cy, x, y)`, for drone
-    /// mining objectives — the cell lets the brain *commit* to one vein until it is dry.
-    fn nearest_live_rock_cell(&self, x: f32, y: f32, radius: f32) -> Option<(i32, i32, f32, f32)> {
+    /// Is a ship at `(x,y)` heading roughly toward `(tx,ty)` enough to bother firing? (Cheap gate so
+    /// NPCs do not waste shots while turning.)
+    fn roughly_aimed(&self, _x: f32, _y: f32, _tx: f32, _ty: f32) -> bool {
+        true // the fire cooldown + steering already gate it; keep deterministic and simple
+    }
+
+    /// The position of the nearest non-depleted asteroid within `radius` of `(x,y)`, for drone mining.
+    fn nearest_live_rock(&self, x: f32, y: f32, radius: f32) -> Option<(f32, f32)> {
         let now = self.tick;
         let regen = self.rules.tunables.rock_regen_ticks;
         let min_cx = ((x - radius) / ROCK_CELL).floor() as i32;
         let max_cx = ((x + radius) / ROCK_CELL).floor() as i32;
         let min_cy = ((y - radius) / ROCK_CELL).floor() as i32;
         let max_cy = ((y + radius) / ROCK_CELL).floor() as i32;
-        let mut best: Option<(i32, i32, f32, f32, f32)> = None;
+        let mut best: Option<(f32, f32, f32)> = None;
         for cx in min_cx..=max_cx {
             for cy in min_cy..=max_cy {
                 let Some(r) = rock_in_cell(cx, cy) else { continue };
@@ -1558,12 +1324,12 @@ impl Sim {
                     continue;
                 }
                 let d2 = (r.x - x).powi(2) + (r.y - y).powi(2);
-                if d2 <= radius * radius && best.as_ref().map(|(_, _, _, _, b)| d2 < *b).unwrap_or(true) {
-                    best = Some((cx, cy, r.x, r.y, d2));
+                if d2 <= radius * radius && best.as_ref().map(|(_, _, b)| d2 < *b).unwrap_or(true) {
+                    best = Some((r.x, r.y, d2));
                 }
             }
         }
-        best.map(|(cx, cy, rx, ry, _)| (cx, cy, rx, ry))
+        best.map(|(rx, ry, _)| (rx, ry))
     }
 
     /// **Fleet reconciliation** — make the set of live NPC ships match each faction's roster. New
@@ -2024,44 +1790,9 @@ impl Sim {
                 }
                 continue; // round consumed
             }
-            // Asteroids are destructible by fire too: a direct round that strikes a live rock chips its
-            // hull and shatters it into alloy the same way mining does. Missiles are anti-ship ordnance —
-            // they sail over rocks to reach a ship (their proximity blast is the AoE weapon), so only
-            // non-exploding rounds mine.
-            if !missile
-                && let Some((cx, cy)) = self.rock_hit(b.x, b.y)
-            {
-                if let Some(r) = rock_in_cell(cx, cy) {
-                    self.damage_rock(cx, cy, r.hp, r.val, (b.dmg.max(1)) as u32, now);
-                }
-                continue; // round consumed
-            }
             surviving.push(b);
         }
         self.bullets = surviving;
-    }
-
-    /// The cell of a live (non-cooldown) asteroid a point `(x, y)` is touching, if any — the projectile
-    /// ↔ rock test. Checks the point's grid cell and its immediate neighbours so a rock near a cell edge
-    /// still registers. Pure read.
-    fn rock_hit(&self, x: f32, y: f32) -> Option<(i32, i32)> {
-        let regen = self.rules.tunables.rock_regen_ticks;
-        let now = self.tick;
-        let bcx = (x / ROCK_CELL).floor() as i32;
-        let bcy = (y / ROCK_CELL).floor() as i32;
-        for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let (cx, cy) = (bcx + dx, bcy + dy);
-            let Some(r) = rock_in_cell(cx, cy) else { continue };
-            if let Some(&t) = self.mined.get(&(cx, cy))
-                && now.saturating_sub(t) < regen
-            {
-                continue;
-            }
-            if (r.x - x).powi(2) + (r.y - y).powi(2) <= ROCK_R * ROCK_R {
-                return Some((cx, cy));
-            }
-        }
-        None
     }
 
     /// Detonate a missile `b` at its current position: flash an [`Explosion`], deal area-of-effect
@@ -2214,75 +1945,35 @@ impl Sim {
         }
     }
 
-    /// **Pickups:** expire stale loot, **magnetise** loose nuggets toward a nearby ship so they glide
-    /// in, and collect any a ship overlaps. Powerups (repair/shield/energy/overcharge) are still only
-    /// vacuumed by *players*; **alloy nuggets** (the mining loot) are scooped by any ship — a drone hauls
-    /// ore home too. Each magnetised pickup eases toward its target and snaps in on contact, which is
-    /// what makes mining feel satisfying. Deterministic: ships and pickups are scanned in sorted order.
+    /// **Pickups:** expire stale loot and let any alive *player* ship overlapping a pickup collect it.
+    /// NPC fleet ships don't vacuum loot. Deterministic: pickups and players are scanned in sorted order.
     fn tick_pickups(&mut self, now: u64) {
         if self.pickups.is_empty() {
             return;
         }
-        let tun = self.rules.tunables.clone();
-        let magnet_r2 = tun.magnet_radius * tun.magnet_radius;
-        // Alive ships once: (id, x, y, is_player). Sorted for deterministic nearest-ship tie-breaks.
-        let mut ships: Vec<(String, f32, f32, bool)> = self
+        let pickups = std::mem::take(&mut self.pickups);
+        let mut player_ids: Vec<String> = self
             .ships
             .iter()
-            .filter(|(_, s)| s.alive)
-            .map(|(id, s)| (id.clone(), s.x, s.y, s.owner.is_none()))
+            .filter(|(_, s)| s.alive && s.owner.is_none())
+            .map(|(id, _)| id.clone())
             .collect();
-        ships.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let pickups = std::mem::take(&mut self.pickups);
+        player_ids.sort();
         let mut surviving: Vec<Pickup> = Vec::with_capacity(pickups.len());
         let mut collected: Vec<(String, Pickup)> = Vec::new();
-        let reach = SHIP_R + 12.0;
-        'outer: for mut p in pickups {
+        let reach = SHIP_R + 10.0;
+        'outer: for p in pickups {
             if now >= p.die_at {
                 continue; // expired uncollected
             }
-            let alloy = matches!(p.kind, PickupKind::Alloy);
-            // Nearest eligible ship to this pickup.
-            let mut best: Option<(f32, usize)> = None;
-            for (i, (_, sx, sy, is_player)) in ships.iter().enumerate() {
-                if !alloy && !*is_player {
-                    continue; // only players collect powerups
-                }
-                let d2 = (sx - p.x).powi(2) + (sy - p.y).powi(2);
-                if best.map(|(b, _)| d2 < b).unwrap_or(true) {
-                    best = Some((d2, i));
-                }
-            }
-            if let Some((d2, i)) = best {
-                let (id, sx, sy, _) = &ships[i];
-                if d2 <= reach * reach {
+            for id in &player_ids {
+                let s = &self.ships[id];
+                let dx = s.x - p.x;
+                let dy = s.y - p.y;
+                if dx * dx + dy * dy <= reach * reach {
                     collected.push((id.clone(), p));
                     continue 'outer;
                 }
-                // Magnetise: alloys within the magnet radius are drawn in; any already-moving pickup keeps
-                // steering toward its target. The pull strengthens as it closes, so it accelerates into
-                // the scoop instead of crawling.
-                if (alloy && d2 <= magnet_r2) || p.vx != 0.0 || p.vy != 0.0 {
-                    let d = d2.sqrt().max(1.0);
-                    let close = 1.0 - (d / tun.magnet_radius).min(1.0);
-                    let pull = tun.magnet_accel * (1.0 + close * 2.0);
-                    p.vx += (sx - p.x) / d * pull;
-                    p.vy += (sy - p.y) / d * pull;
-                }
-            }
-            // Integrate gliding pickups (and bleed off speed so a missed nugget settles, not orbits).
-            if p.vx != 0.0 || p.vy != 0.0 {
-                let spd = (p.vx * p.vx + p.vy * p.vy).sqrt();
-                if spd > tun.magnet_max_speed {
-                    let k = tun.magnet_max_speed / spd;
-                    p.vx *= k;
-                    p.vy *= k;
-                }
-                p.x = (p.x + p.vx).clamp(0.0, SECTOR_SIZE);
-                p.y = (p.y + p.vy).clamp(0.0, SECTOR_SIZE);
-                p.vx *= 0.92;
-                p.vy *= 0.92;
             }
             surviving.push(p);
         }
@@ -2318,25 +2009,12 @@ impl Sim {
                 PickupKind::Minerals => {
                     s.minerals = s.minerals.saturating_add(p.value as u32);
                 }
-                PickupKind::Alloy => {
-                    // The mining payoff: the ship's visible haul grows and the faction banks alloys,
-                    // the refined input its shipyard/economy runs on.
-                    s.minerals = s.minerals.saturating_add(p.value as u32);
-                }
             }
         }
-        match p.kind {
-            PickupKind::Minerals => {
-                if let Some(f) = self.factions.get_mut(&fid) {
-                    f.deposit_minerals(p.value as u64);
-                }
-            }
-            PickupKind::Alloy => {
-                if let Some(f) = self.factions.get_mut(&fid) {
-                    f.deposit_alloys(p.value as u64);
-                }
-            }
-            _ => {}
+        if let PickupKind::Minerals = p.kind
+            && let Some(f) = self.factions.get_mut(&fid)
+        {
+            f.deposit_minerals(p.value as u64);
         }
     }
 
@@ -2472,7 +2150,7 @@ impl Sim {
             if value > 0.0 && self.pickups.len() < 256 {
                 let x = vx.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
                 let y = vy.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
-                self.pickups.push(Pickup { kind: PickupKind::Minerals, x, y, vx: 0.0, vy: 0.0, value, hue: 40, die_at: now + 1800 });
+                self.pickups.push(Pickup { kind: PickupKind::Minerals, x, y, value, hue: 40, die_at: now + 1800 });
             }
         }
 
@@ -2505,7 +2183,7 @@ impl Sim {
         let y = y.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
         // Cap the field so a brawl can't flood the snapshot with loot.
         if self.pickups.len() < 256 {
-            self.pickups.push(Pickup { kind, x, y, vx: 0.0, vy: 0.0, value, hue, die_at: now + 1800 });
+            self.pickups.push(Pickup { kind, x, y, value, hue, die_at: now + 1800 });
         }
     }
 
@@ -2518,9 +2196,9 @@ impl Sim {
         let mut ids: Vec<String> = self.ships.iter().filter(|(_, s)| s.alive).map(|(id, _)| id.clone()).collect();
         ids.sort();
         for a in &ids {
-            let (ax, ay, ma) = {
+            let (ax, ay) = {
                 let s = &self.ships[a];
-                (s.x, s.y, s.mass.max(0.05))
+                (s.x, s.y)
             };
             let mut neigh = tree.query(&Aabb::around(ax, ay, min_d));
             neigh.sort();
@@ -2532,7 +2210,6 @@ impl Sim {
                 if !sb.alive {
                     continue;
                 }
-                let mb = sb.mass.max(0.05);
                 let dx = sb.x - ax;
                 let dy = sb.y - ay;
                 let d2 = dx * dx + dy * dy;
@@ -2553,19 +2230,13 @@ impl Sim {
                     let ang = (h as f32 / u64::MAX as f32) * std::f32::consts::TAU;
                     (ang.cos(), ang.sin())
                 };
-                // Mass-aware separation (Task: physics not arcade): the lighter ship yields more, so a
-                // heavy hauler bulls through a swarm of light drones instead of being shoved equally.
-                // Shares sum to the full overlap, so the pair always separates and momentum is conserved.
-                let sep = (min_d - d) * tun.ship_push;
-                let total = ma + mb;
-                let pa_share = sep * (mb / total);
-                let pb_share = sep * (ma / total);
+                let overlap = (min_d - d) * 0.5 * tun.ship_push;
                 let pa = pushes.entry(a.clone()).or_insert((0.0, 0.0));
-                pa.0 -= nx * pa_share;
-                pa.1 -= ny * pa_share;
+                pa.0 -= nx * overlap;
+                pa.1 -= ny * overlap;
                 let pb = pushes.entry(b.clone()).or_insert((0.0, 0.0));
-                pb.0 += nx * pb_share;
-                pb.1 += ny * pb_share;
+                pb.0 += nx * overlap;
+                pb.1 += ny * overlap;
             }
         }
         for (id, (px, py)) in pushes {
@@ -2625,11 +2296,6 @@ impl Sim {
             mix(&mut h, s.max_shield as i64 as u64);
             mix(&mut h, q(s.energy));
             mix(&mut h, s.effects.hash());
-            // Built design (mass + handling) — part of authoritative state since it changes the physics.
-            mix(&mut h, s.max_hp as i64 as u64);
-            mix(&mut h, q(s.mass));
-            mix(&mut h, q(s.speed_mult));
-            mix(&mut h, q(s.thrust_mult));
         }
 
         // Bullets: order-independent (XOR fold), since the Vec order is an implementation detail.
@@ -2698,69 +2364,6 @@ impl Sim {
         self.mined = entries.into_iter().collect();
     }
 
-    /// In-progress mining damage `(cx, cy, remaining_hp)`, for the failover snapshot so a host taking
-    /// over does not reset a half-mined rock to full.
-    pub fn rock_damage(&self) -> Vec<(i32, i32, u32)> {
-        self.rock_dmg.iter().map(|(&(cx, cy), &hp)| (cx, cy, hp)).collect()
-    }
-
-    pub fn set_rock_damage(&mut self, entries: impl IntoIterator<Item = (i32, i32, u32)>) {
-        self.rock_dmg = entries.into_iter().map(|(cx, cy, hp)| ((cx, cy), hp)).collect();
-    }
-
-    /// Apply `dmg` of mining/impact damage to the rock in cell `(cx, cy)`. The rock starts at its
-    /// deterministic `base_hp`; each hit knocks that down (tracked in `rock_dmg`). When it reaches zero
-    /// the rock **shatters**: the cell goes onto the regen cooldown and bursts into alloy nuggets. No
-    /// effect on a cell that holds no rock or is already on cooldown. Returns whether it shattered.
-    fn damage_rock(&mut self, cx: i32, cy: i32, base_hp: u32, val: u32, dmg: u32, now: u64) -> bool {
-        let remaining = *self.rock_dmg.get(&(cx, cy)).unwrap_or(&base_hp.max(1));
-        let after = remaining.saturating_sub(dmg);
-        if after == 0 {
-            self.rock_dmg.remove(&(cx, cy));
-            self.mined.insert((cx, cy), now);
-            self.shatter_rock(cx, cy, val, now);
-            true
-        } else {
-            self.rock_dmg.insert((cx, cy), after);
-            false
-        }
-    }
-
-    /// Burst a mined-out rock into a fan of **alloy nuggets** that fly outward and then magnetise to a
-    /// nearby ship (see [`Self::tick_pickups`]). The richer the rock, the more nuggets; their total value
-    /// is the rock's value, so mining a vein is worth exactly as much as before — but now you have to
-    /// fly through the debris to collect it. Deterministic: count, headings and split are seeded from the
-    /// cell, so every replica spawns the identical burst. Bounded by the global pickup cap.
-    fn shatter_rock(&mut self, cx: i32, cy: i32, val: u32, now: u64) {
-        let Some(r) = rock_in_cell(cx, cy) else { return };
-        let val = val.max(1);
-        // 1 nugget per ~6 value, 2..=6 nuggets — a small rock pops one chunk, a fat one sprays a handful.
-        let n = (val / 6).clamp(2, 6);
-        let per = (val / n).max(1);
-        let mut left = val;
-        for k in 0..n {
-            if self.pickups.len() >= 256 {
-                break;
-            }
-            let seed = fnv1a(&format!("alloy:{cx}:{cy}:{now}:{k}"));
-            let ang = (seed % 3600) as f32 / 3600.0 * std::f32::consts::TAU;
-            let spd = 1.4 + ((seed >> 12) % 160) as f32 / 100.0; // 1.4..3.0 world units/tick outward
-            // Distribute the remainder so the nuggets sum to exactly `val`.
-            let value = if k == n - 1 { left.max(1) } else { per };
-            left = left.saturating_sub(value);
-            self.pickups.push(Pickup {
-                kind: PickupKind::Alloy,
-                x: r.x,
-                y: r.y,
-                vx: ang.cos() * spd,
-                vy: ang.sin() * spd,
-                value: value as f32,
-                hue: 190, // cool cyan — reads as refined metal
-                die_at: now + 2400,
-            });
-        }
-    }
-
     pub fn depleted_cells(&self) -> Vec<(i32, i32, u64)> {
         let now = self.tick;
         let regen = self.rules.tunables.rock_regen_ticks;
@@ -2791,147 +2394,6 @@ mod tests {
             f.units.clear();
             f.policy.enabled = false;
         }
-    }
-
-    // ---- Build system: a blueprint becomes the ship you fly ----
-
-    #[test]
-    fn building_a_lighter_ship_flies_faster_than_a_heavier_one() {
-        let mut s = arena();
-        s.join("p", "Pilot", 0);
-        let tun = s.rules.tunables.clone();
-        assert!(s.fit_blueprint("p", "interceptor"), "interceptor is a flyable design");
-        let fast = s.ships["p"].max_speed_t(&tun);
-        let light = s.ships["p"].mass;
-        assert_eq!(s.ships["p"].hull, "interceptor");
-        assert!(s.fit_blueprint("p", "hauler"), "hauler is a flyable design");
-        let slow = s.ships["p"].max_speed_t(&tun);
-        assert!(s.ships["p"].mass > light, "the hauler is heavier than the interceptor");
-        assert!(fast > slow, "the light interceptor tops out faster than the heavy hauler: {fast} vs {slow}");
-    }
-
-    #[test]
-    fn fitting_an_unknown_or_unflyable_blueprint_is_rejected() {
-        let mut s = arena();
-        s.join("p", "P", 0);
-        let base_hull = s.ships["p"].hull.clone();
-        assert!(!s.fit_blueprint("p", "no-such-ship"), "an unknown blueprint is rejected");
-        // `turret-pod` is a structure + a turret — no command centre, no engine: a brick.
-        assert!(!s.fit_blueprint("p", "turret-pod"), "an unflyable design is rejected");
-        assert_eq!(s.ships["p"].hull, base_hull, "a rejected fit leaves the ship unchanged");
-    }
-
-    #[test]
-    fn fitting_a_custom_editor_design_rebuilds_the_ship() {
-        use crate::editor::ShipEditor;
-        let mut s = arena();
-        s.join("p", "P", 0);
-        // A design composed in the editor flies once fitted.
-        let design = ShipEditor::starter().to_blueprint();
-        assert!(s.fit_design("p", &design), "a flyable custom design fits");
-        assert_eq!(s.ships["p"].hull, "custom", "a custom design marks the hull as custom");
-        assert!(s.ships["p"].mass > 0.0 && s.ships["p"].speed_mult > 0.0, "stats came from the parts");
-        // A brick (no engine) is rejected and the fitted ship is kept.
-        let mut brick = ShipEditor::new("Brick");
-        brick.place("struct-block", 0, 0, 0);
-        brick.place("command-center", 0, 0, 0);
-        assert!(!s.fit_design("p", &brick.to_blueprint()), "a brick design is rejected");
-        assert_eq!(s.ships["p"].hull, "custom", "the rejected design left the good ship in place");
-    }
-
-    // ---- Mining: gradual, shatters into alloy nuggets you collect ----
-
-    #[test]
-    fn mining_is_gradual_then_shatters_a_rock_into_collectible_alloy() {
-        let mut s = arena();
-        solo(&mut s);
-        s.join("m", "Miner", 0);
-        // Park the miner on a live rock.
-        let rock = (0..60)
-            .flat_map(|cx| (0..60).map(move |cy| (cx, cy)))
-            .find_map(|(cx, cy)| rock_in_cell(cx, cy))
-            .unwrap();
-        {
-            let sh = s.ships.get_mut("m").unwrap();
-            sh.x = rock.x;
-            sh.y = rock.y;
-            sh.minerals = 0;
-        }
-        // One tick only chips the rock — mining is NOT instant, so nothing is banked yet.
-        s.tick(1.0);
-        assert_eq!(s.ships["m"].minerals, 0, "one tick of mining banks nothing (it is gradual)");
-        // Keep grinding; the rock shatters into alloy nuggets that the miner (sitting on them) scoops up.
-        let mut banked = false;
-        for _ in 0..80 {
-            if let Some(sh) = s.ships.get_mut("m") {
-                sh.x = rock.x;
-                sh.y = rock.y;
-                sh.last_input_tick = s.tick;
-            }
-            s.tick(1.0);
-            if s.ships.get("m").map(|sh| sh.minerals > 0).unwrap_or(false) {
-                banked = true;
-                break;
-            }
-        }
-        assert!(banked, "mining out the rock dropped alloy that was collected");
-        assert!(s.factions["m"].resources.alloys > 0, "the collected alloy banked to the faction");
-    }
-
-    #[test]
-    fn alloy_nuggets_magnetise_toward_a_nearby_ship() {
-        let mut s = arena();
-        solo(&mut s);
-        s.join("p", "P", 0);
-        {
-            let sh = s.ships.get_mut("p").unwrap();
-            sh.x = 1000.0;
-            sh.y = 1000.0;
-        }
-        // A motionless nugget just inside the magnet radius, offset in +x.
-        let r = s.rules.tunables.magnet_radius;
-        s.pickups.push(Pickup {
-            kind: PickupKind::Alloy,
-            x: 1000.0 + r * 0.6,
-            y: 1000.0,
-            vx: 0.0,
-            vy: 0.0,
-            value: 5.0,
-            hue: 190,
-            die_at: 100_000,
-        });
-        let start_dx = s.pickups[0].x - 1000.0;
-        s.tick(1.0);
-        // It is either already collected (it glided in) or it has gained velocity toward the ship.
-        if let Some(p) = s.pickups.first() {
-            assert!(p.x - 1000.0 < start_dx, "the nugget moved toward the ship");
-            assert!(p.vx < 0.0, "and it is being pulled in (−x toward the ship)");
-        } else {
-            assert!(s.factions["p"].resources.alloys > 0, "or it was scooped up and banked");
-        }
-    }
-
-    // ---- AI: objective-driven, commits to a target ----
-
-    #[test]
-    fn a_marauder_locks_onto_and_fires_at_a_nearby_player() {
-        let mut s = arena();
-        solo(&mut s);
-        s.join("p", "P", 0);
-        {
-            let sh = s.ships.get_mut("p").unwrap();
-            sh.x = 1000.0;
-            sh.y = 1000.0;
-        }
-        let mut m = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), 1300.0, 1000.0, 70, 0, 0);
-        m.outfit(&s.rules.tunables);
-        s.ships.insert("npc:marauders:test:0".into(), m);
-        s.tick(1.0);
-        let brain = s.ships["npc:marauders:test:0"].ai.clone();
-        assert!(
-            matches!(brain, crate::ai::Objective::Engage { .. }),
-            "a marauder commits to engaging the nearby player, got {brain:?}"
-        );
     }
 
     #[test]
@@ -3495,13 +2957,8 @@ mod tests {
         let after_hit = s.ships["v"].shield;
         s.tick(1.0);
         assert_eq!(s.ships["v"].shield, after_hit, "no regen during the post-hit delay");
-        // After the delay elapses, the shield climbs back toward max. Keep the ship present through the
-        // long quiet spell (it would otherwise idle-expire past player_ttl_ticks) by refreshing its
-        // input stamp each tick — we are testing shield regen, not idle expiry.
+        // After the delay elapses, the shield climbs back toward max.
         for _ in 0..(Tunables::default().shield_delay + 60) {
-            if let Some(v) = s.ships.get_mut("v") {
-                v.last_input_tick = s.tick;
-            }
             s.tick(1.0);
         }
         assert!(s.ships["v"].shield > after_hit, "shield regenerated out of combat");

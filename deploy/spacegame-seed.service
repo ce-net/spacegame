@@ -27,7 +27,7 @@ WorkingDirectory=/opt/ce-build/spacegame-run
 # thin client, and joining-state adoption) gets realtime granularity. --ruleset watches live.json so
 # editing weapons / tech / tunables / shaders hot-reloads every participant with no restart.
 ExecStart=/opt/ce-build/spacegame-run/spacegame host \
-  --sector 0_0 --sector 1_0 --sector n1_0 --sector 0_1 --sector 0_n1 \
+  --sector 0_0 --sector 1_0 --sector -1_0 --sector 0_1 --sector 0_-1 \
   --hz 60 --ruleset /opt/ce-build/spacegame-run/live.json
 Restart=always
 RestartSec=3

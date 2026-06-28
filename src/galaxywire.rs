@@ -21,8 +21,6 @@ use crate::galaxy::{CellId, CellLoad};
 pub mod topics {
     pub const SHAPE: &str = "ce-game/spacegame/galaxy";
     pub const CONTROL: &str = "ce-game/spacegame/control";
-    /// Live player-bubble snapshots for the map (see [`super::DomainFrame`]).
-    pub const DOMAINS: &str = "ce-game/spacegame/domains";
     pub fn load(cell_token: &str) -> String {
         format!("ce-game/spacegame/{cell_token}/load")
     }
@@ -87,41 +85,6 @@ pub struct LoadFrame {
     pub cell: CellId,
     pub host: String,
     pub load: CellLoad,
-}
-
-/// One player's authority bubble, compacted for the live map: where its owner is and how big the
-/// [`crate::domain::Domain`] footprint has grown (the fleet/faction it carries). The map draws these as
-/// the moving "who is where" dots that the grid cells can't show — the player-level view Leif asked the
-/// monitor to have.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DomainView {
-    /// The owning player (their NodeId).
-    pub owner: String,
-    /// World-frame anchor (the owner's own ship).
-    pub x: f64,
-    pub y: f64,
-    /// Footprint side length (the longer axis of the bubble) — grows with the owner's fleet/faction.
-    pub span: f64,
-    /// Entities under this owner's authority (ship + fleet + faction units).
-    pub entities: u32,
-}
-
-/// A host's current set of player bubbles, gossiped on [`topics::DOMAINS`] for the live map. Each frame
-/// is a full snapshot of the domains that host simulates, so a player leaving simply drops out of the
-/// next frame — no explicit removal message needed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DomainFrame {
-    pub host: String,
-    pub domains: Vec<DomainView>,
-}
-
-impl DomainView {
-    /// Build the compact view from a live [`crate::domain::Domain`].
-    pub fn of(d: &crate::domain::Domain) -> Self {
-        let w = d.bounds.max_x - d.bounds.min_x;
-        let h = d.bounds.max_y - d.bounds.min_y;
-        DomainView { owner: d.owner.clone(), x: d.anchor.0, y: d.anchor.1, span: w.max(h), entities: d.entities }
-    }
 }
 
 /// A liveness + role heartbeat on [`topics::CONTROL`]. The union of recent heartbeats *is* the live

@@ -93,15 +93,21 @@ impl ClientProfile {
         server_tick % d == 0
     }
 
-    /// The sectors this client subscribes to, given its **world** position `(x, y)`. Domain-driven (see
-    /// [`crate::domain`]): the set of sectors the client's viewport bubble — the box `(x, y) ±
-    /// view_radius` — actually overlaps. That is **one** sector when the player is mid-sector, **two** on
-    /// an edge, **four** on a corner, and it slides as the player moves, so interest *follows the player*
-    /// instead of snapping a fixed 3×3 ring at the seam. Replaces the old ring/plus heuristic; the
-    /// `interest_sectors` budget is now expressed as the `view_radius` itself (mobile's smaller radius
-    /// keeps it on one sector longer).
+    /// The sectors this client subscribes to, given its world position: the centre sector and as many
+    /// of its neighbours as the budget allows (9 = full ring, 5 = plus-shaped, else just the centre).
     pub fn interest_set(&self, x: f32, y: f32) -> Vec<SectorId> {
-        crate::domain::Bounds::around(x as f64, y as f64, self.view_radius as f64).sectors()
+        let centre = SectorId::containing(x, y);
+        match self.interest_sectors {
+            n if n >= 9 => centre.neighbors(),
+            n if n >= 5 => vec![
+                centre,
+                SectorId::new(centre.sx + 1, centre.sy),
+                SectorId::new(centre.sx - 1, centre.sy),
+                SectorId::new(centre.sx, centre.sy + 1),
+                SectorId::new(centre.sx, centre.sy - 1),
+            ],
+            _ => vec![centre],
+        }
     }
 }
 
@@ -152,21 +158,12 @@ mod tests {
     }
 
     #[test]
-    fn interest_follows_the_player_and_slides_across_seams() {
-        use crate::sim::SECTOR_SIZE;
-        let p = Platform::DesktopBrowser.profile();
-        // Mid-sector: interest is exactly the one home sector — no fixed ring.
-        let mid = p.interest_set(SECTOR_SIZE * 0.5, SECTOR_SIZE * 0.5);
-        assert_eq!(mid, vec![SectorId::new(0, 0)]);
-        // Near the east seam (within view_radius of it): the eastern neighbour joins, nothing else.
-        let edge = p.interest_set(SECTOR_SIZE - 50.0, SECTOR_SIZE * 0.5);
-        assert_eq!(edge.len(), 2);
-        assert!(edge.contains(&SectorId::new(0, 0)) && edge.contains(&SectorId::new(1, 0)));
-        // On a corner: four.
-        assert_eq!(p.interest_set(SECTOR_SIZE - 50.0, SECTOR_SIZE - 50.0).len(), 4);
-        // Mobile's tighter view_radius keeps it on one sector closer to the seam than desktop.
-        let m = Platform::MobileBrowser.profile();
-        assert_eq!(m.interest_set(SECTOR_SIZE - 1500.0, SECTOR_SIZE * 0.5), vec![SectorId::new(0, 0)]);
+    fn interest_set_shrinks_on_mobile() {
+        let n = Platform::Native.profile().interest_set(10.0, 10.0);
+        let m = Platform::MobileBrowser.profile().interest_set(10.0, 10.0);
+        assert_eq!(n.len(), 9, "native subscribes the full 3x3 ring");
+        assert_eq!(m.len(), 5, "mobile subscribes a smaller plus-shape");
+        assert!(m.iter().all(|s| n.contains(s)), "mobile's set is a subset of the full ring");
     }
 
     #[test]

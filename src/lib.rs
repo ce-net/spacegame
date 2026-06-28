@@ -37,12 +37,8 @@
 
 // --- Pure, deterministic SDK (wasm-clean; no mesh, no tokio, no ce-rs) ---
 pub mod aabb;
-pub mod ai;
 pub mod build;
-pub mod shipyard;
 pub mod client;
-pub mod domain;
-pub mod editor;
 pub mod effects;
 pub mod faction;
 pub mod hazard;
@@ -495,20 +491,6 @@ pub async fn run_sector(
                             })
                         {
                             let _ = ce.publish(lt, &b).await;
-                        }
-                    }
-
-                    // LIVE MAP: publish this host's entity-anchored player bubbles (the moving "who is
-                    // where" layer the grid cells can't show). Footprint-only, so the view radius is
-                    // irrelevant to the gossiped dot — pass 0. One frame per advertise interval.
-                    if sim.tick.is_multiple_of(cfg.advertise_every) {
-                        let field = crate::domain::DomainField::from_sim(&sim, 0.0);
-                        let frame = crate::galaxywire::DomainFrame {
-                            host: host_id.clone(),
-                            domains: field.domains().iter().map(crate::galaxywire::DomainView::of).collect(),
-                        };
-                        if let Ok(b) = serde_json::to_vec(&frame) {
-                            let _ = ce.publish(crate::galaxywire::topics::DOMAINS, &b).await;
                         }
                     }
 
