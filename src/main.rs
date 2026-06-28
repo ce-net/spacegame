@@ -40,7 +40,9 @@ struct Args {
     cmd: Option<Cmd>,
 
     /// Back-compat: `spacegame --sector X` with no subcommand hosts sector(s) locally.
-    #[arg(long = "sector", global = true)]
+    // allow_hyphen_values: sector ids are `x_y` and may be negative (e.g. `-1_0`, `0_-1`); without this
+    // clap parses the leading `-` as an unknown flag and rejects the value.
+    #[arg(long = "sector", global = true, allow_hyphen_values = true)]
     sectors: Vec<String>,
 
     /// Authoritative tick rate (Hz). Used by `host`.
@@ -54,7 +56,8 @@ enum Cmd {
     /// is an independent concurrent cell.
     Host {
         /// Sector(s) to host. Repeat to host several from one process.
-        #[arg(long = "sector", default_values_t = vec!["0_0".to_string()])]
+        // allow_hyphen_values: sector ids may be negative (`-1_0`, `0_-1`) — see the global flag above.
+        #[arg(long = "sector", default_values_t = vec!["0_0".to_string()], allow_hyphen_values = true)]
         sectors: Vec<String>,
         /// Authoritative tick rate (Hz).
         #[arg(long, default_value_t = 20)]
