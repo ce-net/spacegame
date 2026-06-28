@@ -131,6 +131,19 @@ impl Replica {
         self.sim.state_hash()
     }
 
+    /// Drain the ships that crossed this replica's sector edge this tick (the other end of
+    /// [`accept_transit`](Self::accept_transit)). The [`SectorHost`] routes each to the replica that
+    /// hosts the destination sector, so a ship slides between two warm sectors with no `Sim` rebuild.
+    pub fn drain_transits(&mut self) -> Vec<crate::sim::Transit> {
+        self.sim.take_transits()
+    }
+
+    /// Admit a ship handed off from a neighbouring sector's replica, carrying its full persistent state
+    /// (already in this sector's local coordinates). Used by [`SectorHost::step_transits`].
+    pub fn accept_transit(&mut self, ship: crate::snapshot::ShipSnap) {
+        self.sim.accept_transit(ship);
+    }
+
     /// The **entity-anchored authority bubbles** for everything this replica simulates — the local
     /// player, their fleet, and any NPC factions present — in the absolute world frame, each grown by
     /// `view_radius`. See [`crate::domain`]: a domain follows its owner, so the partition moves with the
@@ -214,6 +227,193 @@ impl Replica {
             }
             self.sim.tick(1.0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// SectorHost — simulate (and therefore render) the WHOLE interest bubble, not one sector.
+// ---------------------------------------------------------------------------------------------------
+
+/// The set of sector cells a single player's node simulates at once — its **interest bubble** (the
+/// sectors the entity-anchored recursive AABB overlaps: one mid-sector, two on an edge, four on a
+/// corner, growing with the fleet). This is what makes crossing a seam **seamless**.
+///
+/// The old single-`Replica` client ran exactly one sector and, on crossing an edge, threw the whole
+/// surrounding world away and built a fresh [`Sim::for_sector`] carrying only the player's ship
+/// ([`Replica::rehome_local_player`]). Every other ship, asteroid, NPC and bullet popped out and a
+/// freshly-generated set popped in — the "horrible switch". A `SectorHost` instead keeps a deterministic
+/// replica **warm for every sector the bubble overlaps**, so the neighbour you are about to cross into is
+/// already simulated and already on screen. Crossing then only changes *which* warm replica carries your
+/// ship ([`step_transits`](Self::step_transits)); nothing is rebuilt, so nothing pops.
+///
+/// The renderer is already multi-sector and world-framed (`spacegame_render::Game` composes every
+/// snapshot in `sectors` at its absolute `sector * SECTOR_SIZE` offset), so [`snapshots`](Self::snapshots)
+/// just hands it one snapshot per warm sector and the seam disappears in the view too.
+///
+/// Each warm replica is an ordinary deterministic [`Replica`]: a sector I don't pilot is driven by the
+/// real inputs of whoever *is* there (routed by [`schedule`](Self::schedule) from that sector's `/in`),
+/// and an empty sector runs its deterministic environment — so every node that holds the same sector
+/// computes the same state, exactly as the quorum-merge model requires.
+pub struct SectorHost {
+    /// The sector that carries the local player's ship — the one we publish our own inputs to and are
+    /// the authority for. Follows the player across edges (see [`step_transits`](Self::step_transits)).
+    home: SectorId,
+    /// One deterministic replica per warm sector. A `BTreeMap` so iteration (snapshots, transit drain) is
+    /// deterministic regardless of insertion order.
+    reps: BTreeMap<SectorId, Replica>,
+    /// The ruleset every warm sector is spawned with — cloned from the home sim so all sectors agree.
+    rules: crate::ruleset::RulesetHandle,
+}
+
+impl SectorHost {
+    /// Start a host from the local player's initial home sim (a fresh world, or one restored from a
+    /// snapshot) — mirrors [`Replica::new`]. `home_sim.tick` should already be the shared wall-clock tick
+    /// so every warm sector and every peer agree on the clock.
+    pub fn from_home(home_sim: Sim) -> Self {
+        let home = home_sim.sector;
+        let rules = home_sim.rules.clone();
+        let mut reps = BTreeMap::new();
+        reps.insert(home, Replica::new(home_sim));
+        SectorHost { home, reps, rules }
+    }
+
+    /// The sector currently carrying the local player.
+    pub fn home(&self) -> SectorId {
+        self.home
+    }
+
+    /// The next tick the home replica will simulate — the reference clock for scheduling our own input
+    /// and warming a new sector.
+    pub fn home_tick(&self) -> u64 {
+        self.reps.get(&self.home).map(|r| r.tick()).unwrap_or(0)
+    }
+
+    /// The home replica's authoritative sim (read-only) — for the local ship's position / interest math.
+    pub fn home_sim(&self) -> &Sim {
+        // `home` is always present (seeded in `from_home`, kept by `retain`), so this never panics; the
+        // `expect` documents the invariant.
+        &self.reps.get(&self.home).expect("home replica is always present").sim
+    }
+
+    /// A warm sector's sim, if hosted.
+    pub fn sim(&self, sector: SectorId) -> Option<&Sim> {
+        self.reps.get(&sector).map(|r| &r.sim)
+    }
+
+    /// Warm a sector if it is not already hosted: a fresh deterministic [`Sim::for_sector`] (its own
+    /// hazards / NPC factions) started at the home clock so [`advance_all`](Self::advance_all) steps it in
+    /// lockstep with every other warm sector. Idempotent — an already-warm sector keeps its live state.
+    pub fn ensure(&mut self, sector: SectorId) {
+        if self.reps.contains_key(&sector) {
+            return;
+        }
+        let tick = self.home_tick();
+        let mut sim = Sim::for_sector(sector, self.rules.clone());
+        sim.tick = tick;
+        self.reps.insert(sector, Replica::new(sim));
+    }
+
+    /// Apply one of THIS node's own inputs to the **home** sector immediately (zero input delay for your
+    /// own ship); pair with a tick-tagged broadcast so peers apply it deterministically. Used for the
+    /// initial join and any local-echo action.
+    pub fn apply_local_now(&mut self, player: &str, msg: ClientMsg) {
+        if let Some(r) = self.reps.get_mut(&self.home) {
+            r.apply_local_now(player, msg);
+        }
+    }
+
+    /// Schedule one of THIS node's own tick-tagged inputs into the **home** sector (where our ship lives).
+    pub fn schedule_home(&mut self, input: TickInput) -> bool {
+        match self.reps.get_mut(&self.home) {
+            Some(r) => r.schedule(input),
+            None => false,
+        }
+    }
+
+    /// Route an input received from a sector's `/in` stream to the replica that hosts **that** sector —
+    /// not blindly into home. This is what replaces the old "filter out every neighbour input" guard: a
+    /// neighbour sector is now driven by the real players there, so it is correct to render, and when you
+    /// cross into it its world is already live. Dropped if that sector is not warm (we don't host it).
+    pub fn schedule(&mut self, sector: SectorId, input: TickInput) -> bool {
+        match self.reps.get_mut(&sector) {
+            Some(r) => r.schedule(input),
+            None => false,
+        }
+    }
+
+    /// Advance every warm sector to the shared wall-clock `target` tick. Deterministic per sector.
+    pub fn advance_all(&mut self, target: u64) {
+        for r in self.reps.values_mut() {
+            r.advance_to(target);
+        }
+    }
+
+    /// Resolve cross-edge ships across all warm sectors. A ship that left sector A this tick is handed to
+    /// the replica hosting its destination B (already warm if B is in the bubble), so it **slides** between
+    /// sectors with its full state and no rebuild:
+    /// * if the LOCAL player (`me`) crossed, we warm the destination if needed, admit the ship, and move
+    ///   `home` onto it — the player's node now hosts the region it moved into. Returns `Some(new_home)`.
+    /// * any other ship crossing between two sectors we host is admitted to its destination (kept seamless
+    ///   for the players who can see it); a ship leaving for a sector we do NOT host is dropped — its real
+    ///   owner's node hosts that region.
+    ///
+    /// Because the destination is normally already warm and at the same tick, the admitted ship enters a
+    /// live world at the correct coordinate — never the sector-centre teleport the single-replica re-home
+    /// risked, and never a full-world pop.
+    pub fn step_transits(&mut self, me: &str) -> Option<SectorId> {
+        let mut pending: Vec<crate::sim::Transit> = Vec::new();
+        for r in self.reps.values_mut() {
+            pending.extend(r.drain_transits());
+        }
+        let mut new_home = None;
+        for t in pending {
+            if t.ship.id == me {
+                self.ensure(t.to); // normally a no-op: the bubble pre-warmed it
+                if let Some(dst) = self.reps.get_mut(&t.to) {
+                    dst.accept_transit(t.ship);
+                }
+                self.home = t.to;
+                new_home = Some(t.to);
+            } else if let Some(dst) = self.reps.get_mut(&t.to) {
+                dst.accept_transit(t.ship);
+            }
+            // else: destination not hosted here — its owner's node has it.
+        }
+        new_home
+    }
+
+    /// Drop warm sectors that have left the interest bubble (their `/state` no longer needs simulating or
+    /// rendering), returning the dropped [`SectorId`]s so the caller can also forget their stale snapshot
+    /// in the renderer's `sectors` map. `home` is always kept, even if a momentary interest glitch omits
+    /// it. Call once per frame with the current interest set.
+    pub fn retain(&mut self, interest: &std::collections::BTreeSet<SectorId>) -> Vec<SectorId> {
+        let home = self.home;
+        let dropped: Vec<SectorId> =
+            self.reps.keys().copied().filter(|s| *s != home && !interest.contains(s)).collect();
+        for s in &dropped {
+            self.reps.remove(s);
+        }
+        dropped
+    }
+
+    /// One authoritative snapshot per warm sector, keyed by its `/state` topic, ready to feed straight to
+    /// `Game::ingest`. The world-framed renderer composes them into one seamless view (each offset by its
+    /// sector origin), so a player standing on a seam sees both sides at once and a crossing shows no
+    /// transition.
+    pub fn snapshots(&self, me: &str, now_ms: u64) -> Vec<(String, crate::wire::Snapshot)> {
+        self.reps
+            .iter()
+            .map(|(sector, r)| {
+                let tok = sector.token();
+                let snap = crate::room::build_snapshot(&r.sim, &tok, me, now_ms);
+                (crate::wire::topics::state(&tok), snap)
+            })
+            .collect()
+    }
+
+    /// The sectors currently warm — for tests and diagnostics.
+    pub fn warm_sectors(&self) -> Vec<SectorId> {
+        self.reps.keys().copied().collect()
     }
 }
 
@@ -393,5 +593,78 @@ mod tests {
         r.advance_to(100);
         let at = r.schedule_local("me", 1, ClientMsg::Respawn);
         assert_eq!(at, 100 + INPUT_DELAY, "local input is scheduled INPUT_DELAY ticks ahead for propagation");
+    }
+
+    #[test]
+    fn crossing_between_warm_sectors_slides_the_ship_without_a_rebuild() {
+        // The seamless property at the host level: with the eastern neighbour already warm (as the
+        // interest bubble keeps it), a player crossing the seam is HANDED to that live replica with full
+        // state — not dropped into a freshly rebuilt sector — and the sector left behind stays warm, so
+        // nothing pops in front of OR behind the player.
+        use crate::sim::{SECTOR_SIZE, SHIP_R};
+        let mut sim = Sim::new(); // home sector (0,0)
+        sim.join("me", "Me", 0);
+        sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
+        {
+            let s = sim.ships.get_mut("me").unwrap();
+            s.x = SECTOR_SIZE - 2.0;
+            s.y = 1500.0;
+            s.a = 0.0;
+            s.vx = 6.0; // carried velocity pushes it across the east edge
+            s.minerals = 7;
+        }
+        let mut host = SectorHost::from_home(sim);
+        host.ensure(SectorId::new(1, 0)); // pre-warm the neighbour, as the bubble does every frame
+        let start = host.home_tick();
+        host.advance_all(start + 3);
+        let moved = host.step_transits("me");
+        assert_eq!(moved, Some(SectorId::new(1, 0)), "home follows the player east");
+        assert_eq!(host.home(), SectorId::new(1, 0), "the node now hosts the neighbour as home");
+        let s = host.home_sim().ships.get("me").expect("ship carried into the neighbour, not lost");
+        assert_eq!(s.minerals, 7, "full state crossed the boundary");
+        assert!(s.x < SHIP_R + 50.0, "entered at the west edge (x={}), not mid-sector", s.x);
+        assert!((s.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT teleported to the sector centre");
+        assert!(host.sim(SectorId::new(0, 0)).is_some(), "the sector we left stays warm — no pop behind us");
+    }
+
+    #[test]
+    fn retain_drops_far_sectors_but_never_home() {
+        let mut sim = Sim::new();
+        sim.join("me", "Me", 0);
+        let mut host = SectorHost::from_home(sim);
+        host.ensure(SectorId::new(1, 0));
+        host.ensure(SectorId::new(5, 5)); // a sector far outside the bubble
+        let interest: std::collections::BTreeSet<SectorId> =
+            [SectorId::new(0, 0), SectorId::new(1, 0)].into_iter().collect();
+        let dropped = host.retain(&interest);
+        assert_eq!(dropped, vec![SectorId::new(5, 5)], "the far sector is released");
+        let warm = host.warm_sectors();
+        assert!(warm.contains(&SectorId::new(0, 0)) && warm.contains(&SectorId::new(1, 0)));
+        assert!(!warm.contains(&SectorId::new(5, 5)));
+        // Home is kept even if an interest glitch omits it.
+        host.retain(&std::collections::BTreeSet::new());
+        assert!(host.warm_sectors().contains(&SectorId::new(0, 0)), "home is never dropped");
+    }
+
+    #[test]
+    fn an_input_routes_to_its_own_sector_not_home() {
+        // A neighbour player's input arrives on the NEIGHBOUR's /in. It must drive the neighbour's warm
+        // replica (so we render it correctly across the seam), never auto-join a ghost at our home centre.
+        let mut sim = Sim::new();
+        sim.join("me", "Me", 0);
+        sim.factions.values_mut().for_each(|f| f.units.clear());
+        let mut host = SectorHost::from_home(sim);
+        host.ensure(SectorId::new(1, 0));
+        let t = host.home_tick();
+        host.schedule(
+            SectorId::new(1, 0),
+            TickInput { tick: t, player: "neighbour".into(), seq: 1, msg: ClientMsg::Join { name: "N".into(), cap: None } },
+        );
+        host.advance_all(t + 2);
+        assert!(
+            host.sim(SectorId::new(1, 0)).unwrap().ships.contains_key("neighbour"),
+            "the neighbour spawned in its own sector"
+        );
+        assert!(!host.home_sim().ships.contains_key("neighbour"), "and did NOT ghost-join home");
     }
 }

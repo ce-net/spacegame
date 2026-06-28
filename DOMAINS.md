@@ -23,24 +23,40 @@ factions." It is the design and API of `src/domain.rs`.
   sector-guarded so pre-warmed neighbours never ghost-join the local sim.
 - 239 pure + 248 mesh SDK tests green; both frontends compile; deployed to `spa.ce-net.com`.
 
+**Shipped this pass (b) — seamless cross-seam play (`SectorHost`):** the *felt* seam transition is gone.
+Each client now simulates **and renders its whole interest bubble**, not one sector. New
+`replica::SectorHost` keeps a deterministic `Replica` warm for every sector the recursive AABB overlaps
+(1/2/4, growing with the fleet); both frontends drive it (`spacegame-wasm/src/lib.rs`,
+`spacegame-native/src/main.rs run_player`). Crossing a seam now **moves `home` onto an already-live
+neighbour** (`SectorHost::step_transits` hands the ship over with full state) instead of rebuilding a
+fresh `Sim` — so nothing pops in front of OR behind the player, and the world-framed renderer (`Game`
+composes every warm sector at its `sector*SECTOR_SIZE` offset) shows both sides of a seam at once.
+Neighbour `/in` inputs now drive their own sector's replica (no longer filtered out), so peers across a
+seam simulate correctly; sectors leaving the bubble are released by `SectorHost::retain` (which also drops
+their stale snapshot from the renderer). 4 new `replica` tests + 250 lib tests green; both frontends
+compile.
+
 **Remainders (open, in priority order):**
 1. **Per-entity environment authority is not in the tick** (see ladder item 4). `claim_sticky` is built +
    tested but deliberately not driving simulation: it conflicts with the shipped quorum-merge model
    (every player runs the *whole* region sim and agrees on a state hash; per-entity ownership would make
    replicas simulate different subsets and diverge). **Decision needed:** keep full-region replication,
    or move to per-entity authority (partial sim + cross-player entity exchange) — the latter is the
-   "each player simulates its environment for others" scaling win, but it *replaces* the merge.
-2. **Cross-seam rendering.** Clients pre-warm neighbour `/in` (no hitch crossing) but still render only
-   their own replica's sector, so you don't *see* players across a seam until you cross. Needs neighbour
-   `/state` consumption, or domains replacing sector-partitioning in the sim (item 3).
+   "each player simulates its environment for others" scaling win, but it *replaces* the merge. Note: a
+   `SectorHost` client already simulates several sectors at once, so the partial-sim plumbing is now a
+   smaller step from here.
+2. **Cross-seam rendering — DONE** (the `SectorHost` pass above): you see players, asteroids and NPCs
+   across a seam before you reach it, and a crossing shows no transition.
 3. **Domains replacing the sector sim outright.** Today domains are a layer *on top* of the
-   sector-partitioned `Sim` (authority/interest/map). The full vision — the sim itself partitioned by a
-   moving AABB, no sectors at all — is a large `sim.rs` rewrite, deferred (and `sim.rs` is being reworked
-   concurrently).
-4. **Frontend lockfile pins.** `spacegame-wasm`/`-native` pin the `spacegame` git dep to `9eda512`
-   (functionally complete; the later `fb259a5` only fixes a unit test). Bump for hygiene when convenient.
-5. **Subscription pruning.** Clients accumulate `/in` subscriptions as they explore; far sectors are
-   never unsubscribed. Bounded, but a prune pass would tighten bandwidth on long sessions.
+   sector-partitioned `Sim`; the `SectorHost` runs several such sims at once but they are still fixed-grid
+   cells. The full vision — the sim itself partitioned by a moving AABB, no sectors at all — is a large
+   `sim.rs` rewrite, deferred (and `sim.rs` is being reworked concurrently).
+4. **Frontend lockfile pins / local patch.** `spacegame-wasm`/`-native` pin the `spacegame` git dep; this
+   pass adds a local `[patch]` to build the working-tree SDK. Push the SDK to `development` and bump the
+   pin (then drop the `[patch]`) when convenient.
+5. **Subscription pruning — DONE** for warm replicas (`SectorHost::retain` releases sectors that leave the
+   bubble). The mesh `/in` *subscription* is still left in place after a sector is dropped (a bounded set);
+   an explicit unsubscribe is a minor follow-up.
 
 ## The problem with a grid
 
