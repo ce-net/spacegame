@@ -37,12 +37,18 @@
 
 // --- Pure, deterministic SDK (wasm-clean; no mesh, no tokio, no ce-rs) ---
 pub mod aabb;
+pub mod ai;
 pub mod build;
+pub mod shipyard;
 pub mod client;
+pub mod coords;
+pub mod domain;
+pub mod editor;
 pub mod effects;
 pub mod faction;
 pub mod hazard;
 pub mod leaderboard;
+pub mod mapview;
 pub mod physics;
 pub mod procgen;
 pub mod replica;

@@ -170,6 +170,16 @@ pub fn snapshot_topic(sector: &str) -> String {
     format!("{}/snap", topics::service(sector))
 }
 
+/// Publish this host's live [`crate::mapview::CellReport`] for a cell it runs onto the galaxy-wide
+/// [`crate::mapview::MAP_TOPIC`], so the `/map` viewer (and any friend's map) can render the whole galaxy
+/// from every server at once. Call it on the same cadence as the capacity broadcast (a few seconds). The
+/// report is small (load + entity dots + broad-phase boxes) and JSON-encoded for the browser bridge.
+pub async fn publish_map_report(ce: &CeClient, report: &crate::mapview::CellReport) -> Result<()> {
+    let b = serde_json::to_vec(report).context("encode map report")?;
+    ce.publish(crate::mapview::MAP_TOPIC, &b).await.context("publish map report")?;
+    Ok(())
+}
+
 /// An announcement that a fresh snapshot exists. Published on [`snapshot_topic`] after each
 /// [`replicate_snapshot`]. `hash` is the snapshot's deterministic [`Sim::state_hash`], so a replica
 /// that the quorum has out-voted can fetch the CID whose state matches the **agreed** hash and merge to

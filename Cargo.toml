@@ -19,6 +19,13 @@ name = "spacegame"
 path = "src/main.rs"
 required-features = ["mesh"]
 
+# Zero-dependency benchmark harness (std::time only). Run against the pure SDK to skip the mesh git deps:
+#   cargo bench --no-default-features
+[[bench]]
+name = "bench"
+path = "benches/bench.rs"
+harness = false
+
 [features]
 default = ["mesh"]
 # The mesh backend: sector hosting, replication, hot-reload distribution, the CLI. Off for wasm SDK use.
