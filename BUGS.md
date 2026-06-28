@@ -48,15 +48,19 @@ Verbatim:
 Status: ❌ Not started. Saved blueprints list is a dropdown; needs a real-time rendered preview of each
 full ship + proper submenus.
 
-## B5 — Editor doesn't actually change the ship on exit
+## B5 — Editor doesn't actually change the ship on exit / design ends up on enemies
 Verbatim:
 > "ANd why doesnt the ship actually become what you designed in the editor when you leave the editor!!!"
+> "Alright i see whats happening the blueprints i make only is set for the enemies for some reason."
 > (earlier) "the editor does actually have a affect and actually modify my ship."
 
-Status: ❌ Apply IS wired (`take_apply()` → `ClientMsg::FitDesign` → `host.schedule_home`) and
-`fit_design` stores the design JSON in `hull` so `resolve_hull` can draw it — but the ship visibly does
-not become the design in game. Needs investigation (fit rejected? not reaching the home sim? predicted
-sprite drawn from a default? render not reading the fitted hull?).
+Status: ❌ Apply IS wired (`take_apply()` → `ClientMsg::FitDesign` (seq incremented) → `host.schedule_home`
+with `player=me_id`) and `fit_design` stores the design JSON in `hull` so `resolve_hull` draws it. The
+wasm runs `local_authority=true`, so the local ship draws from the snapshot render-map (`hull: s.hull`),
+same path as enemies — meaning if the fit applied, the player's own ship WOULD show it. Hypothesis: the
+"on enemies" is the new B6 enemy designs (raider/brawler/cruiser) being mis-attributed, and the real
+bug is the fit not landing on the player's ship (timing: scheduled at `tick: cur` not `cur+INPUT_DELAY`
+like Join; or `fit_design` returning false; or the home-sim id). Needs runtime debugging.
 
 ## B6 — Enemy ship designs
 Verbatim:
