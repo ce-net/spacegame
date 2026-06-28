@@ -229,6 +229,11 @@ pub struct ShipView {
     /// `"player" | "drone" | "fighter" | "hauler"`.
     #[serde(default)]
     pub role: String,
+    /// The **blueprint id** this ship was built/fitted from (e.g. `"interceptor"`). The renderer resolves
+    /// it against the ruleset catalogue to draw the ship's real multi-part hull instead of a placeholder.
+    /// Empty for a stock ship that has never been fitted — the renderer falls back to its default shape.
+    #[serde(default)]
+    pub hull: String,
     /// Reliable-input acknowledgement: the highest contiguous client-action sequence the host has
     /// APPLIED for this player (see [`ClientPacket`]). The owning client drops acked actions from its
     /// resend outbox. Only meaningful on the viewer's own ship; `0` for everyone else / NPCs.
@@ -518,6 +523,7 @@ mod tests {
                 weapons: vec!["blaster".into(), "railgun".into()],
                 owner: None,
                 role: "player".into(),
+                hull: "interceptor".into(),
                 input_ack: 11,
                 alive: true,
             }],

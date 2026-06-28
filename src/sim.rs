@@ -35,6 +35,7 @@ use crate::faction::{Faction, FactionCommand, UnitKind};
 use crate::hazard::Hazards;
 use crate::physics::{self, RigidBody, Shape, Vec2};
 use crate::ruleset::{OnHitEffect, Ruleset, RulesetHandle, TechEffect, Tunables, WeaponKind};
+use crate::coords::{Anchor, GalaxyPos};
 use crate::shard::SectorId;
 use crate::snapshot::ShipSnap;
 
@@ -132,9 +133,19 @@ pub struct Rock {
     pub cy: i32,
 }
 
-/// The deterministic asteroid (if any) for sector-local grid cell `(cx, cy)`.
-pub fn rock_in_cell(cx: i32, cy: i32) -> Option<Rock> {
-    let h = cell_hash(cx, cy, "rock");
+/// Asteroid grid cells per sector edge (`SECTOR_SIZE / ROCK_CELL`). A sector-local cell `cx ∈ 0..30` maps to
+/// the **global** cell `sector.sx * ROCKS_PER_SECTOR + cx`, which is what the field is hashed on so every
+/// galactic region is distinct (not the old repeating-per-sector field).
+pub const ROCKS_PER_SECTOR: i32 = (SECTOR_SIZE / ROCK_CELL) as i32;
+
+/// The deterministic asteroid (if any) in a sector-local grid cell `(cx, cy)` of `sector`. Keyed on the
+/// **global** cell so distinct regions of the galaxy hold distinct fields; the rock's `(x, y)` stay
+/// sector-local (so transit, mining cells, and the broad-phase are unchanged). The home sector `(0,0)` maps
+/// global == local, so its field is byte-identical to the legacy [`rock_in_cell`].
+pub fn rock_in_cell_at(sector: SectorId, cx: i32, cy: i32) -> Option<Rock> {
+    let gcx = sector.sx.saturating_mul(ROCKS_PER_SECTOR).saturating_add(cx);
+    let gcy = sector.sy.saturating_mul(ROCKS_PER_SECTOR).saturating_add(cy);
+    let h = cell_hash(gcx, gcy, "rock");
     if h % 100 >= 55 {
         return None; // ~55% of cells host a rock
     }
@@ -146,9 +157,45 @@ pub fn rock_in_cell(cx: i32, cy: i32) -> Option<Rock> {
         return None;
     }
     let span = ROCK_MAX_VAL - ROCK_MIN_VAL;
-    let val = ROCK_MIN_VAL + (cell_hash(cx, cy, "val") % (span + 1));
-    let hp = 18 + (cell_hash(cx, cy, "hp") % 30);
+    let val = ROCK_MIN_VAL + (cell_hash(gcx, gcy, "val") % (span + 1));
+    let hp = 18 + (cell_hash(gcx, gcy, "hp") % 30);
     Some(Rock { x, y, val, hp, cx, cy })
+}
+
+/// The deterministic asteroid (if any) for **home-sector** grid cell `(cx, cy)`. Back-compat shim equal to
+/// `rock_in_cell_at(SectorId::new(0, 0), cx, cy)`; new code on the sim path goes through [`Sim::rock`], which
+/// keys on the sim's own global region.
+pub fn rock_in_cell(cx: i32, cy: i32) -> Option<Rock> {
+    rock_in_cell_at(SectorId::new(0, 0), cx, cy)
+}
+
+/// The deterministic asteroid (if any) at the **global** rock-grid cell `(gcx, gcy)`, returned in **world**
+/// coordinates. This is the canonical accessor a *renderer* uses: it walks world cells across the camera and
+/// gets each rock's true galaxy position directly, with the byte-for-byte same existence / value / hp /
+/// in-cell offset the authoritative [`rock_in_cell_at`] computes for the matching sector + local cell — so
+/// the client draws exactly the field the server simulates. (`rock_in_cell_at(sector, cx, cy)` is the same
+/// rock viewed in sector-local coordinates: world = sector origin + local.) The edge-inset rule is applied on
+/// the within-sector local cell, identically on both, so a rock near a sector seam is kept (or culled) the
+/// same way everywhere.
+pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
+    let h = cell_hash(gcx, gcy, "rock");
+    if h % 100 >= 55 {
+        return None;
+    }
+    let ox = ((h >> 8) % 1000) as f32 / 1000.0;
+    let oy = ((h >> 18) % 1000) as f32 / 1000.0;
+    // Edge-inset rule, evaluated on the within-sector local position (matches `rock_in_cell_at`).
+    let lcx = gcx.rem_euclid(ROCKS_PER_SECTOR);
+    let lcy = gcy.rem_euclid(ROCKS_PER_SECTOR);
+    let lx = lcx as f32 * ROCK_CELL + ox * ROCK_CELL;
+    let ly = lcy as f32 * ROCK_CELL + oy * ROCK_CELL;
+    if lx < 30.0 || ly < 30.0 || lx > SECTOR_SIZE - 30.0 || ly > SECTOR_SIZE - 30.0 {
+        return None;
+    }
+    let span = ROCK_MAX_VAL - ROCK_MIN_VAL;
+    let val = ROCK_MIN_VAL + (cell_hash(gcx, gcy, "val") % (span + 1));
+    let hp = 18 + (cell_hash(gcx, gcy, "hp") % 30);
+    Some(Rock { x: gcx as f32 * ROCK_CELL + ox * ROCK_CELL, y: gcy as f32 * ROCK_CELL + oy * ROCK_CELL, val, hp, cx: lcx, cy: lcy })
 }
 
 /// A ship's authoritative state.
@@ -809,6 +856,32 @@ impl Sim {
         }
     }
 
+    /// The deterministic asteroid (if any) in this sim's sector-local cell `(cx, cy)`, keyed on the sim's
+    /// **global** region so each part of the galaxy has its own field. All sim-internal asteroid lookups go
+    /// through here, so the content follows the region, not a repeating per-sector pattern.
+    pub fn rock(&self, cx: i32, cy: i32) -> Option<Rock> {
+        rock_in_cell_at(self.sector, cx, cy)
+    }
+
+    /// This sim's **floating-origin frame** — the galaxy-scale [`Anchor`] its local `(x, y)` coordinates are
+    /// measured from. Today it is the galaxy generalisation of the sim's [`SectorId`]; it is what makes every
+    /// entity's local position resolvable to an origin-invariant galaxy position (see [`Self::galaxy_pos`]).
+    pub fn galaxy_frame(&self) -> Anchor {
+        Anchor::from_sector(self.sector)
+    }
+
+    /// Lift a local `(x, y)` in this sim's frame to an anchored galaxy position. The canonical
+    /// ([`GalaxyPos::fixed8`]) form is identical no matter which host's frame produced it — the property the
+    /// authoritative [`Self::state_hash`] and seamless transit both rely on.
+    pub fn galaxy_pos(&self, x: f32, y: f32) -> GalaxyPos {
+        GalaxyPos::new(self.galaxy_frame(), x, y)
+    }
+
+    /// A ship's anchored galaxy position (`None` if no such ship).
+    pub fn ship_galaxy_pos(&self, id: &str) -> Option<GalaxyPos> {
+        self.ships.get(id).map(|s| self.galaxy_pos(s.x, s.y))
+    }
+
     /// Accept a ship handed off from a neighbouring sector (the other end of [`take_transits`]).
     pub fn accept_transit(&mut self, snap: ShipSnap) {
         let ship = Ship::from_snap(&snap, self.tick);
@@ -1129,7 +1202,7 @@ impl Sim {
                     let max_cy = ((sy + reach) / ROCK_CELL).floor() as i32;
                     for cx in min_cx..=max_cx {
                         for cy in min_cy..=max_cy {
-                            let Some(r) = rock_in_cell(cx, cy) else { continue };
+                            let Some(r) = self.rock(cx, cy) else { continue };
                             if let Some(&t) = self.mined.get(&(cx, cy))
                                 && now.saturating_sub(t) < tun.rock_regen_ticks
                             {
@@ -1450,7 +1523,7 @@ impl Sim {
                 let e = self.escort_slot(id, anchor);
                 (e.0, e.1, false)
             }
-            Objective::Mine { cx, cy } => match rock_in_cell(*cx, *cy) {
+            Objective::Mine { cx, cy } => match self.rock(*cx, *cy) {
                 Some(r) => (r.x, r.y, false),
                 None => {
                     let e = self.escort_slot(id, anchor);
@@ -1495,7 +1568,7 @@ impl Sim {
 
     /// Whether the rock in cell `(cx, cy)` exists and is currently mineable (not on its regen cooldown).
     fn rock_cell_live(&self, cx: i32, cy: i32) -> bool {
-        if rock_in_cell(cx, cy).is_none() {
+        if self.rock(cx, cy).is_none() {
             return false;
         }
         match self.mined.get(&(cx, cy)) {
@@ -1551,7 +1624,7 @@ impl Sim {
         let mut best: Option<(i32, i32, f32, f32, f32)> = None;
         for cx in min_cx..=max_cx {
             for cy in min_cy..=max_cy {
-                let Some(r) = rock_in_cell(cx, cy) else { continue };
+                let Some(r) = self.rock(cx, cy) else { continue };
                 if let Some(&t) = self.mined.get(&(cx, cy))
                     && now.saturating_sub(t) < regen
                 {
@@ -2031,7 +2104,7 @@ impl Sim {
             if !missile
                 && let Some((cx, cy)) = self.rock_hit(b.x, b.y)
             {
-                if let Some(r) = rock_in_cell(cx, cy) {
+                if let Some(r) = self.rock(cx, cy) {
                     self.damage_rock(cx, cy, r.hp, r.val, (b.dmg.max(1)) as u32, now);
                 }
                 continue; // round consumed
@@ -2051,7 +2124,7 @@ impl Sim {
         let bcy = (y / ROCK_CELL).floor() as i32;
         for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
             let (cx, cy) = (bcx + dx, bcy + dy);
-            let Some(r) = rock_in_cell(cx, cy) else { continue };
+            let Some(r) = self.rock(cx, cy) else { continue };
             if let Some(&t) = self.mined.get(&(cx, cy))
                 && now.saturating_sub(t) < regen
             {
@@ -2595,10 +2668,22 @@ impl Sim {
             // Quantise to 1/8 unit so honest replicas agree despite sub-unit float noise.
             (f * 8.0).round() as i64 as u64
         }
+        // Positions are folded as **anchored galaxy coordinates**, not raw sector-local `q(x)`. The frame
+        // (this sim's anchor) plus the local offset reduces to one origin-invariant key ([`GalaxyPos::fixed8`])
+        // — so a host that anchors a patch of space at a *different* origin than its neighbour (the two sides
+        // of a seamless transit, a re-based domain) still computes the *same* hash for the same physical
+        // world. Folding the raw sector separately, as this used to, would make re-anchoring look like a
+        // divergence. Velocities/angles are translation-invariant and stay as plain quantised scalars.
+        let frame = self.galaxy_frame();
+        fn mixpos(h: &mut u64, frame: Anchor, x: f32, y: f32) {
+            let (ax, ay, lx, ly) = GalaxyPos::new(frame, x, y).fixed8();
+            mix(h, ax as u64);
+            mix(h, ay as u64);
+            mix(h, lx as u64);
+            mix(h, ly as u64);
+        }
         let mut h: u64 = 0xcbf29ce484222325;
         mix(&mut h, self.tick);
-        mix(&mut h, self.sector.sx as u64);
-        mix(&mut h, self.sector.sy as u64);
         mix(&mut h, self.rules.version);
 
         // Ships: sorted by id (stable order).
@@ -2607,8 +2692,7 @@ impl Sim {
         for id in ids {
             let s = &self.ships[id];
             mix(&mut h, fnv1a(id) as u64);
-            mix(&mut h, q(s.x));
-            mix(&mut h, q(s.y));
+            mixpos(&mut h, frame, s.x, s.y);
             mix(&mut h, q(s.vx));
             mix(&mut h, q(s.vy));
             mix(&mut h, q(s.a));
@@ -2637,8 +2721,7 @@ impl Sim {
         for b in &self.bullets {
             let mut bh: u64 = 0x9e3779b97f4a7c15;
             mix(&mut bh, fnv1a(&b.owner) as u64);
-            mix(&mut bh, q(b.x));
-            mix(&mut bh, q(b.y));
+            mixpos(&mut bh, frame, b.x, b.y);
             mix(&mut bh, b.dmg as i64 as u64);
             mix(&mut bh, b.die_at);
             bsum ^= bh;
@@ -2650,8 +2733,7 @@ impl Sim {
         for m in &self.mines {
             let mut mh: u64 = 0x517cc1b727220a95;
             mix(&mut mh, fnv1a(&m.owner) as u64);
-            mix(&mut mh, q(m.x));
-            mix(&mut mh, q(m.y));
+            mixpos(&mut mh, frame, m.x, m.y);
             mix(&mut mh, m.dmg as i64 as u64);
             mix(&mut mh, m.arm_at);
             mix(&mut mh, m.die_at);
@@ -2664,8 +2746,7 @@ impl Sim {
         for p in &self.pickups {
             let mut ph: u64 = 0xff51afd7ed558ccd;
             mix(&mut ph, p.kind.code() as u64);
-            mix(&mut ph, q(p.x));
-            mix(&mut ph, q(p.y));
+            mixpos(&mut ph, frame, p.x, p.y);
             mix(&mut ph, q(p.value));
             mix(&mut ph, p.die_at);
             psum ^= ph;
@@ -2732,7 +2813,7 @@ impl Sim {
     /// fly through the debris to collect it. Deterministic: count, headings and split are seeded from the
     /// cell, so every replica spawns the identical burst. Bounded by the global pickup cap.
     fn shatter_rock(&mut self, cx: i32, cy: i32, val: u32, now: u64) {
-        let Some(r) = rock_in_cell(cx, cy) else { return };
+        let Some(r) = self.rock(cx, cy) else { return };
         let val = val.max(1);
         // 1 nugget per ~6 value, 2..=6 nuggets — a small rock pops one chunk, a fat one sprays a handful.
         let n = (val / 6).clamp(2, 6);

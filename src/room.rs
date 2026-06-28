@@ -227,6 +227,7 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         weapons: s.weapons.clone(),
         owner: s.owner.clone(),
         role: role_str(s.role).to_string(),
+        hull: s.hull.clone(), // the blueprint id, so the client can draw the real fitted hull
         input_ack: 0, // stamped by the host loop from its InputSync after the snapshot is built
         alive: s.alive,
     }

@@ -25,7 +25,7 @@
 
 /// An axis-aligned bounding box in sector-local world units. `min <= max` on both axes for any box
 /// produced by this module.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Aabb {
     pub min_x: f32,
     pub min_y: f32,
@@ -83,6 +83,17 @@ impl Aabb {
 enum Node {
     Leaf { items: Vec<usize> },
     Branch { children: Box<[Node; 4]> },
+}
+
+/// One node of an [`AabbTree`] exposed for **visualization/debugging** — its region box, its depth, whether
+/// it is a leaf, and how many items it holds. The galaxy map draws these to show the broad-phase structure
+/// from ship scale on up. Not used by the hot query path.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AabbNodeInfo {
+    pub region: Aabb,
+    pub depth: u32,
+    pub leaf: bool,
+    pub count: usize,
 }
 
 /// A recursively subdivided AABB tree over a set of `(Aabb, payload)` items. Build once per tick, then
@@ -190,6 +201,36 @@ impl<T: Clone> AabbTree<T> {
             Self::subdivide(quads[3], &buckets[3], boxes, depth + 1, leaf_cap, max_depth),
         ]);
         Node::Branch { children }
+    }
+
+    /// Every node's region box for visualization — `(region, depth, leaf, item_count)`, root first, in the
+    /// fixed NW/NE/SW/SE order. Regions are recomputed on the walk (they aren't stored), exactly mirroring
+    /// [`subdivide`](Self::subdivide), so they are the true node boxes. This is what the map draws to show
+    /// the AABB hierarchy; it is O(nodes) and off the hot path.
+    pub fn node_boxes(&self) -> Vec<AabbNodeInfo> {
+        fn walk(node: &Node, region: Aabb, depth: u32, out: &mut Vec<AabbNodeInfo>) {
+            match node {
+                Node::Leaf { items } => {
+                    out.push(AabbNodeInfo { region, depth, leaf: true, count: items.len() });
+                }
+                Node::Branch { children } => {
+                    out.push(AabbNodeInfo { region, depth, leaf: false, count: 0 });
+                    let (cx, cy) = region.center();
+                    let quads = [
+                        Aabb::new(region.min_x, region.min_y, cx, cy),
+                        Aabb::new(cx, region.min_y, region.max_x, cy),
+                        Aabb::new(region.min_x, cy, cx, region.max_y),
+                        Aabb::new(cx, cy, region.max_x, region.max_y),
+                    ];
+                    for (c, q) in children.iter().zip(quads) {
+                        walk(c, q, depth + 1, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, self.bounds, 0, &mut out);
+        out
     }
 
     /// Number of indexed items.

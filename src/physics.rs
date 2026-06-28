@@ -32,6 +32,7 @@
 //! of nearby players and fail over between them.
 
 use crate::aabb::{Aabb, DynamicAabbTree, Proxy};
+use crate::coords::{Anchor, GalaxyPos, ANCHOR_SPAN};
 
 /// A 2D vector. Plain `Copy` math, GPU/SIMD friendly.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -278,17 +279,74 @@ pub struct World {
     /// Baumgarte positional-correction factor and penetration slop.
     pub beta: f32,
     pub slop: f32,
+    /// **Floating origin.** Every body's `pos` is local to this galaxy-scale [`Anchor`]; a body's true
+    /// galaxy position is `frame ⊕ pos`. The world keeps the action near `pos ≈ 0` by recentring `frame`
+    /// on its bodies ([`World::recenter`], called every [`step`](World::step)), so the integrator only ever
+    /// sees small numbers and stays precise anywhere in the galaxy — not just within one sector. A `World`
+    /// is one node of the frame tree (an active bubble); the tree *across* bubbles is the celestial layer.
+    pub frame: Anchor,
 }
 
 impl Default for World {
     fn default() -> Self {
-        World { bodies: Vec::new(), tree: DynamicAabbTree::new(8.0), beta: 0.2, slop: 0.05 }
+        World { bodies: Vec::new(), tree: DynamicAabbTree::new(8.0), beta: 0.2, slop: 0.05, frame: Anchor::ORIGIN }
     }
 }
 
 impl World {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This world's floating-origin [`Anchor`]. A body's galaxy position is `frame ⊕ pos`.
+    pub fn frame(&self) -> Anchor {
+        self.frame
+    }
+
+    /// Place this world's local origin at `frame` (where in the galaxy this bubble lives). Existing body
+    /// `pos` are left untouched — they are now interpreted relative to the new frame, so set this *before*
+    /// populating a bubble, or follow it with a shift if you mean to keep global positions.
+    pub fn set_frame(&mut self, frame: Anchor) {
+        self.frame = frame;
+    }
+
+    /// Body `i`'s **galaxy position** — the anchored, origin-invariant coordinate ([`GalaxyPos`]) that holds
+    /// full precision anywhere in the galaxy, even where its raw `pos` magnitude never could.
+    pub fn global_pos(&self, i: usize) -> GalaxyPos {
+        let b = &self.bodies[i];
+        GalaxyPos::new(self.frame, b.pos.x, b.pos.y)
+    }
+
+    /// **Recentre the floating origin on the bodies** so the integrator works near `pos ≈ 0`. If the body
+    /// centroid has drifted more than half an [`ANCHOR_SPAN`] from the local origin, the frame jumps by that
+    /// whole number of anchor cells and every body's `pos` is shifted by the exact opposite — so **global
+    /// positions are unchanged**, only their spelling is. Called automatically every [`step`](World::step),
+    /// it is what makes a body cruising across the galaxy keep a small, precise local coordinate the whole
+    /// way (floating-origin rebasing *during flight*, not just at sector seams). Cheap: it only touches the
+    /// bodies (and rebuilds the broad-phase) on the rare tick a jump actually happens. Returns the cell delta.
+    pub fn recenter(&mut self) -> (i64, i64) {
+        if self.bodies.is_empty() {
+            return (0, 0);
+        }
+        let (mut sx, mut sy) = (0.0f64, 0.0f64);
+        for b in &self.bodies {
+            sx += b.pos.x as f64;
+            sy += b.pos.y as f64;
+        }
+        let n = self.bodies.len() as f64;
+        let dcx = (sx / n / ANCHOR_SPAN as f64).round() as i64;
+        let dcy = (sy / n / ANCHOR_SPAN as f64).round() as i64;
+        if dcx == 0 && dcy == 0 {
+            return (0, 0);
+        }
+        let (ox, oy) = (dcx as f32 * ANCHOR_SPAN, dcy as f32 * ANCHOR_SPAN);
+        for b in self.bodies.iter_mut() {
+            b.pos.x -= ox;
+            b.pos.y -= oy;
+        }
+        self.frame = self.frame.offset(dcx, dcy);
+        self.rebuild_tree(); // positions moved by a span; proxies must be refit from scratch
+        (dcx, dcy)
     }
 
     /// Add a body, indexing it in the broad-phase. Returns its index in [`World::bodies`].
@@ -327,6 +385,9 @@ impl World {
     /// bodies take more substeps and more solver iterations than low-tier ones, and `Registered`
     /// bodies are only integrated (no contact solving). Call [`assign_lod`] first.
     pub fn step(&mut self, dt: f32, gravity: Vec2) {
+        // Floating origin: keep the active set near pos≈0 before integrating, so a bubble cruising across
+        // the galaxy never accumulates a large (imprecise) local coordinate. A no-op unless it drifted a cell.
+        self.recenter();
         // Group work by the coarsest budget present, but apply each body's own substep/iteration count.
         // For simplicity and determinism we run the whole world at the max substep count and let each
         // body's solver iterations gate its contact work; Registered bodies skip the solver entirely.
