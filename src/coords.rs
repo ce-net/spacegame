@@ -178,6 +178,40 @@ impl GalaxyPos {
         let (ox, oy) = self.anchor.origin_f64();
         (ox + self.x as f64, oy + self.y as f64)
     }
+
+    // --- movement / geometry API ---------------------------------------------------------------------
+    // These keep the WHOLE sim off raw `.x`/`.y` arithmetic: positions move and compare only through
+    // these methods, so swapping the underlying model later (e.g. a recursive-AABB cell scheme instead of
+    // the flat anchor grid) is a change to GalaxyPos alone, not to 180 call sites.
+
+    /// Move by a world-space vector, keeping the local offset small (re-anchoring as it crosses a span).
+    /// The canonical way to integrate motion: `p = p.translate(vx * dt, vy * dt)`.
+    pub fn translate(self, dx: f32, dy: f32) -> GalaxyPos {
+        GalaxyPos { anchor: self.anchor, x: self.x + dx, y: self.y + dy }.normalize()
+    }
+
+    /// Set the local offset within the SAME anchor (then normalise). For clamps/teleports relative to a
+    /// known frame; prefer [`translate`](Self::translate) for motion.
+    pub fn with_local(self, x: f32, y: f32) -> GalaxyPos {
+        GalaxyPos { anchor: self.anchor, x, y }.normalize()
+    }
+
+    /// Squared world distance to `other` (cheap; for range comparisons).
+    pub fn dist2(self, other: GalaxyPos) -> f32 {
+        let (dx, dy) = self.delta(other);
+        dx * dx + dy * dy
+    }
+
+    /// World distance to `other`.
+    pub fn dist(self, other: GalaxyPos) -> f32 {
+        self.dist2(other).sqrt()
+    }
+
+    /// Heading (radians) from `self` toward `other` — `atan2(Δy, Δx)`.
+    pub fn bearing(self, other: GalaxyPos) -> f32 {
+        let (dx, dy) = other.delta(self);
+        dy.atan2(dx)
+    }
 }
 
 #[cfg(test)]

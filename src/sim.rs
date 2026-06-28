@@ -203,8 +203,9 @@ pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
 pub struct Ship {
     pub name: String,
     pub hue: u32,
-    pub x: f32,
-    pub y: f32,
+    /// Absolute galaxy position (anchored floating-origin — the ONLY coordinate model; there is no
+    /// sector-local raw `f32` any more). `.x`/`.y` are the small local offset within `.anchor`.
+    pub pos: crate::coords::GalaxyPos,
     pub vx: f32,
     pub vy: f32,
     pub a: f32,
@@ -297,8 +298,9 @@ impl Ship {
         Ship {
             name,
             hue,
-            x: SECTOR_SIZE / 2.0 + off,
-            y: SECTOR_SIZE / 2.0 - off,
+            // Placeholder local offset at the origin anchor; callers (join/npc/respawn) set the real
+            // galaxy position with `pos = sim.galaxy_pos(x, y)`.
+            pos: GalaxyPos::new(Anchor::ORIGIN, SECTOR_SIZE / 2.0 + off, SECTOR_SIZE / 2.0 - off),
             vx: 0.0,
             vy: 0.0,
             a: -std::f32::consts::FRAC_PI_2,
@@ -339,10 +341,9 @@ impl Ship {
     /// Spawn an NPC fleet ship of `role` for faction `owner` at `(x, y)`. It carries the blaster (so a
     /// fighter can fight) and full hull for its role; its id is the synthetic `npc:<owner>:<seq>`.
     #[allow(clippy::too_many_arguments)]
-    fn npc(role: ShipRole, owner: String, x: f32, y: f32, hp: i32, hue: u32, tick: u64) -> Self {
+    fn npc(role: ShipRole, owner: String, pos: GalaxyPos, hp: i32, hue: u32, tick: u64) -> Self {
         let mut s = Ship::new(format!("{role:?}"), hue, tick, "blaster".into(), hp);
-        s.x = x;
-        s.y = y;
+        s.pos = pos;
         s.max_hp = hp;
         s.hp = hp;
         s.owner = Some(owner);
@@ -504,8 +505,9 @@ impl Ship {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Bullet {
     pub owner: String,
-    pub x: f32,
-    pub y: f32,
+    /// Absolute galaxy position (anchored floating-origin) — same model as [`Ship::pos`]; bullets are
+    /// no longer sector-local, so they fly continuously across the galaxy with no boundary.
+    pub pos: crate::coords::GalaxyPos,
     pub vx: f32,
     pub vy: f32,
     pub dmg: i32,
