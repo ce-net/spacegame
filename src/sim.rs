@@ -2908,14 +2908,14 @@ mod tests {
         // A design composed in the editor flies once fitted.
         let design = ShipEditor::starter().to_blueprint();
         assert!(s.fit_design("p", &design), "a flyable custom design fits");
-        assert_eq!(s.ships["p"].hull, "custom", "a custom design marks the hull as custom");
+        assert!(s.ships["p"].hull.starts_with('{'), "a custom design stores its blueprint inline in the hull (so the renderer draws the exact parts)");
         assert!(s.ships["p"].mass > 0.0 && s.ships["p"].speed_mult > 0.0, "stats came from the parts");
         // A brick (no engine) is rejected and the fitted ship is kept.
         let mut brick = ShipEditor::new("Brick");
         brick.place("struct-block", 0, 0, 0);
         brick.place("command-center", 0, 0, 0);
         assert!(!s.fit_design("p", &brick.to_blueprint()), "a brick design is rejected");
-        assert_eq!(s.ships["p"].hull, "custom", "the rejected design left the good ship in place");
+        assert!(s.ships["p"].hull.starts_with('{'), "the rejected design left the good ship (its prior custom hull) in place");
     }
 
     // ---- Mining: gradual, shatters into alloy nuggets you collect ----
