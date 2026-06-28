@@ -423,6 +423,20 @@ pub fn resolve_blueprint(
 
 /// Resolve a blueprint **value** (e.g. one synthesized by the procedural generator, which is not in the
 /// catalogue) against the object/blueprint catalogue it references.
+/// Resolve a ship's `hull` field to its concrete [`ResolvedCraft`] for rendering. A hull that begins with
+/// `{` is an **inline custom design** — the editor's [`Blueprint`] as JSON, stored by
+/// [`crate::sim::Sim::fit_design`] so the in-game ship draws exactly what was composed in the editor;
+/// anything else is a **named blueprint id** resolved against the catalogue. `None` if empty/unresolvable.
+pub fn resolve_hull(catalog: &Catalog, hull: &str, args: &BTreeMap<String, f32>) -> Option<ResolvedCraft> {
+    if hull.starts_with('{') {
+        serde_json::from_str::<Blueprint>(hull).ok().and_then(|bp| resolve_design(catalog, &bp, args).ok())
+    } else if !hull.is_empty() {
+        resolve_blueprint(catalog, hull, args).ok()
+    } else {
+        None
+    }
+}
+
 pub fn resolve_design(
     catalog: &Catalog,
     blueprint: &Blueprint,

@@ -849,7 +849,12 @@ impl Sim {
         }
         match self.ships.get_mut(id) {
             Some(s) => {
-                s.apply_loadout(&lo, "custom");
+                // Carry the design ITSELF (as JSON) in the hull field, not the placeholder "custom", so
+                // the renderer draws the exact blueprint the player composed — the in-game ship matches
+                // the editor 1:1. `crate::build::resolve_hull` decodes an inline `{...}` design; a named id
+                // still resolves by name.
+                let hull = serde_json::to_string(design).unwrap_or_default();
+                s.apply_loadout(&lo, &hull);
                 true
             }
             None => false,
