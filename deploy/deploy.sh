@@ -77,7 +77,9 @@ seed() {
     ce-publish app ceapp.toml --bin target/release/spacegame --target linux-amd64 --hub '"$HUB"'
     ce app uninstall spacegame >/dev/null 2>&1 || true
     pkill -f "apps/spacegame/.*/spacegame host" >/dev/null 2>&1 || true
-    ce app install spacegame --yes --registry '"$HUB"'
+    # Use the DEFAULT registry (the relay hub IS ce-net.com): passing --registry http://127.0.0.1:8970
+    # here HANGS the materialize step, whereas the default resolves the just-published manifest instantly.
+    ce app install spacegame --yes
     ce app daemon enable spacegame >/dev/null 2>&1 || true
     sleep 6
     printf "daemon supervised: "; ce app daemon ls 2>/dev/null | grep -q spacegame && echo yes || echo NO
