@@ -1755,6 +1755,20 @@ impl Sim {
             // Hue 0 = an aggressive red, so marauders read instantly as a threat.
             let mut s = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), self.galaxy_pos(sx, sy), tun.enemy_hp.try_into().unwrap(), 0, now);
             s.outfit(tun);
+            // Each marauder flies one of several distinct enemy hulls (deterministically by seed) so a raid
+            // is a mixed fleet, not clones. Stats come from the design's parts (the same blueprint->loadout
+            // path a player uses); the hull id is the blueprint, so `resolve_hull` draws the real silhouette.
+            const ENEMY_DESIGNS: [&str; 4] = ["raider", "brawler", "interceptor", "cruiser"];
+            let pick = ENEMY_DESIGNS[((seed >> 20) as usize) % ENEMY_DESIGNS.len()];
+            if let Ok(craft) =
+                crate::build::resolve_blueprint(&self.rules.catalog(), pick, &std::collections::BTreeMap::new())
+            {
+                let lo = crate::shipyard::loadout_from_craft(&craft);
+                if lo.is_flyable() {
+                    s.apply_loadout(&lo, pick);
+                    s.hp = s.max_hp;
+                }
+            }
             self.ships.insert(id, s);
         }
     }

@@ -1350,7 +1350,77 @@ fn builtin_blueprints() -> Vec<Blueprint> {
         ],
     );
 
-    vec![pod, scout, core, wing, engine, nose, interceptor, gunship, hauler]
+    // --- MARAUDER (enemy) hulls — distinct silhouettes so a raid reads as a mixed hostile fleet, and each
+    // flies differently because its stats come from its parts (the same blueprint->loadout path as players). ---
+
+    // RAIDER — a fast striker: light spine, twin turret pods + a missile rack, big thrusters + fins. Glass cannon.
+    let raider = bp(
+        "raider",
+        "Raider",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0))
+                .with_children(vec![Placement::object("command-center", Transform2D::default())]),
+            Placement::object("struct-block", Transform2D::new(0.0, 1.8, 0.0)),
+            Placement::object("thruster", Transform2D::new(-0.8, -1.6, 0.0)),
+            Placement::object("thruster", Transform2D::new(0.8, -1.6, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(-2.2, 0.4, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.2, 0.4, 0.0)),
+            Placement::object("missile-rack", Transform2D::new(0.0, 1.0, 0.0)),
+            Placement::object("armor-wedge", Transform2D::new(-1.6, -0.8, 0.0)),
+            Placement::object("armor-wedge", Transform2D::new(1.6, -0.8, 0.0)),
+        ],
+    );
+
+    // BRAWLER — an armored bruiser: heavy plating + a forward gun, slow but very tough.
+    let brawler = bp(
+        "brawler",
+        "Brawler",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("reactor", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            Placement::object("struct-corner", Transform2D::new(-1.4, 0.0, 0.0)),
+            Placement::object("struct-corner", Transform2D::new(1.4, 0.0, 0.0)),
+            Placement::object("thruster", Transform2D::new(-1.0, -1.8, 0.0)),
+            Placement::object("thruster", Transform2D::new(1.0, -1.8, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(0.0, 1.6, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(-1.6, 1.2, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(1.6, 1.2, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(-1.6, 2.6, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(1.6, 2.6, 0.0)),
+            Placement::object("gun", Transform2D::new(0.0, -0.6, 0.0)),
+        ],
+    );
+
+    // CRUISER — a marauder capital ship: a long spine bristling with turret pods + missiles. The raid boss.
+    let cruiser = bp(
+        "cruiser",
+        "Marauder Cruiser",
+        vec![
+            Placement::object("struct-block", Transform2D::new(0.0, 0.0, 0.0)).with_repeat(Repeat {
+                count: 4,
+                dx: 0.0,
+                dy: 2.0,
+                drot: 0.0,
+            }),
+            Placement::object("struct-block", Transform2D::new(0.0, 2.0, 0.0)).with_children(vec![
+                Placement::object("command-center", Transform2D::default()),
+                Placement::object("reactor", Transform2D::new(0.0, 0.4, 0.0)),
+            ]),
+            Placement::object("thruster", Transform2D::new(-1.0, -1.8, 0.0)),
+            Placement::object("thruster", Transform2D::new(1.0, -1.8, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(-2.8, 1.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.8, 1.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(-2.8, 4.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.8, 4.0, 0.0)),
+            Placement::object("missile-rack", Transform2D::new(0.0, 5.0, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(-1.4, 6.2, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(1.4, 6.2, 0.0)),
+        ],
+    );
+
+    vec![pod, scout, core, wing, engine, nose, interceptor, gunship, hauler, raider, brawler, cruiser]
 }
 
 /// A small hot-reloadable shape library, referenced by id or edited to restyle many blocks at once.
