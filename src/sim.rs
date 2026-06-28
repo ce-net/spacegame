@@ -2073,14 +2073,12 @@ impl Sim {
                 b.vx += g.x * dt_scale;
                 b.vy += g.y * dt_scale;
             }
+            // Move in the sim's continuous frame. Bullets are NOT clamped/dropped at the old sector edge —
+            // sectors are a dynamic addressing grid, not a wall, so a round flies transparently across a
+            // boundary and only expires by `die_at`. (Per-bullet cross-sim authority hand-off is the deeper
+            // step; this removes the visible seam where rounds used to vanish.)
             b.pos.x += b.vx * dt_scale;
             b.pos.y += b.vy * dt_scale;
-            if b.pos.x < 0.0 || b.pos.y < 0.0 || b.pos.x > SECTOR_SIZE || b.pos.y > SECTOR_SIZE {
-                if missile {
-                    self.detonate(&b, now, tree);
-                }
-                continue;
-            }
             // Broad-phase: only ships near the bullet are candidates.
             let mut candidates = tree.query(&Aabb::around(b.pos.x, b.pos.y, SHIP_R + 4.0));
             candidates.sort();
