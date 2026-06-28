@@ -7,6 +7,41 @@ This is the answer to that directive, and to "make chunks/sections seamless — 
 ideally no transition required at all… recursive AABB which follows the player and its ships and
 factions." It is the design and API of `src/domain.rs`.
 
+## Status & remainders (2026-06-28)
+
+**Shipped this pass (committed + pushed to GitHub `development`; live-deployed):**
+- `domain.rs` — the entity-anchored recursive-AABB partition core: `Bounds` (f64 world AABB), `Domain`
+  (a player's ship+fleet+faction bubble that follows them), `DomainField` + `DomainTree` (broad-phase
+  overlap = interest), `claim`/`claim_sticky` (environment ownership, hysteresis). Sim bridge:
+  `from_sim`, `world_pos`, `Bounds::sectors`. 11 unit tests.
+- `replica.rs` — `domain_field()` + `interest_sectors()` (seamless interest: 1/2/4 sectors).
+- `client.rs` — `interest_set` is domain-driven (viewport bubble → overlapping sectors).
+- `galaxywire.rs` + `galaxymap.rs` + `node.rs` + `lib.rs` host loop — hosts gossip `DomainFrame`s on
+  `topics::DOMAINS`; the map folds them (`MapModel::on_domains`, `player_domains`, `live_players`).
+- **Clients wired** — `spacegame-wasm` and `spacegame-native` subscribe to the `/in` of every interest
+  sector each frame, pre-warming the neighbour so a crossing has no subscribe round-trip; inputs are
+  sector-guarded so pre-warmed neighbours never ghost-join the local sim.
+- 239 pure + 248 mesh SDK tests green; both frontends compile; deployed to `spa.ce-net.com`.
+
+**Remainders (open, in priority order):**
+1. **Per-entity environment authority is not in the tick** (see ladder item 4). `claim_sticky` is built +
+   tested but deliberately not driving simulation: it conflicts with the shipped quorum-merge model
+   (every player runs the *whole* region sim and agrees on a state hash; per-entity ownership would make
+   replicas simulate different subsets and diverge). **Decision needed:** keep full-region replication,
+   or move to per-entity authority (partial sim + cross-player entity exchange) — the latter is the
+   "each player simulates its environment for others" scaling win, but it *replaces* the merge.
+2. **Cross-seam rendering.** Clients pre-warm neighbour `/in` (no hitch crossing) but still render only
+   their own replica's sector, so you don't *see* players across a seam until you cross. Needs neighbour
+   `/state` consumption, or domains replacing sector-partitioning in the sim (item 3).
+3. **Domains replacing the sector sim outright.** Today domains are a layer *on top* of the
+   sector-partitioned `Sim` (authority/interest/map). The full vision — the sim itself partitioned by a
+   moving AABB, no sectors at all — is a large `sim.rs` rewrite, deferred (and `sim.rs` is being reworked
+   concurrently).
+4. **Frontend lockfile pins.** `spacegame-wasm`/`-native` pin the `spacegame` git dep to `9eda512`
+   (functionally complete; the later `fb259a5` only fixes a unit test). Bump for hygiene when convenient.
+5. **Subscription pruning.** Clients accumulate `/in` subscriptions as they explore; far sectors are
+   never unsubscribed. Bounded, but a prune pass would tighten bandwidth on long sessions.
+
 ## The problem with a grid
 
 The adaptive galaxy (`galaxy.rs`) is real and it scales: space is a power-of-two quadtree, hot cells

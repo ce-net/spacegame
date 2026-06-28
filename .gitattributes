@@ -1,0 +1,7 @@
+# Keep scripts and unit files LF, always. The workspace's git has core.autocrlf=true (a relic of the
+# now-disabled cross-platform gitsync), which checked these out with CRLF and broke them: bash read
+# `set -euo pipefail\r` as the invalid option `pipefail\r`, and the deploy aborted on line 1. Forcing
+# eol=lf here makes them correct on every checkout regardless of the autocrlf setting.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.bash      text eol=lf
