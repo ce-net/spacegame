@@ -193,7 +193,7 @@ impl Autoscaler {
         let mut out: Vec<NodeId> = Vec::with_capacity(4);
         // A throwaway local view so we don't seat two children on the last free slot of one node.
         let mut taken: HashMap<NodeId, u32> = HashMap::new();
-        for k in &kids {
+        for _k in &kids {
             let pick = fleet
                 .hosts
                 .iter()

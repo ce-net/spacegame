@@ -27,8 +27,8 @@ fn ship_transits_from_one_sector_to_the_neighbour() {
     a.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
     {
         let s = a.ships.get_mut("p").unwrap();
-        s.x = SECTOR_SIZE - 2.0;
-        s.y = 1500.0;
+        s.pos.x = SECTOR_SIZE - 2.0;
+        s.pos.y = 1500.0;
         s.a = 0.0;
         s.vx = 6.0;
         s.minerals = 42;
@@ -106,7 +106,7 @@ fn honest_replicas_agree_on_the_state_hash_and_a_cheat_diverges() {
         }
     }
     assert_eq!(a.state_hash(), b.state_hash(), "honest replicas agree");
-    a.ships.get_mut("x").unwrap().x += 75.0; // a cheating host teleports a ship
+    a.ships.get_mut("x").unwrap().pos.x += 75.0; // a cheating host teleports a ship
     assert_ne!(a.state_hash(), b.state_hash(), "the tampered replica's hash diverges");
 }
 
@@ -242,10 +242,10 @@ fn a_mobile_viewport_only_receives_nearby_entities() {
     s.seamless = false;
     apply_client_msg(&mut s, "near", ClientMsg::Join { name: "N".into(), cap: None });
     apply_client_msg(&mut s, "far", ClientMsg::Join { name: "F".into(), cap: None });
-    s.ships.get_mut("near").unwrap().x = 200.0;
-    s.ships.get_mut("near").unwrap().y = 200.0;
-    s.ships.get_mut("far").unwrap().x = 2800.0;
-    s.ships.get_mut("far").unwrap().y = 2800.0;
+    s.ships.get_mut("near").unwrap().pos.x = 200.0;
+    s.ships.get_mut("near").unwrap().pos.y = 200.0;
+    s.ships.get_mut("far").unwrap().pos.x = 2800.0;
+    s.ships.get_mut("far").unwrap().pos.y = 2800.0;
     s.tick(1.0);
 
     let profile = Platform::MobileBrowser.profile();

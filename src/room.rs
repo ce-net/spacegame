@@ -207,8 +207,8 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
         id: id.to_string(),
         name: s.name.clone(),
         hue: s.hue,
-        x: s.x.round().clamp(0.0, SECTOR_SIZE) as i32,
-        y: s.y.round().clamp(0.0, SECTOR_SIZE) as i32,
+        x: s.pos.x.round().clamp(0.0, SECTOR_SIZE) as i32,
+        y: s.pos.y.round().clamp(0.0, SECTOR_SIZE) as i32,
         a: (s.a * 100.0).round() as i32,
         hp: s.hp,
         max_hp: s.max_hp,
@@ -234,10 +234,10 @@ fn ship_view(id: &str, s: &crate::sim::Ship) -> ShipView {
 fn mine_views(sim: &crate::sim::Sim, filter: Option<&Aabb>) -> Vec<crate::wire::MineView> {
     sim.mines
         .iter()
-        .filter(|m| filter.map(|f| f.contains_point(m.x, m.y)).unwrap_or(true))
+        .filter(|m| filter.map(|f| f.contains_point(m.pos.x, m.pos.y)).unwrap_or(true))
         .map(|m| crate::wire::MineView {
-            x: m.x.round() as i32,
-            y: m.y.round() as i32,
+            x: m.pos.x.round() as i32,
+            y: m.pos.y.round() as i32,
             hue: m.hue,
             r: m.trigger.round() as i32,
             armed: sim.tick >= m.arm_at,
@@ -249,10 +249,10 @@ fn mine_views(sim: &crate::sim::Sim, filter: Option<&Aabb>) -> Vec<crate::wire::
 fn pickup_views(sim: &crate::sim::Sim, filter: Option<&Aabb>) -> Vec<crate::wire::PickupView> {
     sim.pickups
         .iter()
-        .filter(|p| filter.map(|f| f.contains_point(p.x, p.y)).unwrap_or(true))
+        .filter(|p| filter.map(|f| f.contains_point(p.pos.x, p.pos.y)).unwrap_or(true))
         .map(|p| crate::wire::PickupView {
-            x: p.x.round() as i32,
-            y: p.y.round() as i32,
+            x: p.pos.x.round() as i32,
+            y: p.pos.y.round() as i32,
             hue: p.hue,
             kind: p.kind.code(),
         })
@@ -269,8 +269,8 @@ pub fn build_snapshot(sim: &Sim, sector: &str, host: &str, now_ms: u64) -> Snaps
         .bullets
         .iter()
         .map(|b| BulletView {
-            x: b.x.round() as i32,
-            y: b.y.round() as i32,
+            x: b.pos.x.round() as i32,
+            y: b.pos.y.round() as i32,
             vx: b.vx.round() as i32,
             vy: b.vy.round() as i32,
             hue: b.hue,
@@ -351,7 +351,7 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
     // Ships: index with the AABB tree, query the viewport.
     let ship_tree: AabbTree<String> = AabbTree::build(
         Aabb::new(0.0, 0.0, SECTOR_SIZE, SECTOR_SIZE),
-        sim.ships.iter().map(|(id, s)| (Aabb::around(s.x, s.y, crate::sim::SHIP_R), id.clone())),
+        sim.ships.iter().map(|(id, s)| (Aabb::around(s.pos.x, s.pos.y, crate::sim::SHIP_R), id.clone())),
     );
     let mut visible_ids = ship_tree.query(&pad);
     visible_ids.sort();
@@ -363,10 +363,10 @@ pub fn build_snapshot_view(sim: &Sim, sector: &str, host: &str, now_ms: u64, vie
     let bullets: Vec<BulletView> = sim
         .bullets
         .iter()
-        .filter(|b| pad.contains_point(b.x, b.y))
+        .filter(|b| pad.contains_point(b.pos.x, b.pos.y))
         .map(|b| BulletView {
-            x: b.x.round() as i32,
-            y: b.y.round() as i32,
+            x: b.pos.x.round() as i32,
+            y: b.pos.y.round() as i32,
             vx: b.vx.round() as i32,
             vy: b.vy.round() as i32,
             hue: b.hue,
@@ -613,10 +613,10 @@ mod tests {
         apply_client_msg(&mut sim, "near", ClientMsg::Join { name: "N".into(), cap: None });
         apply_client_msg(&mut sim, "far", ClientMsg::Join { name: "F".into(), cap: None });
         sim.factions.values_mut().for_each(|f| f.units.clear()); // count only the two player ships
-        sim.ships.get_mut("near").unwrap().x = 200.0;
-        sim.ships.get_mut("near").unwrap().y = 200.0;
-        sim.ships.get_mut("far").unwrap().x = 2800.0;
-        sim.ships.get_mut("far").unwrap().y = 2800.0;
+        sim.ships.get_mut("near").unwrap().pos.x = 200.0;
+        sim.ships.get_mut("near").unwrap().pos.y = 200.0;
+        sim.ships.get_mut("far").unwrap().pos.x = 2800.0;
+        sim.ships.get_mut("far").unwrap().pos.y = 2800.0;
         sim.tick(1.0);
 
         let viewport = Aabb::new(0.0, 0.0, 600.0, 600.0);

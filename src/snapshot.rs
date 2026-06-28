@@ -42,8 +42,8 @@ pub struct ShipSnap {
     pub id: String,
     pub name: String,
     pub hue: u32,
-    pub x: f32,
-    pub y: f32,
+    /// Absolute galaxy position (anchored 1:1 floating-origin) — the canonical persistent position.
+    pub pos: crate::coords::GalaxyPos,
     pub vx: f32,
     pub vy: f32,
     pub a: f32,
@@ -223,8 +223,8 @@ mod tests {
             .find_map(|(cx, cy)| rock_in_cell(cx, cy))
             .unwrap();
         if let Some(sh) = s.ships.get_mut("nodeA") {
-            sh.x = rock.x;
-            sh.y = rock.y;
+            sh.pos.x = rock.x;
+            sh.pos.y = rock.y;
             sh.minerals = 500;
         }
         apply_client_msg(&mut s, "nodeA", ClientMsg::Build { kind: "tech-missile".into() });
@@ -252,7 +252,7 @@ mod tests {
             assert_eq!(q.guns, p.guns);
             assert_eq!(q.weapon, p.weapon, "selected weapon survives failover");
             assert_eq!(q.weapons, p.weapons, "unlocked loadout survives failover");
-            assert!((q.x - p.x).abs() < 1e-3 && (q.y - p.y).abs() < 1e-3);
+            assert!((q.pos.x - p.pos.x).abs() < 1e-3 && (q.pos.y - p.pos.y).abs() < 1e-3);
         }
     }
 

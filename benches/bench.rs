@@ -58,8 +58,8 @@ fn main() {
         let id = format!("s{i}");
         s.join(&id, &id, i.wrapping_mul(7));
         if let Some(sh) = s.ships.get_mut(&id) {
-            sh.x = (i.wrapping_mul(37) % 8800 + 100) as f32;
-            sh.y = (i.wrapping_mul(53) % 8800 + 100) as f32;
+            sh.pos.x = (i.wrapping_mul(37) % 8800 + 100) as f32;
+            sh.pos.y = (i.wrapping_mul(53) % 8800 + 100) as f32;
         }
     }
     bench("sim::state_hash (500 ships)", 3000, || {
@@ -71,8 +71,8 @@ fn main() {
         let id = format!("t{i}");
         st.join(&id, &id, i);
         if let Some(sh) = st.ships.get_mut(&id) {
-            sh.x = (i.wrapping_mul(37) % 8800 + 100) as f32;
-            sh.y = (i.wrapping_mul(53) % 8800 + 100) as f32;
+            sh.pos.x = (i.wrapping_mul(37) % 8800 + 100) as f32;
+            sh.pos.y = (i.wrapping_mul(53) % 8800 + 100) as f32;
         }
     }
     bench("sim::tick (200 ships, full)", 500, || {

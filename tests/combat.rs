@@ -33,29 +33,29 @@ fn blaster_kills_and_scatters_debris() {
     no_npcs(&mut s);
     {
         let k = s.ships.get_mut("k").unwrap();
-        k.x = 1000.0;
-        k.y = 1000.0;
+        k.pos.x = 1000.0;
+        k.pos.y = 1000.0;
         k.a = 0.0;
         k.vx = 0.0;
         k.vy = 0.0;
     }
     {
         let v = s.ships.get_mut("v").unwrap();
-        v.x = 1000.0 + SHIP_R + 8.0;
-        v.y = 1000.0;
+        v.pos.x = 1000.0 + SHIP_R + 8.0;
+        v.pos.y = 1000.0;
         v.hp = 5;
     }
     let mut killed = false;
     for _ in 0..50 {
         {
             let k = s.ships.get_mut("k").unwrap();
-            k.x = 1000.0;
-            k.y = 1000.0;
+            k.pos.x = 1000.0;
+            k.pos.y = 1000.0;
             k.a = 0.0;
         }
         if let Some(v) = s.ships.get_mut("v") {
-            v.x = 1000.0 + SHIP_R + 8.0;
-            v.y = 1000.0;
+            v.pos.x = 1000.0 + SHIP_R + 8.0;
+            v.pos.y = 1000.0;
         }
         s.apply_intent("k", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);
         s.tick(1.0);
@@ -78,14 +78,14 @@ fn railgun_is_instant_hitscan_with_a_beam() {
     give_weapon(&mut s, "g", "railgun");
     {
         let g = s.ships.get_mut("g").unwrap();
-        g.x = 500.0;
-        g.y = 500.0;
+        g.pos.x = 500.0;
+        g.pos.y = 500.0;
         g.a = 0.0;
     }
     {
         let t = s.ships.get_mut("t").unwrap();
-        t.x = 900.0;
-        t.y = 500.0;
+        t.pos.x = 900.0;
+        t.pos.y = 500.0;
         t.hp = 5;
     }
     s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);
@@ -104,8 +104,8 @@ fn laser_chips_hp_over_time() {
     give_weapon(&mut s, "g", "laser");
     {
         let t = s.ships.get_mut("t").unwrap();
-        t.x = 650.0;
-        t.y = 500.0;
+        t.pos.x = 650.0;
+        t.pos.y = 500.0;
         t.hp = 300;
         t.max_hp = 300;
     }
@@ -113,13 +113,13 @@ fn laser_chips_hp_over_time() {
     for _ in 0..15 {
         {
             let g = s.ships.get_mut("g").unwrap();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0;
         }
         if let Some(t) = s.ships.get_mut("t") {
-            t.x = 650.0;
-            t.y = 500.0;
+            t.pos.x = 650.0;
+            t.pos.y = 500.0;
         }
         s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);
         s.tick(1.0);
@@ -137,16 +137,16 @@ fn homing_missile_flies_in_and_explodes_with_area_damage() {
     give_weapon(&mut s, "g", "missile");
     {
         let g = s.ships.get_mut("g").unwrap();
-        g.x = 500.0;
-        g.y = 500.0;
+        g.pos.x = 500.0;
+        g.pos.y = 500.0;
         g.a = 0.0;
         g.vx = 0.0;
         g.vy = 0.0;
     }
     for (id, x, y) in [("e1", 900.0, 500.0), ("e2", 930.0, 522.0)] {
         let e = s.ships.get_mut(id).unwrap();
-        e.x = x;
-        e.y = y;
+        e.pos.x = x;
+        e.pos.y = y;
         e.hp = 400;
         e.max_hp = 400;
     }
@@ -158,8 +158,8 @@ fn homing_missile_flies_in_and_explodes_with_area_damage() {
     for _ in 0..60 {
         for (id, x, y) in [("e1", 900.0, 500.0), ("e2", 930.0, 522.0)] {
             if let Some(e) = s.ships.get_mut(id) {
-                e.x = x;
-                e.y = y;
+                e.pos.x = x;
+                e.pos.y = y;
             }
         }
         s.tick(1.0);
@@ -209,15 +209,15 @@ fn destroying_a_faction_npc_strikes_its_roster() {
     for _ in 0..60 {
         {
             let k = s.ships.get_mut("k").unwrap();
-            k.x = 1000.0;
-            k.y = 1000.0;
+            k.pos.x = 1000.0;
+            k.pos.y = 1000.0;
             k.a = 0.0;
             k.vx = 0.0;
             k.vy = 0.0;
         }
         if let Some(n) = s.ships.get_mut(&fid) {
-            n.x = 1000.0 + SHIP_R + 8.0;
-            n.y = 1000.0;
+            n.pos.x = 1000.0 + SHIP_R + 8.0;
+            n.pos.y = 1000.0;
             n.vx = 0.0;
             n.vy = 0.0;
         }

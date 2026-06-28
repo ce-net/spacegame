@@ -514,7 +514,7 @@ mod tests {
         // The just-fired bullet originates at the player (not at some divergent host-side position).
         let nearest = mine
             .iter()
-            .map(|b| ((b.x - ship.x).powi(2) + (b.y - ship.y).powi(2)).sqrt())
+            .map(|b| ((b.pos.x - ship.pos.x).powi(2) + (b.pos.y - ship.pos.y).powi(2)).sqrt())
             .fold(f32::INFINITY, f32::min);
         assert!(nearest < 150.0, "a bullet spawned from the player's position (nearest {nearest})");
     }
@@ -532,8 +532,8 @@ mod tests {
         sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
         {
             let s = sim.ships.get_mut("me").unwrap();
-            s.x = SECTOR_SIZE - 2.0;
-            s.y = 1500.0;
+            s.pos.x = SECTOR_SIZE - 2.0;
+            s.pos.y = 1500.0;
             s.a = 0.0;
             s.vx = 6.0; // carried velocity pushes it across the east edge on the next tick
             s.minerals = 7;
@@ -549,8 +549,8 @@ mod tests {
         let s = r.sim().ships.get("me").expect("the ship was carried into the new sector, not lost");
         assert_eq!(s.minerals, 7, "its full state crossed the boundary");
         // The decisive assertions: entered at the WRAPPED edge coordinate, NOT teleported to the centre.
-        assert!(s.x < SHIP_R + 50.0, "entered at the west edge of the new sector (x={}), not mid-sector", s.x);
-        assert!((s.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT at the sector centre (the teleport bug)");
+        assert!(s.pos.x < SHIP_R + 50.0, "entered at the west edge of the new sector (x={}), not mid-sector", s.pos.x);
+        assert!((s.pos.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT at the sector centre (the teleport bug)");
     }
 
     #[test]
@@ -565,8 +565,8 @@ mod tests {
         sim.factions.values_mut().for_each(|f| f.units.clear()); // isolate the player's own bubble
         {
             let s = sim.ships.get_mut("me").unwrap();
-            s.x = SECTOR_SIZE * 0.5; // dead centre
-            s.y = SECTOR_SIZE * 0.5;
+            s.pos.x = SECTOR_SIZE * 0.5; // dead centre
+            s.pos.y = SECTOR_SIZE * 0.5;
         }
         let r = Replica::new(sim);
         let mid = r.interest_sectors("me", view);
@@ -579,8 +579,8 @@ mod tests {
         sim2.factions.values_mut().for_each(|f| f.units.clear());
         {
             let s = sim2.ships.get_mut("me").unwrap();
-            s.x = SECTOR_SIZE - 100.0; // 100 units from the east seam, inside a 1500 view
-            s.y = SECTOR_SIZE * 0.5;
+            s.pos.x = SECTOR_SIZE - 100.0; // 100 units from the east seam, inside a 1500 view
+            s.pos.y = SECTOR_SIZE * 0.5;
         }
         let edge = Replica::new(sim2).interest_sectors("me", view);
         assert!(edge.contains(&SectorId::new(0, 0)) && edge.contains(&SectorId::new(1, 0)));
@@ -607,8 +607,8 @@ mod tests {
         sim.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet to collide with at the edge
         {
             let s = sim.ships.get_mut("me").unwrap();
-            s.x = SECTOR_SIZE - 2.0;
-            s.y = 1500.0;
+            s.pos.x = SECTOR_SIZE - 2.0;
+            s.pos.y = 1500.0;
             s.a = 0.0;
             s.vx = 6.0; // carried velocity pushes it across the east edge
             s.minerals = 7;
@@ -622,8 +622,8 @@ mod tests {
         assert_eq!(host.home(), SectorId::new(1, 0), "the node now hosts the neighbour as home");
         let s = host.home_sim().ships.get("me").expect("ship carried into the neighbour, not lost");
         assert_eq!(s.minerals, 7, "full state crossed the boundary");
-        assert!(s.x < SHIP_R + 50.0, "entered at the west edge (x={}), not mid-sector", s.x);
-        assert!((s.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT teleported to the sector centre");
+        assert!(s.pos.x < SHIP_R + 50.0, "entered at the west edge (x={}), not mid-sector", s.pos.x);
+        assert!((s.pos.x - SECTOR_SIZE / 2.0).abs() > 100.0, "NOT teleported to the sector centre");
         assert!(host.sim(SectorId::new(0, 0)).is_some(), "the sector we left stays warm — no pop behind us");
     }
 

@@ -43,18 +43,18 @@ fn two_servers_at_different_origins_agree_on_the_same_ship() {
     b.join("n", "N", 0);
     {
         let s = a.ships.get_mut("n").unwrap();
-        s.x = 8990.0;
-        s.y = 1500.0;
+        s.pos.x = 8990.0;
+        s.pos.y = 1500.0;
     }
     let (bx, by) = reframe_local(8990.0, 1500.0, 1, 0);
     {
         let s = b.ships.get_mut("n").unwrap();
-        s.x = bx; // ≈ -10.0
-        s.y = by;
+        s.pos.x = bx; // ≈ -10.0
+        s.pos.y = by;
     }
 
     // Their *local* coordinates disagree wildly (8990 vs -10)...
-    assert_ne!(a.ships["n"].x, b.ships["n"].x, "the two hosts genuinely hold different local coordinates");
+    assert_ne!(a.ships["n"].pos.x, b.ships["n"].pos.x, "the two hosts genuinely hold different local coordinates");
     // ...but the canonical galaxy position is identical. This is the whole point of floating origin.
     assert_eq!(
         a.ship_galaxy_pos("n").unwrap().fixed8(),
@@ -74,8 +74,8 @@ fn transit_across_the_seam_is_globally_continuous() {
     a.factions.values_mut().for_each(|f| f.units.clear()); // no NPC fleet at the edge
     {
         let s = a.ships.get_mut("p").unwrap();
-        s.x = SECTOR_SIZE - 2.0;
-        s.y = 1500.0;
+        s.pos.x = SECTOR_SIZE - 2.0;
+        s.pos.y = 1500.0;
         s.a = 0.0;
         s.vx = 6.0;
     }
@@ -121,8 +121,8 @@ fn a_server_that_botches_the_re_anchor_is_caught() {
     a.factions.values_mut().for_each(|f| f.units.clear());
     {
         let s = a.ships.get_mut("p").unwrap();
-        s.x = SECTOR_SIZE - 2.0;
-        s.y = 1500.0;
+        s.pos.x = SECTOR_SIZE - 2.0;
+        s.pos.y = 1500.0;
         s.vx = 6.0;
     }
     let mut transit = None;
@@ -144,7 +144,7 @@ fn a_server_that_botches_the_re_anchor_is_caught() {
 
     let mut buggy = Sim::for_sector(SectorId::new(1, 0), rules());
     let mut bad = snap.clone();
-    bad.x += SECTOR_SIZE; // the mishandled re-anchor
+    bad.pos.x += SECTOR_SIZE; // the mishandled re-anchor
     buggy.accept_transit(bad);
 
     // The honest server's galaxy position matches A's; the buggy one is a whole span away.
@@ -178,8 +178,8 @@ fn state_hash_is_identical_across_hosts_with_different_origins() {
             s.join(id, id, 0);
             let (lx, ly) = reframe_local(gx, gy, sx, sy);
             let sh = s.ships.get_mut(id).unwrap();
-            sh.x = lx;
-            sh.y = ly;
+            sh.pos.x = lx;
+            sh.pos.y = ly;
             sh.vx = vx;
             sh.hp = hp;
             sh.minerals = min;
@@ -193,7 +193,7 @@ fn state_hash_is_identical_across_hosts_with_different_origins() {
 
     // Sanity: the servers really are anchored differently and hold different local coordinates.
     assert_ne!(a.galaxy_frame(), b.galaxy_frame());
-    assert_ne!(a.ships["a"].x, b.ships["a"].x);
+    assert_ne!(a.ships["a"].pos.x, b.ships["a"].pos.x);
     // Yet every entity is at the same galaxy position, so the canonical world hash is identical.
     assert_eq!(a.ship_galaxy_pos("a").unwrap().fixed8(), b.ship_galaxy_pos("a").unwrap().fixed8());
     assert_eq!(a.ship_galaxy_pos("b").unwrap().fixed8(), b.ship_galaxy_pos("b").unwrap().fixed8());
@@ -214,11 +214,11 @@ fn galaxy_scale_position_keeps_precision_through_the_sim() {
     s.join("n", "N", 0);
     {
         let sh = s.ships.get_mut("n").unwrap();
-        sh.x = 100.000;
-        sh.y = 4000.0;
+        sh.pos.x = 100.000;
+        sh.pos.y = 4000.0;
     }
     let p1 = s.ship_galaxy_pos("n").unwrap();
-    s.ships.get_mut("n").unwrap().x = 100.125; // nudge by exactly one 1/8-unit quantum
+    s.ships.get_mut("n").unwrap().pos.x = 100.125; // nudge by exactly one 1/8-unit quantum
     let p2 = s.ship_galaxy_pos("n").unwrap();
     assert_ne!(p1.fixed8(), p2.fixed8(), "1/8-unit precision is preserved even billions of cells out");
 

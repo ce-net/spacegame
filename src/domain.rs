@@ -454,7 +454,7 @@ impl DomainField {
             // A human's own ship has `owner == None` and is keyed by the pilot id; an NPC carries the
             // faction owner in `Ship::owner`. Either way the authority owner is a player NodeId.
             let owner = ship.owner.clone().unwrap_or_else(|| id.clone());
-            let (wx, wy) = world_pos(sim.sector, ship.x, ship.y);
+            let (wx, wy) = world_pos(sim.sector, ship.pos.x, ship.pos.y);
             let b = Bounds::around(wx, wy, SHIP_R as World);
             let acc = by.entry(owner.clone()).or_insert(Acc { bounds: None, anchor: None, n: 0 });
             acc.bounds = Some(match acc.bounds {

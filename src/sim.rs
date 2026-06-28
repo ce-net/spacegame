@@ -359,8 +359,7 @@ impl Ship {
         Ship {
             name: snap.name.clone(),
             hue: snap.hue,
-            x: snap.x,
-            y: snap.y,
+            pos: snap.pos,
             vx: snap.vx,
             vy: snap.vy,
             a: snap.a,
@@ -455,8 +454,7 @@ impl Ship {
             id: id.to_string(),
             name: self.name.clone(),
             hue: self.hue,
-            x: self.x,
-            y: self.y,
+            pos: self.pos,
             vx: self.vx,
             vy: self.vy,
             a: self.a,
@@ -537,8 +535,7 @@ pub struct Bullet {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Mine {
     pub owner: String,
-    pub x: f32,
-    pub y: f32,
+    pub pos: crate::coords::GalaxyPos,
     pub vx: f32,
     pub vy: f32,
     pub dmg: i32,
@@ -593,8 +590,7 @@ impl PickupKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Pickup {
     pub kind: PickupKind,
-    pub x: f32,
-    pub y: f32,
+    pub pos: crate::coords::GalaxyPos,
     /// Velocity — alloy nuggets fly off a shattered rock and then glide (magnetise) toward a nearby
     /// ship. `0` for static powerups. `#[serde(default)]` so older snapshots decode.
     #[serde(default)]
@@ -886,7 +882,7 @@ impl Sim {
 
     /// A ship's anchored galaxy position (`None` if no such ship).
     pub fn ship_galaxy_pos(&self, id: &str) -> Option<GalaxyPos> {
-        self.ships.get(id).map(|s| self.galaxy_pos(s.x, s.y))
+        self.ships.get(id).map(|s| self.galaxy_pos(s.pos.x, s.pos.y))
     }
 
     /// Accept a ship handed off from a neighbouring sector (the other end of [`take_transits`]).
@@ -1126,10 +1122,10 @@ impl Sim {
                 // ENVIRONMENTAL HAZARDS: gravity wells pull the ship inward; nebula clouds add drag.
                 // Read from the sector's deterministic field (a disjoint borrow from `ships`).
                 if !self.hazards.is_empty() {
-                    let g = self.hazards.accel_at(s.x, s.y);
+                    let g = self.hazards.accel_at(s.pos.x, s.pos.y);
                     s.vx += g.x * dt_scale;
                     s.vy += g.y * dt_scale;
-                    let drag = self.hazards.drag_at(s.x, s.y);
+                    let drag = self.hazards.drag_at(s.pos.x, s.pos.y);
                     if drag > 0.0 {
                         s.vx *= 1.0 - drag;
                         s.vy *= 1.0 - drag;
@@ -1151,48 +1147,48 @@ impl Sim {
                     s.vy *= k;
                 }
                 // Integrate position.
-                s.x += s.vx * dt_scale;
-                s.y += s.vy * dt_scale;
+                s.pos.x += s.vx * dt_scale;
+                s.pos.y += s.vy * dt_scale;
 
-                let out = s.x < 0.0 || s.y < 0.0 || s.x >= SECTOR_SIZE || s.y >= SECTOR_SIZE;
+                let out = s.pos.x < 0.0 || s.pos.y < 0.0 || s.pos.x >= SECTOR_SIZE || s.pos.y >= SECTOR_SIZE;
                 // Only player ships transit between sectors; NPC fleet ships belong to their faction's
                 // sector and bounce off the edge instead of wandering off the mesh.
                 if out && self.seamless && s.owner.is_none() {
                     // INFINITE MAP: hand the ship to the neighbour sector instead of bouncing.
                     let mut dsx = 0;
                     let mut dsy = 0;
-                    if s.x < 0.0 {
+                    if s.pos.x < 0.0 {
                         dsx = -1;
-                        s.x += SECTOR_SIZE;
-                    } else if s.x >= SECTOR_SIZE {
+                        s.pos.x += SECTOR_SIZE;
+                    } else if s.pos.x >= SECTOR_SIZE {
                         dsx = 1;
-                        s.x -= SECTOR_SIZE;
+                        s.pos.x -= SECTOR_SIZE;
                     }
-                    if s.y < 0.0 {
+                    if s.pos.y < 0.0 {
                         dsy = -1;
-                        s.y += SECTOR_SIZE;
-                    } else if s.y >= SECTOR_SIZE {
+                        s.pos.y += SECTOR_SIZE;
+                    } else if s.pos.y >= SECTOR_SIZE {
                         dsy = 1;
-                        s.y -= SECTOR_SIZE;
+                        s.pos.y -= SECTOR_SIZE;
                     }
                     let to = SectorId::new(self.sector.sx + dsx, self.sector.sy + dsy);
                     transit = Some(Transit { to, ship: s.snap(id) });
                 } else if out {
                     // Closed-arena fallback: bounce off the walls.
-                    if s.x < SHIP_R {
-                        s.x = SHIP_R;
+                    if s.pos.x < SHIP_R {
+                        s.pos.x = SHIP_R;
                         s.vx = -s.vx * 0.4;
                     }
-                    if s.x > SECTOR_SIZE - SHIP_R {
-                        s.x = SECTOR_SIZE - SHIP_R;
+                    if s.pos.x > SECTOR_SIZE - SHIP_R {
+                        s.pos.x = SECTOR_SIZE - SHIP_R;
                         s.vx = -s.vx * 0.4;
                     }
-                    if s.y < SHIP_R {
-                        s.y = SHIP_R;
+                    if s.pos.y < SHIP_R {
+                        s.pos.y = SHIP_R;
                         s.vy = -s.vy * 0.4;
                     }
-                    if s.y > SECTOR_SIZE - SHIP_R {
-                        s.y = SECTOR_SIZE - SHIP_R;
+                    if s.pos.y > SECTOR_SIZE - SHIP_R {
+                        s.pos.y = SECTOR_SIZE - SHIP_R;
                         s.vy = -s.vy * 0.4;
                     }
                 }
@@ -1201,7 +1197,7 @@ impl Sim {
                 // tick chips the rock's hull; when it breaks it shatters into alloy nuggets you then
                 // scoop up. Collect the cells in reach here; apply the damage after the `s` borrow ends.
                 if transit.is_none() {
-                    let (sx, sy) = (s.x, s.y);
+                    let (sx, sy) = (s.pos.x, s.pos.y);
                     let reach = SHIP_R + 22.0;
                     let min_cx = ((sx - reach) / ROCK_CELL).floor() as i32;
                     let max_cx = ((sx + reach) / ROCK_CELL).floor() as i32;
@@ -1256,7 +1252,7 @@ impl Sim {
                         burns.push((id.clone(), dmg, b.source.clone()));
                     }
                 }
-                if lethal && self.hazards.lethal_at(s.x, s.y) {
+                if lethal && self.hazards.lethal_at(s.pos.x, s.pos.y) {
                     swallowed.push(id.clone());
                 }
             }
@@ -1325,7 +1321,7 @@ impl Sim {
         // --- Pass 6: LOD rigid-body wreckage. Precision follows the players: debris near a ship is
         // simulated at high precision/iteration; far debris is coarse or merely registered. ---
         if !self.debris.bodies.is_empty() {
-            let focus: Vec<Vec2> = self.ships.values().map(|s| Vec2::new(s.x, s.y)).collect();
+            let focus: Vec<Vec2> = self.ships.values().map(|s| Vec2::new(s.pos.x, s.pos.y)).collect();
             physics::assign_lod(&mut self.debris.bodies, &focus, 700.0, 1500.0, 3000.0);
             self.debris.step(1.0 / 20.0, Vec2::zero());
             // Retire wreckage that drifted out of the sector or has lived long enough.
@@ -1359,7 +1355,7 @@ impl Sim {
             .ships
             .iter()
             .filter(|(_, s)| s.alive)
-            .map(|(id, s)| (Aabb::around(s.x, s.y, SHIP_R), id.clone()));
+            .map(|(id, s)| (Aabb::around(s.pos.x, s.pos.y, SHIP_R), id.clone()));
         AabbTree::build(bounds, items)
     }
 
@@ -1390,7 +1386,7 @@ impl Sim {
         for id in npc_ids {
             let (role, owner, x, y) = {
                 let Some(s) = self.ships.get(&id) else { continue };
-                (s.role, s.owner.clone().unwrap_or_default(), s.x, s.y)
+                (s.role, s.owner.clone().unwrap_or_default(), s.pos.x, s.pos.y)
             };
             // Marauders own no faction; they always hunt. Player fleet ships obey their faction's order.
             let cmd = if owner.as_str() == HOSTILE_OWNER {
@@ -1407,7 +1403,7 @@ impl Sim {
                 && let Some(ow) = self.ships.get(&owner)
                 && owner != id
             {
-                let (ox, oy) = (ow.x, ow.y);
+                let (ox, oy) = (ow.pos.x, ow.pos.y);
                 let od = ((x - ox).powi(2) + (y - oy).powi(2)).sqrt();
                 if od < 200.0 {
                     let ang = (y - oy).atan2(x - ox);
@@ -1476,11 +1472,11 @@ impl Sim {
             self.nearest_enemy_of(owner, x, y, engage_r * ENGAGE_KEEP, tree).and_then(|eid| {
                 self.ships.get(&eid).map(|e| Contact {
                     id: eid.clone(),
-                    x: e.x,
-                    y: e.y,
+                    x: e.pos.x,
+                    y: e.pos.y,
                     vx: e.vx,
                     vy: e.vy,
-                    dist: ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt(),
+                    dist: ((e.pos.x - x).powi(2) + (e.pos.y - y).powi(2)).sqrt(),
                 })
             })
         } else {
@@ -1496,7 +1492,7 @@ impl Sim {
             Objective::Engage { target, .. } => self
                 .ships
                 .get(target)
-                .map(|t| t.alive && ((t.x - x).powi(2) + (t.y - y).powi(2)).sqrt() <= (engage_r * ENGAGE_KEEP).max(1.0))
+                .map(|t| t.alive && ((t.pos.x - x).powi(2) + (t.pos.y - y).powi(2)).sqrt() <= (engage_r * ENGAGE_KEEP).max(1.0))
                 .unwrap_or(false),
             _ => false,
         };
@@ -1522,7 +1518,7 @@ impl Sim {
     ) -> (f32, f32, bool) {
         use crate::ai::{self, Objective};
         let anchor =
-            self.ships.get(owner).map(|s| (s.x, s.y)).unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+            self.ships.get(owner).map(|s| (s.pos.x, s.pos.y)).unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
         match obj {
             Objective::Idle => (x, y, false),
             Objective::Move { x: mx, y: my } => (*mx, *my, false),
@@ -1551,8 +1547,8 @@ impl Sim {
             Objective::Engage { target, .. } => match self.ships.get(target) {
                 Some(e) => {
                     let proj = self.npc_proj_speed(id);
-                    let (lx, ly) = ai::lead_target(x, y, e.x, e.y, e.vx, e.vy, proj);
-                    let d = ((e.x - x).powi(2) + (e.y - y).powi(2)).sqrt();
+                    let (lx, ly) = ai::lead_target(x, y, e.pos.x, e.pos.y, e.vx, e.vy, proj);
+                    let d = ((e.pos.x - x).powi(2) + (e.pos.y - y).powi(2)).sqrt();
                     (lx, ly, d <= 760.0)
                 }
                 None => {
@@ -1611,7 +1607,7 @@ impl Sim {
             if s.faction_id(&cid) == owner {
                 continue; // same faction (the owner or its own fleet)
             }
-            let d2 = (s.x - x).powi(2) + (s.y - y).powi(2);
+            let d2 = (s.pos.x - x).powi(2) + (s.pos.y - y).powi(2);
             if d2 <= radius * radius && best.as_ref().map(|(b, _)| d2 < *b).unwrap_or(true) {
                 best = Some((d2, cid));
             }
@@ -1676,7 +1672,7 @@ impl Sim {
             let (ax, ay) = self
                 .ships
                 .get(&owner)
-                .map(|s| (s.x, s.y))
+                .map(|s| (s.pos.x, s.pos.y))
                 .unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
             let hue = self.ships.get(&owner).map(|s| s.hue).unwrap_or_else(|| fnv1a(&owner) % 360);
 
@@ -1703,7 +1699,7 @@ impl Sim {
             }
         }
         for (id, owner, role, x, y, hp, hue) in spawns {
-            let mut s = Ship::npc(role, owner, x, y, hp, hue, now);
+            let mut s = Ship::npc(role, owner, self.galaxy_pos(x, y), hp, hue, now);
             s.outfit(tun);
             self.ships.insert(id, s);
         }
@@ -1727,7 +1723,7 @@ impl Sim {
             .ships
             .values()
             .filter(|s| s.alive && s.owner.is_none())
-            .map(|s| (s.name.clone(), s.x, s.y))
+            .map(|s| (s.name.clone(), s.pos.x, s.pos.y))
             .collect();
         if players.is_empty() {
             return;
@@ -1757,7 +1753,7 @@ impl Sim {
             let sy = (py + ang.sin() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
             let id = format!("npc:{HOSTILE_OWNER}:{now}:{k}");
             // Hue 0 = an aggressive red, so marauders read instantly as a threat.
-            let mut s = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), sx, sy, tun.enemy_hp, 0, now);
+            let mut s = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), self.galaxy_pos(sx, sy), tun.enemy_hp.try_into().unwrap(), 0, now);
             s.outfit(tun);
             self.ships.insert(id, s);
         }
@@ -1769,7 +1765,7 @@ impl Sim {
         let rules = self.rules.clone();
         let (wx, wy, wa, wvx, wvy, hue0, guns, weapon, energy, oc) = {
             let Some(s) = self.ships.get(id) else { return };
-            (s.x, s.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone(), s.energy, s.effects.overcharge_mult())
+            (s.pos.x, s.pos.y, s.a, s.vx, s.vy, s.hue, s.guns, s.weapon.clone(), s.energy, s.effects.overcharge_mult())
         };
         let def = rules.weapon(&weapon).cloned().unwrap_or_else(crate::ruleset::WeaponDef::fallback);
 
@@ -1820,8 +1816,7 @@ impl Sim {
                     let a = wa + off;
                     self.bullets.push(Bullet {
                         owner: id.to_string(),
-                        x: wx + a.cos() * (SHIP_R + 4.0),
-                        y: wy + a.sin() * (SHIP_R + 4.0),
+                        pos: self.galaxy_pos(wx + a.cos() * (SHIP_R + 4.0), wy + a.sin() * (SHIP_R + 4.0)),
                         vx: a.cos() * def.speed + wvx,
                         vy: a.sin() * def.speed + wvy,
                         dmg,
@@ -1878,8 +1873,7 @@ impl Sim {
                     let a = back + off;
                     self.mines.push(Mine {
                         owner: id.to_string(),
-                        x: wx + a.cos() * (SHIP_R + 6.0),
-                        y: wy + a.sin() * (SHIP_R + 6.0),
+                        pos: self.galaxy_pos(wx + a.cos() * (SHIP_R + 6.0), wy + a.sin() * (SHIP_R + 6.0)),
                         vx: a.cos() * def.speed,
                         vy: a.sin() * def.speed,
                         dmg: ((def.damage as f32) * dmg_mult).round() as i32,
@@ -1938,7 +1932,7 @@ impl Sim {
                 break;
             }
             let (tx, ty) = match self.ships.get(&target) {
-                Some(s) if s.alive => (s.x, s.y),
+                Some(s) if s.alive => (s.pos.x, s.pos.y),
                 _ => break,
             };
             self.beams.push(BeamEvent { owner: owner.to_string(), x0: from.0, y0: from.1, x1: tx, y1: ty, hue, kind: 2 });
@@ -1975,7 +1969,7 @@ impl Sim {
             if !s.alive || s.faction_id(&cid) == faction {
                 continue;
             }
-            let d2 = (s.x - x).powi(2) + (s.y - y).powi(2);
+            let d2 = (s.pos.x - x).powi(2) + (s.pos.y - y).powi(2);
             if d2 <= radius * radius && best.as_ref().map(|(b, _)| d2 < *b).unwrap_or(true) {
                 best = Some((d2, cid));
             }
@@ -2013,13 +2007,13 @@ impl Sim {
                 continue;
             }
             // Project the ship centre onto the ray; reject if behind the muzzle or beyond range.
-            let t = (s.x - ox) * dx + (s.y - oy) * dy;
+            let t = (s.pos.x - ox) * dx + (s.pos.y - oy) * dy;
             if t < 0.0 || t > range {
                 continue;
             }
             let px = ox + dx * t;
             let py = oy + dy * t;
-            let perp2 = (s.x - px) * (s.x - px) + (s.y - py) * (s.y - py);
+            let perp2 = (s.pos.x - px) * (s.pos.x - px) + (s.pos.y - py) * (s.pos.y - py);
             let r = SHIP_R + 4.0;
             if perp2 <= r * r && best.as_ref().map(|(bt, _)| t < *bt).unwrap_or(true) {
                 best = Some((t, cid));
@@ -2045,12 +2039,12 @@ impl Sim {
             }
             // Homing: steer the velocity toward the nearest alive enemy within the acquire radius.
             if b.homing > 0.0
-                && let Some(target) = self.nearest_enemy(&b.owner, b.x, b.y, HOMING_ACQUIRE_R, tree)
+                && let Some(target) = self.nearest_enemy(&b.owner, b.pos.x, b.pos.y, HOMING_ACQUIRE_R, tree)
                 && let Some(t) = self.ships.get(&target)
             {
                 let speed = (b.vx * b.vx + b.vy * b.vy).sqrt().max(0.001);
                 let cur = b.vy.atan2(b.vx);
-                let want = (t.y - b.y).atan2(t.x - b.x);
+                let want = (t.pos.y - b.pos.y).atan2(t.pos.x - b.pos.x);
                 let mut d = (want - cur + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                     - std::f32::consts::PI;
                 d = d.clamp(-b.homing, b.homing);
@@ -2061,20 +2055,20 @@ impl Sim {
             // ENVIRONMENTAL HAZARDS: gravity wells curve projectiles too — missiles fall inward, shots
             // arc past a planet. (Nebula drag is ship-only; light rounds aren't slowed by gas.)
             if !self.hazards.is_empty() {
-                let g = self.hazards.accel_at(b.x, b.y);
+                let g = self.hazards.accel_at(b.pos.x, b.pos.y);
                 b.vx += g.x * dt_scale;
                 b.vy += g.y * dt_scale;
             }
-            b.x += b.vx * dt_scale;
-            b.y += b.vy * dt_scale;
-            if b.x < 0.0 || b.y < 0.0 || b.x > SECTOR_SIZE || b.y > SECTOR_SIZE {
+            b.pos.x += b.vx * dt_scale;
+            b.pos.y += b.vy * dt_scale;
+            if b.pos.x < 0.0 || b.pos.y < 0.0 || b.pos.x > SECTOR_SIZE || b.pos.y > SECTOR_SIZE {
                 if missile {
                     self.detonate(&b, now, tree);
                 }
                 continue;
             }
             // Broad-phase: only ships near the bullet are candidates.
-            let mut candidates = tree.query(&Aabb::around(b.x, b.y, SHIP_R + 4.0));
+            let mut candidates = tree.query(&Aabb::around(b.pos.x, b.pos.y, SHIP_R + 4.0));
             candidates.sort();
             let mut hit_target: Option<String> = None;
             for cid in candidates {
@@ -2085,8 +2079,8 @@ impl Sim {
                 if !s.alive {
                     continue;
                 }
-                let dx = s.x - b.x;
-                let dy = s.y - b.y;
+                let dx = s.pos.x - b.pos.x;
+                let dy = s.pos.y - b.pos.y;
                 if dx * dx + dy * dy <= (SHIP_R + 4.0) * (SHIP_R + 4.0) {
                     hit_target = Some(cid);
                     break;
@@ -2109,7 +2103,7 @@ impl Sim {
             // they sail over rocks to reach a ship (their proximity blast is the AoE weapon), so only
             // non-exploding rounds mine.
             if !missile
-                && let Some((cx, cy)) = self.rock_hit(b.x, b.y)
+                && let Some((cx, cy)) = self.rock_hit(b.pos.x, b.pos.y)
             {
                 if let Some(r) = self.rock(cx, cy) {
                     self.damage_rock(cx, cy, r.hp, r.val, (b.dmg.max(1)) as u32, now);
@@ -2150,24 +2144,24 @@ impl Sim {
     /// scatter wreckage. The blast is found with the AABB broad-phase, so it is cheap even in a crowd.
     fn detonate(&mut self, b: &Bullet, now: u64, tree: &AabbTree<String>) {
         let radius = b.explode_radius;
-        self.explosions.push(Explosion { x: b.x, y: b.y, r: radius, hue: b.hue });
+        self.explosions.push(Explosion { x: b.pos.x, y: b.pos.y, r: radius, hue: b.hue });
         // The firer's faction (to avoid blowing up your own fleet).
         let own_faction = self
             .ships
             .get(&b.owner)
             .map(|s| s.faction_id(&b.owner).to_string())
             .unwrap_or_else(|| b.owner.clone());
-        let mut victims = tree.query(&Aabb::around(b.x, b.y, radius));
+        let mut victims = tree.query(&Aabb::around(b.pos.x, b.pos.y, radius));
         victims.sort();
         for cid in victims {
             let (alive, fac, sx, sy) = {
                 let Some(s) = self.ships.get(&cid) else { continue };
-                (s.alive, s.faction_id(&cid).to_string(), s.x, s.y)
+                (s.alive, s.faction_id(&cid).to_string(), s.pos.x, s.pos.y)
             };
             if !alive || fac == own_faction {
                 continue;
             }
-            let d = ((sx - b.x).powi(2) + (sy - b.y).powi(2)).sqrt();
+            let d = ((sx - b.pos.x).powi(2) + (sy - b.pos.y).powi(2)).sqrt();
             if d > radius {
                 continue;
             }
@@ -2190,8 +2184,7 @@ impl Sim {
                 let spd = 8.0;
                 self.bullets.push(Bullet {
                     owner: b.owner.clone(),
-                    x: b.x + a.cos() * 6.0,
-                    y: b.y + a.sin() * 6.0,
+                    pos: b.pos.translate(a.cos() * 6.0, a.sin() * 6.0),
                     vx: a.cos() * spd,
                     vy: a.sin() * spd,
                     dmg: child_dmg,
@@ -2205,11 +2198,11 @@ impl Sim {
             }
         }
         // A little debris kicked out by the blast (deterministic from position + tick).
-        let seed = fnv1a(&b.owner) ^ (b.x as u32).wrapping_mul(2654435761) ^ now as u32;
+        let seed = fnv1a(&b.owner) ^ (b.pos.x as u32).wrapping_mul(2654435761) ^ now as u32;
         for k in 0..3u32 {
             let a = ((seed.wrapping_add(k.wrapping_mul(40503)) % 360) as f32).to_radians();
             let spd = 20.0 + ((seed >> (k % 8)) % 40) as f32;
-            let mut body = RigidBody::dynamic(Vec2::new(b.x, b.y), 0.6, Shape::Circle { r: 3.0 });
+            let mut body = RigidBody::dynamic(Vec2::new(b.pos.x, b.pos.y), 0.6, Shape::Circle { r: 3.0 });
             body.vel = Vec2::new(a.cos() * spd, a.sin() * spd);
             body.ang_vel = a.sin() * 2.0;
             body.restitution = 0.5;
@@ -2223,8 +2216,7 @@ impl Sim {
     fn mine_blast(m: &Mine) -> Bullet {
         Bullet {
             owner: m.owner.clone(),
-            x: m.x,
-            y: m.y,
+            pos: m.pos,
             vx: 0.0,
             vy: 0.0,
             dmg: m.dmg,
@@ -2253,11 +2245,11 @@ impl Sim {
                 continue;
             }
             // Drift to rest where it was dropped.
-            m.x += m.vx;
-            m.y += m.vy;
+            m.pos.x += m.vx;
+            m.pos.y += m.vy;
             m.vx *= 0.92;
             m.vy *= 0.92;
-            if m.x < 0.0 || m.y < 0.0 || m.x > SECTOR_SIZE || m.y > SECTOR_SIZE {
+            if m.pos.x < 0.0 || m.pos.y < 0.0 || m.pos.x > SECTOR_SIZE || m.pos.y > SECTOR_SIZE {
                 continue; // drifted out of the sector — gone
             }
             let mut triggered = false;
@@ -2267,15 +2259,15 @@ impl Sim {
                     .get(&m.owner)
                     .map(|s| s.faction_id(&m.owner).to_string())
                     .unwrap_or_else(|| m.owner.clone());
-                let mut cands = tree.query(&Aabb::around(m.x, m.y, m.trigger));
+                let mut cands = tree.query(&Aabb::around(m.pos.x, m.pos.y, m.trigger));
                 cands.sort();
                 for cid in cands {
                     let Some(s) = self.ships.get(&cid) else { continue };
                     if !s.alive || s.faction_id(&cid) == own_fac {
                         continue;
                     }
-                    let dx = s.x - m.x;
-                    let dy = s.y - m.y;
+                    let dx = s.pos.x - m.pos.x;
+                    let dy = s.pos.y - m.pos.y;
                     if dx * dx + dy * dy <= m.trigger * m.trigger {
                         triggered = true;
                         break;
@@ -2310,7 +2302,7 @@ impl Sim {
             .ships
             .iter()
             .filter(|(_, s)| s.alive)
-            .map(|(id, s)| (id.clone(), s.x, s.y, s.owner.is_none()))
+            .map(|(id, s)| (id.clone(), s.pos.x, s.pos.y, s.owner.is_none()))
             .collect();
         ships.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -2329,7 +2321,7 @@ impl Sim {
                 if !alloy && !*is_player {
                     continue; // only players collect powerups
                 }
-                let d2 = (sx - p.x).powi(2) + (sy - p.y).powi(2);
+                let d2 = (sx - p.pos.x).powi(2) + (sy - p.pos.y).powi(2);
                 if best.map(|(b, _)| d2 < b).unwrap_or(true) {
                     best = Some((d2, i));
                 }
@@ -2347,8 +2339,8 @@ impl Sim {
                     let d = d2.sqrt().max(1.0);
                     let close = 1.0 - (d / tun.magnet_radius).min(1.0);
                     let pull = tun.magnet_accel * (1.0 + close * 2.0);
-                    p.vx += (sx - p.x) / d * pull;
-                    p.vy += (sy - p.y) / d * pull;
+                    p.vx += (sx - p.pos.x) / d * pull;
+                    p.vy += (sy - p.pos.y) / d * pull;
                 }
             }
             // Integrate gliding pickups (and bleed off speed so a missed nugget settles, not orbits).
@@ -2359,8 +2351,8 @@ impl Sim {
                     p.vx *= k;
                     p.vy *= k;
                 }
-                p.x = (p.x + p.vx).clamp(0.0, SECTOR_SIZE);
-                p.y = (p.y + p.vy).clamp(0.0, SECTOR_SIZE);
+                p.pos.x = (p.pos.x + p.vx).clamp(0.0, SECTOR_SIZE);
+                p.pos.y = (p.pos.y + p.vy).clamp(0.0, SECTOR_SIZE);
                 p.vx *= 0.92;
                 p.vy *= 0.92;
             }
@@ -2433,7 +2425,7 @@ impl Sim {
             if !s.alive {
                 continue;
             }
-            let d2 = (s.x - x) * (s.x - x) + (s.y - y) * (s.y - y);
+            let d2 = (s.pos.x - x) * (s.pos.x - x) + (s.pos.y - y) * (s.pos.y - y);
             if d2 <= radius * radius && best.as_ref().map(|(bd, _)| d2 < *bd).unwrap_or(true) {
                 best = Some((d2, cid));
             }
@@ -2505,7 +2497,7 @@ impl Sim {
             v.hp = 0;
             v.dead_at = now;
             v.minerals = 0;
-            let p = (v.x, v.y);
+            let p = (v.pos.x, v.pos.y);
             v.vx = 0.0;
             v.vy = 0.0;
             p
@@ -2552,7 +2544,7 @@ impl Sim {
             if value > 0.0 && self.pickups.len() < 256 {
                 let x = vx.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
                 let y = vy.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
-                self.pickups.push(Pickup { kind: PickupKind::Minerals, x, y, vx: 0.0, vy: 0.0, value, hue: 40, die_at: now + 1800 });
+                self.pickups.push(Pickup { kind: PickupKind::Minerals, pos: self.galaxy_pos(x, y), vx: 0.0, vy: 0.0, value, hue: 40, die_at: now + 1800 });
             }
         }
 
@@ -2585,7 +2577,7 @@ impl Sim {
         let y = y.clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
         // Cap the field so a brawl can't flood the snapshot with loot.
         if self.pickups.len() < 256 {
-            self.pickups.push(Pickup { kind, x, y, vx: 0.0, vy: 0.0, value, hue, die_at: now + 1800 });
+            self.pickups.push(Pickup { kind, pos: self.galaxy_pos(x, y), vx: 0.0, vy: 0.0, value, hue, die_at: now + 1800 });
         }
     }
 
@@ -2600,7 +2592,7 @@ impl Sim {
         for a in &ids {
             let (ax, ay, ma) = {
                 let s = &self.ships[a];
-                (s.x, s.y, s.mass.max(0.05))
+                (s.pos.x, s.pos.y, s.mass.max(0.05))
             };
             let mut neigh = tree.query(&Aabb::around(ax, ay, min_d));
             neigh.sort();
@@ -2613,8 +2605,8 @@ impl Sim {
                     continue;
                 }
                 let mb = sb.mass.max(0.05);
-                let dx = sb.x - ax;
-                let dy = sb.y - ay;
+                let dx = sb.pos.x - ax;
+                let dy = sb.pos.y - ay;
                 let d2 = dx * dx + dy * dy;
                 if d2 >= min_d * min_d {
                     continue;
@@ -2650,8 +2642,8 @@ impl Sim {
         }
         for (id, (px, py)) in pushes {
             if let Some(s) = self.ships.get_mut(&id) {
-                s.x = (s.x + px).clamp(0.0, SECTOR_SIZE);
-                s.y = (s.y + py).clamp(0.0, SECTOR_SIZE);
+                s.pos.x = (s.pos.x + px).clamp(0.0, SECTOR_SIZE);
+                s.pos.y = (s.pos.y + py).clamp(0.0, SECTOR_SIZE);
                 // A gentle velocity nudge so the separation reads as a bump, not a teleport.
                 s.vx += px * 0.3;
                 s.vy += py * 0.3;
@@ -2699,7 +2691,7 @@ impl Sim {
         for id in ids {
             let s = &self.ships[id];
             mix(&mut h, fnv1a(id) as u64);
-            mixpos(&mut h, frame, s.x, s.y);
+            mixpos(&mut h, frame, s.pos.x, s.pos.y);
             mix(&mut h, q(s.vx));
             mix(&mut h, q(s.vy));
             mix(&mut h, q(s.a));
@@ -2728,7 +2720,7 @@ impl Sim {
         for b in &self.bullets {
             let mut bh: u64 = 0x9e3779b97f4a7c15;
             mix(&mut bh, fnv1a(&b.owner) as u64);
-            mixpos(&mut bh, frame, b.x, b.y);
+            mixpos(&mut bh, frame, b.pos.x, b.pos.y);
             mix(&mut bh, b.dmg as i64 as u64);
             mix(&mut bh, b.die_at);
             bsum ^= bh;
@@ -2740,7 +2732,7 @@ impl Sim {
         for m in &self.mines {
             let mut mh: u64 = 0x517cc1b727220a95;
             mix(&mut mh, fnv1a(&m.owner) as u64);
-            mixpos(&mut mh, frame, m.x, m.y);
+            mixpos(&mut mh, frame, m.pos.x, m.pos.y);
             mix(&mut mh, m.dmg as i64 as u64);
             mix(&mut mh, m.arm_at);
             mix(&mut mh, m.die_at);
@@ -2753,7 +2745,7 @@ impl Sim {
         for p in &self.pickups {
             let mut ph: u64 = 0xff51afd7ed558ccd;
             mix(&mut ph, p.kind.code() as u64);
-            mixpos(&mut ph, frame, p.x, p.y);
+            mixpos(&mut ph, frame, p.pos.x, p.pos.y);
             mix(&mut ph, q(p.value));
             mix(&mut ph, p.die_at);
             psum ^= ph;
@@ -2838,8 +2830,7 @@ impl Sim {
             left = left.saturating_sub(value);
             self.pickups.push(Pickup {
                 kind: PickupKind::Alloy,
-                x: r.x,
-                y: r.y,
+                pos: self.galaxy_pos(r.x, r.y),
                 vx: ang.cos() * spd,
                 vy: ang.sin() * spd,
                 value: value as f32,
@@ -2941,8 +2932,8 @@ mod tests {
             .unwrap();
         {
             let sh = s.ships.get_mut("m").unwrap();
-            sh.x = rock.x;
-            sh.y = rock.y;
+            sh.pos.x = rock.x;
+            sh.pos.y = rock.y;
             sh.minerals = 0;
         }
         // One tick only chips the rock — mining is NOT instant, so nothing is banked yet.
@@ -2952,8 +2943,8 @@ mod tests {
         let mut banked = false;
         for _ in 0..80 {
             if let Some(sh) = s.ships.get_mut("m") {
-                sh.x = rock.x;
-                sh.y = rock.y;
+                sh.pos.x = rock.x;
+                sh.pos.y = rock.y;
                 sh.last_input_tick = s.tick;
             }
             s.tick(1.0);
@@ -2973,26 +2964,25 @@ mod tests {
         s.join("p", "P", 0);
         {
             let sh = s.ships.get_mut("p").unwrap();
-            sh.x = 1000.0;
-            sh.y = 1000.0;
+            sh.pos.x = 1000.0;
+            sh.pos.y = 1000.0;
         }
         // A motionless nugget just inside the magnet radius, offset in +x.
         let r = s.rules.tunables.magnet_radius;
         s.pickups.push(Pickup {
             kind: PickupKind::Alloy,
-            x: 1000.0 + r * 0.6,
-            y: 1000.0,
+            pos: s.galaxy_pos(1000.0 + r * 0.6, 1000.0),
             vx: 0.0,
             vy: 0.0,
             value: 5.0,
             hue: 190,
             die_at: 100_000,
         });
-        let start_dx = s.pickups[0].x - 1000.0;
+        let start_dx = s.pickups[0].pos.x - 1000.0;
         s.tick(1.0);
         // It is either already collected (it glided in) or it has gained velocity toward the ship.
         if let Some(p) = s.pickups.first() {
-            assert!(p.x - 1000.0 < start_dx, "the nugget moved toward the ship");
+            assert!(p.pos.x - 1000.0 < start_dx, "the nugget moved toward the ship");
             assert!(p.vx < 0.0, "and it is being pulled in (−x toward the ship)");
         } else {
             assert!(s.factions["p"].resources.alloys > 0, "or it was scooped up and banked");
@@ -3008,10 +2998,10 @@ mod tests {
         s.join("p", "P", 0);
         {
             let sh = s.ships.get_mut("p").unwrap();
-            sh.x = 1000.0;
-            sh.y = 1000.0;
+            sh.pos.x = 1000.0;
+            sh.pos.y = 1000.0;
         }
-        let mut m = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), 1300.0, 1000.0, 70, 0, 0);
+        let mut m = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), crate::coords::GalaxyPos::new(crate::coords::Anchor::ORIGIN, 1300.0, 1000.0), 70, 0, 0);
         m.outfit(&s.rules.tunables);
         s.ships.insert("npc:marauders:test:0".into(), m);
         s.tick(1.0);
@@ -3062,8 +3052,8 @@ mod tests {
             s.apply_intent("n", Intent { thrust: true, aim: Some(0.7), ..Default::default() }, 0);
             s.tick(1.0);
             let p = &s.ships["n"];
-            assert!(p.x >= 0.0 && p.x <= SECTOR_SIZE);
-            assert!(p.y >= 0.0 && p.y <= SECTOR_SIZE);
+            assert!(p.pos.x >= 0.0 && p.pos.x <= SECTOR_SIZE);
+            assert!(p.pos.y >= 0.0 && p.pos.y <= SECTOR_SIZE);
         }
     }
 
@@ -3076,8 +3066,8 @@ mod tests {
         solo(&mut s);
         {
             let p = s.ships.get_mut("n").unwrap();
-            p.x = SECTOR_SIZE - 2.0;
-            p.y = 1500.0;
+            p.pos.x = SECTOR_SIZE - 2.0;
+            p.pos.y = 1500.0;
             p.a = 0.0;
             p.vx = 6.0;
             p.vy = 0.0;
@@ -3094,15 +3084,15 @@ mod tests {
         assert_eq!(transits.len(), 1);
         let t = &transits[0];
         assert_eq!(t.to, SectorId::new(1, 0), "transited east into (1,0)");
-        assert!(t.ship.x >= 0.0 && t.ship.x < SECTOR_SIZE, "entry x is in neighbour-local space");
+        assert!(t.ship.pos.x >= 0.0 && t.ship.pos.x < SECTOR_SIZE, "entry x is in neighbour-local space");
     }
 
     #[test]
     fn accept_transit_admits_a_ship_with_carried_state() {
         let mut dst = Sim::for_sector(SectorId::new(1, 0), Arc::new(Ruleset::builtin()));
         let mut snap = Ship::new("Ace".into(), 100, 0, "blaster".into(), 100).snap("n");
-        snap.x = 5.0;
-        snap.y = 1500.0;
+        snap.pos.x = 5.0;
+        snap.pos.y = 1500.0;
         snap.minerals = 99;
         snap.kills = 4;
         dst.accept_transit(snap);
@@ -3132,16 +3122,16 @@ mod tests {
             let g = s.ships.get_mut("gunner").unwrap();
             g.weapons.push("railgun".into());
             g.weapon = "railgun".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0;
             g.vx = 0.0;
             g.vy = 0.0;
         }
         {
             let t = s.ships.get_mut("target").unwrap();
-            t.x = 900.0; // straight ahead, within range
-            t.y = 500.0;
+            t.pos.x = 900.0; // straight ahead, within range
+            t.pos.y = 500.0;
             t.hp = 5;
             t.vx = 0.0;
             t.vy = 0.0;
@@ -3164,16 +3154,16 @@ mod tests {
             let g = s.ships.get_mut("gunner").unwrap();
             g.weapons.push("laser".into());
             g.weapon = "laser".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0;
             g.vx = 0.0;
             g.vy = 0.0;
         }
         {
             let t = s.ships.get_mut("target").unwrap();
-            t.x = 650.0; // within laser range
-            t.y = 500.0;
+            t.pos.x = 650.0; // within laser range
+            t.pos.y = 500.0;
             t.hp = 200;
             t.max_hp = 200;
             t.vx = 0.0;
@@ -3183,13 +3173,13 @@ mod tests {
         for _ in 0..10 {
             {
                 let t = s.ships.get_mut("target").unwrap();
-                t.x = 650.0;
-                t.y = 500.0;
+                t.pos.x = 650.0;
+                t.pos.y = 500.0;
             }
             {
                 let g = s.ships.get_mut("gunner").unwrap();
-                g.x = 500.0;
-                g.y = 500.0;
+                g.pos.x = 500.0;
+                g.pos.y = 500.0;
                 g.a = 0.0;
             }
             s.apply_intent("gunner", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);
@@ -3208,16 +3198,16 @@ mod tests {
             let g = s.ships.get_mut("gunner").unwrap();
             g.weapons.push("missile".into());
             g.weapon = "missile".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0; // firing straight along +x ...
             g.vx = 0.0;
             g.vy = 0.0;
         }
         {
             let t = s.ships.get_mut("target").unwrap();
-            t.x = 900.0;
-            t.y = 800.0; // ... but the target is off-axis, so the missile must curve
+            t.pos.x = 900.0;
+            t.pos.y = 800.0; // ... but the target is off-axis, so the missile must curve
             t.hp = 500;
             t.max_hp = 500;
             t.vx = 0.0;
@@ -3241,8 +3231,8 @@ mod tests {
             let g = s.ships.get_mut("g").unwrap();
             g.weapons.push("missile".into());
             g.weapon = "missile".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0;
             g.vx = 0.0;
             g.vy = 0.0;
@@ -3253,8 +3243,8 @@ mod tests {
         solo(&mut s);
         for (id, ex, ey) in [("e1", 900.0, 500.0), ("e2", 928.0, 520.0)] {
             let e = s.ships.get_mut(id).unwrap();
-            e.x = ex;
-            e.y = ey;
+            e.pos.x = ex;
+            e.pos.y = ey;
             e.hp = 300;
             e.max_hp = 300;
             e.vx = 0.0;
@@ -3269,8 +3259,8 @@ mod tests {
             // Hold the targets still and let the missile fly in and detonate.
             for (id, ex, ey) in [("e1", 900.0, 500.0), ("e2", 928.0, 520.0)] {
                 if let Some(e) = s.ships.get_mut(id) {
-                    e.x = ex;
-                    e.y = ey;
+                    e.pos.x = ex;
+                    e.pos.y = ey;
                 }
             }
             s.tick(1.0);
@@ -3339,15 +3329,15 @@ mod tests {
         s.join("b", "B", 2);
         {
             let a = s.ships.get_mut("a").unwrap();
-            a.x = 1000.0;
-            a.y = 1000.0;
+            a.pos.x = 1000.0;
+            a.pos.y = 1000.0;
             a.vx = 0.0;
             a.vy = 0.0;
         }
         {
             let b = s.ships.get_mut("b").unwrap();
-            b.x = 1004.0; // heavily overlapping (< 2*SHIP_R apart)
-            b.y = 1000.0;
+            b.pos.x = 1004.0; // heavily overlapping (< 2*SHIP_R apart)
+            b.pos.y = 1000.0;
             b.vx = 0.0;
             b.vy = 0.0;
         }
@@ -3358,7 +3348,7 @@ mod tests {
         }
         let a = &s.ships["a"];
         let b = &s.ships["b"];
-        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+        let d = ((a.pos.x - b.pos.x).powi(2) + (a.pos.y - b.pos.y).powi(2)).sqrt();
         assert!(d > SHIP_R, "collision physics separates overlapping ships, d={d}");
     }
 
@@ -3404,21 +3394,21 @@ mod tests {
         // Place fighter right on top of B and run; the NPC should shoot B.
         {
             let b = s.ships.get_mut("B").unwrap();
-            b.x = 1500.0;
-            b.y = 1500.0;
+            b.pos.x = 1500.0;
+            b.pos.y = 1500.0;
             b.hp = 12;
         }
         {
             let g = s.ships.get_mut(&fid).unwrap();
-            g.x = 1500.0 - 60.0;
-            g.y = 1500.0;
+            g.pos.x = 1500.0 - 60.0;
+            g.pos.y = 1500.0;
         }
         let before = s.factions["A"].unit_count(UnitKind::Fighter);
         for _ in 0..60 {
             // keep B in place (don't let it drift) so the fighter has a stationary target
             if let Some(b) = s.ships.get_mut("B") {
-                b.x = 1500.0;
-                b.y = 1500.0;
+                b.pos.x = 1500.0;
+                b.pos.y = 1500.0;
             }
             s.tick(1.0);
         }
@@ -3515,7 +3505,7 @@ mod tests {
         assert_eq!(a.state_hash(), b.state_hash(), "honest replicas agree on the world hash");
 
         // A cheating host teleports its ship; its hash now disagrees and would be outvoted.
-        a.ships.get_mut("x").unwrap().x += 60.0;
+        a.ships.get_mut("x").unwrap().pos.x += 60.0;
         assert_ne!(a.state_hash(), b.state_hash(), "a tampered state produces a different hash");
     }
 
@@ -3606,16 +3596,16 @@ mod tests {
             let g = s.ships.get_mut("g").unwrap();
             g.weapons.push("railgun".into());
             g.weapon = "railgun".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.a = 0.0;
             g.energy = 10.0; // below the railgun's 34 cost
             g.max_energy = 100.0;
         }
         {
             let t = s.ships.get_mut("t").unwrap();
-            t.x = 900.0;
-            t.y = 500.0;
+            t.pos.x = 900.0;
+            t.pos.y = 500.0;
             t.hp = 5;
         }
         s.apply_intent("g", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 0);
@@ -3637,8 +3627,8 @@ mod tests {
         solo(&mut s);
         {
             let p = s.ships.get_mut("n").unwrap();
-            p.x = 1000.0;
-            p.y = 1000.0;
+            p.pos.x = 1000.0;
+            p.pos.y = 1000.0;
             p.vx = 0.0;
             p.vy = 0.0;
             p.effects.apply(StatusKind::Emp, s.tick + 50, 1.0, "z");
@@ -3686,8 +3676,7 @@ mod tests {
         // An already-armed mine owned by A, with enemy E sitting inside its trigger radius.
         s.mines.push(Mine {
             owner: "a".into(),
-            x: 1500.0,
-            y: 1500.0,
+            pos: s.galaxy_pos(1500.0, 1500.0),
             vx: 0.0,
             vy: 0.0,
             dmg: 60,
@@ -3700,8 +3689,8 @@ mod tests {
         });
         {
             let e = s.ships.get_mut("e").unwrap();
-            e.x = 1540.0; // within trigger
-            e.y = 1500.0;
+            e.pos.x = 1540.0; // within trigger
+            e.pos.y = 1500.0;
             e.hp = 300;
             e.max_hp = 300;
         }
@@ -3718,8 +3707,7 @@ mod tests {
         solo(&mut s);
         s.mines.push(Mine {
             owner: "a".into(),
-            x: 1500.0,
-            y: 1500.0,
+            pos: s.galaxy_pos(1500.0, 1500.0),
             vx: 0.0,
             vy: 0.0,
             dmg: 60,
@@ -3730,8 +3718,8 @@ mod tests {
             die_at: s.tick + 1000,
             effect: None,
         });
-        s.ships.get_mut("a").unwrap().x = 1500.0;
-        s.ships.get_mut("a").unwrap().y = 1500.0;
+        s.ships.get_mut("a").unwrap().pos.x = 1500.0;
+        s.ships.get_mut("a").unwrap().pos.y = 1500.0;
         s.tick(1.0);
         assert_eq!(s.mines.len(), 1, "a mine ignores its own faction");
     }
@@ -3744,18 +3732,18 @@ mod tests {
         solo(&mut s);
         {
             let v = s.ships.get_mut("victim").unwrap();
-            v.x = 1500.0;
-            v.y = 1500.0;
+            v.pos.x = 1500.0;
+            v.pos.y = 1500.0;
         }
         // Destroy the player: a pickup drops where they died.
         s.apply_damage("victim", 9999, "looter", s.tick);
         assert_eq!(s.pickups.len(), 1, "a destroyed player dropped loot");
-        let (px, py) = (s.pickups[0].x, s.pickups[0].y);
+        let (px, py) = (s.pickups[0].pos.x, s.pickups[0].pos.y);
         // Fly the looter onto the pickup; it gets collected on the next tick.
         {
             let l = s.ships.get_mut("looter").unwrap();
-            l.x = px;
-            l.y = py;
+            l.pos.x = px;
+            l.pos.y = py;
         }
         s.tick(1.0);
         assert!(s.pickups.is_empty(), "the looter collected the pickup");
@@ -3773,8 +3761,8 @@ mod tests {
         solo(&mut s);
         {
             let p = s.ships.get_mut("n").unwrap();
-            p.x = 1000.0;
-            p.y = 1000.0;
+            p.pos.x = 1000.0;
+            p.pos.y = 1000.0;
             p.vx = 0.0;
             p.vy = 0.0;
         }
@@ -3784,7 +3772,7 @@ mod tests {
             s.tick(1.0);
         }
         assert!(s.ships["n"].vx > 0.0, "gravity pulled the ship toward the well");
-        assert!(s.ships["n"].x > 1000.0, "and moved it inward");
+        assert!(s.ships["n"].pos.x > 1000.0, "and moved it inward");
     }
 
     #[test]
@@ -3799,8 +3787,8 @@ mod tests {
         solo(&mut s);
         {
             let d = s.ships.get_mut("doomed").unwrap();
-            d.x = 1010.0; // inside the event horizon
-            d.y = 1000.0;
+            d.pos.x = 1010.0; // inside the event horizon
+            d.pos.y = 1000.0;
         }
         s.tick(1.0);
         assert!(!s.ships["doomed"].alive, "the event horizon destroyed the ship");
@@ -3814,8 +3802,8 @@ mod tests {
             let g = s.ships.get_mut("g").unwrap();
             g.weapons.push("arc".into());
             g.weapon = "arc".into();
-            g.x = 500.0;
-            g.y = 500.0;
+            g.pos.x = 500.0;
+            g.pos.y = 500.0;
             g.energy = 100.0;
             g.max_energy = 100.0;
         }
@@ -3823,8 +3811,8 @@ mod tests {
         for (i, id) in ["e1", "e2", "e3"].iter().enumerate() {
             s.join(id, id, 200 + i as u32);
             let e = s.ships.get_mut(*id).unwrap();
-            e.x = 700.0 + i as f32 * 200.0;
-            e.y = 500.0;
+            e.pos.x = 700.0 + i as f32 * 200.0;
+            e.pos.y = 500.0;
             e.hp = 300;
             e.max_hp = 300;
             e.owner = None;

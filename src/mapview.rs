@@ -68,10 +68,10 @@ impl CellReport {
         for (id, s) in sim.ships.iter() {
             dots.push(EntityDot {
                 id: id.clone(),
-                pos: sim.galaxy_pos(s.x, s.y),
+                pos: sim.galaxy_pos(s.pos.x, s.pos.y),
                 kind: if s.owner.is_none() { DotKind::Player } else { DotKind::Npc },
             });
-            items.push((Aabb::around(s.x, s.y, 18.0), id.clone()));
+            items.push((Aabb::around(s.pos.x, s.pos.y, 18.0), id.clone()));
         }
         let bounds = Aabb::new(0.0, 0.0, ANCHOR_SPAN, ANCHOR_SPAN);
         let tree = AabbTree::build(bounds, items);

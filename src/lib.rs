@@ -251,14 +251,14 @@ async fn merge_to_quorum_if_outvoted(
 
 /// Where to re-admit a transiting ship into *this* sector when its destination neighbour has no live
 /// host (solo / not-yet-autoscaled world): place it just inside the edge it tried to leave, so it
-/// bounces back into play instead of vanishing. `t.ship.x/y` are in the neighbour's local frame; we
+/// bounces back into play instead of vanishing. `t.ship.pos.x/y` are in the neighbour's local frame; we
 /// flip them back to this sector's boundary based on the crossing direction.
 fn readmit_coords(here: shard::SectorId, t: &sim::Transit) -> (f32, f32) {
     use sim::{SECTOR_SIZE, SHIP_R};
     let dsx = t.to.sx - here.sx;
     let dsy = t.to.sy - here.sy;
-    let mut x = t.ship.x.clamp(0.0, SECTOR_SIZE);
-    let mut y = t.ship.y.clamp(0.0, SECTOR_SIZE);
+    let mut x = t.ship.pos.x.clamp(0.0, SECTOR_SIZE);
+    let mut y = t.ship.pos.y.clamp(0.0, SECTOR_SIZE);
     if dsx == 1 {
         x = SECTOR_SIZE - SHIP_R - 1.0;
     } else if dsx == -1 {
@@ -434,8 +434,8 @@ pub async fn run_sector(
                             _ => {
                                 let mut snap = t.ship.clone();
                                 let (x, y) = readmit_coords(sector_id, &t);
-                                snap.x = x;
-                                snap.y = y;
+                                snap.pos.x = x;
+                                snap.pos.y = y;
                                 sim.accept_transit(snap);
                             }
                         }
