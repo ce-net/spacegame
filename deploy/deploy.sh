@@ -97,10 +97,12 @@ frontend() {
   sync "$HERE"                   spacegame
   sync "$SIBS/spacegame-render"  spacegame-render
   sync "$SIBS/spacegame-wasm"    spacegame-wasm
-  # RUSTFLAGS --growable-table: recent rust-lld emits the wasm `__indirect_function_table` with a fixed
-  # maximum (min == max), so wasm-bindgen's runtime `table.grow()` for JS closures fails at boot
-  # ("WebAssembly.Table.grow() failed to grow table by N"). This flag makes the table growable. (`.cargo/`
-  # is excluded from the source sync, so the flag is set here rather than in a committed cargo config.)
+  # RUSTFLAGS --growable-table: rust-lld emits the wasm closure/externref table with a fixed max (min==max),
+  # so wasm-bindgen's runtime table.grow() fails at boot ("WebAssembly.Table.grow(): failed to grow table by
+  # N"). This flag makes the table growable. CRITICAL COMPANION: `wasm-opt = false` in spacegame-wasm's
+  # Cargo.toml — the relay's binaryen RE-caps the table max, undoing this flag, so both are required (a
+  # merge once dropped that metadata and the page stopped booting). Keep reference-types ON (default);
+  # wasm-bindgen 0.2.12x needs its externref table.
   "${SSH[@]}" "$RELAY" 'source $HOME/.cargo/env; cd '"$REMOTE"'/spacegame-wasm &&
     (command -v wasm-pack >/dev/null || cargo install wasm-pack) &&
     (RUSTFLAGS="-C link-arg=--growable-table" wasm-pack build --release --target web --out-dir pkg > /tmp/spacegame-wasm-build.log 2>&1; rc=$?; tail -30 /tmp/spacegame-wasm-build.log; exit $rc)'
