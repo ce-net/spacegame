@@ -27,7 +27,12 @@ use crate::sim::{Bullet, Sim};
 /// Format version, so a future field change can be migrated rather than mis-read. v4 adds the shield/
 /// energy/status-effect ship fields plus deployed mines and dropped pickups (all `#[serde(default)]`,
 /// so a v3 snapshot still decodes — its ships come back unshielded with full energy and no effects).
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
+
+/// serde default for built-design multipliers/mass on a pre-build snapshot: the stock hull is `1.0`.
+fn one_f32_snap() -> f32 {
+    1.0
+}
 
 /// A serializable capture of one ship's authoritative, persistent state. The newer loadout/tech fields
 /// carry `#[serde(default)]` so a v1 snapshot (pre-weapons) still decodes — the ship simply comes back
@@ -61,6 +66,22 @@ pub struct ShipSnap {
     pub kills: u32,
     pub speed_lv: u32,
     pub guns: u32,
+    /// Built-design physical mass (`1.0` for the stock hull). Carried so a fitted ship keeps its
+    /// handling across failover/transit.
+    #[serde(default = "one_f32_snap")]
+    pub mass: f32,
+    /// Built-design max-speed multiplier.
+    #[serde(default = "one_f32_snap")]
+    pub speed_mult: f32,
+    /// Built-design acceleration/agility multiplier.
+    #[serde(default = "one_f32_snap")]
+    pub thrust_mult: f32,
+    /// Built-design cargo capacity.
+    #[serde(default)]
+    pub cargo: f32,
+    /// Blueprint id the ship was built from (`""` = stock hull).
+    #[serde(default)]
+    pub hull: String,
     /// Selected weapon id.
     #[serde(default)]
     pub weapon: String,
@@ -104,6 +125,11 @@ pub struct SectorSnapshot {
     pub pickups: Vec<crate::sim::Pickup>,
     /// Asteroid cells depleted: `(cx, cy, mined_at_tick)`.
     pub mined: Vec<(i32, i32, u64)>,
+    /// Rocks being mined but not yet shattered: `(cx, cy, remaining_hp)`. Carried so a host taking over
+    /// resumes a half-mined rock instead of resetting it to full. `#[serde(default)]` — a v4 snapshot
+    /// (no field) restores with no in-progress damage, which is harmless.
+    #[serde(default)]
+    pub rock_dmg: Vec<(i32, i32, u32)>,
     /// Always-alive player factions, so a host taking over keeps everyone's economy building without
     /// missing a beat. (Ephemeral debris is not snapshotted — it is cosmetic and bounded.)
     #[serde(default)]
@@ -121,6 +147,9 @@ impl SectorSnapshot {
             sim.mined_cells().into_iter().map(|((cx, cy), t)| (cx, cy, t)).collect();
         mined.sort();
 
+        let mut rock_dmg = sim.rock_damage();
+        rock_dmg.sort();
+
         let mut factions: Vec<Faction> = sim.factions.values().cloned().collect();
         factions.sort_by(|a, b| a.owner.cmp(&b.owner));
 
@@ -135,6 +164,7 @@ impl SectorSnapshot {
             mines: sim.mines.clone(),
             pickups: sim.pickups.clone(),
             mined,
+            rock_dmg,
             factions,
         }
     }
@@ -153,6 +183,7 @@ impl SectorSnapshot {
             sim.ships.insert(s.id.clone(), crate::sim::Ship::from_snap(s, self.tick));
         }
         sim.set_mined(self.mined.iter().map(|&(cx, cy, t)| ((cx, cy), t)));
+        sim.set_rock_damage(self.rock_dmg.iter().copied());
         for f in &self.factions {
             sim.factions.insert(f.owner.clone(), f.clone());
         }
