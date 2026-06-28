@@ -91,24 +91,34 @@ what remains:
    ship by its authority owner (a human ship by its pilot, an NPC fleet unit by its faction's player) so
    a player's ship + fleet + faction fold into one bubble. `Bounds::sectors()` resolves a bubble to the
    sectors it overlaps. Tested.
-2. **`Replica` interest — DONE (engine).** `Replica::domain_field()` and `Replica::interest_sectors(me,
-   view_radius)` give the seamless interest set — one sector mid-sector, two on an edge, four on a
-   corner, growing with the fleet — replacing `SectorId`'s fixed 8-neighbour ring. Tested
-   (`replica::tests::interest_grows_to_the_neighbour_as_the_bubble_nears_a_seam`). **Remaining:** the
-   wasm/native clients must *call* `interest_sectors` to drive their `/in` + `/state` subscriptions
-   (cross-repo: `spacegame-wasm`, `spacegame-native`).
+2. **`Replica` interest + clients — DONE (end to end).** `Replica::domain_field()` /
+   `Replica::interest_sectors(me, view_radius)` and the shared `ClientProfile::interest_set(world_x,
+   world_y)` give the seamless interest set — one sector mid-sector, two on an edge, four on a corner,
+   growing with the fleet — replacing the fixed ring. **Both clients now call it:** `spacegame-wasm` and
+   `spacegame-native` subscribe to the `/in` of every sector their viewport bubble overlaps each frame,
+   so the neighbour they are about to cross into is *already* subscribed — the hand-off has no subscribe
+   round-trip at the seam. Neighbour inputs are filtered out (wasm tags each queued input with its
+   sector; native already had the `sector_of(topic) == sector_tok` guard) until the replica actually
+   re-homes, so a pre-warmed subscription never spawns a ghost in the local sim. Tested
+   (`replica::tests::interest_grows_to_the_neighbour_as_the_bubble_nears_a_seam`,
+   `client::tests::interest_follows_the_player_and_slides_across_seams`).
 3. **Live map — DONE (end to end).** Hosts publish a `galaxywire::DomainFrame` (compact `DomainView`
    bubbles) on `topics::DOMAINS` once per advertise interval (`run_sector`); the node control loop and
    `observe_galaxy` subscribe and fold via `MapModel::on_domains`; `MapModel::player_domains()` and
    `MapSummary::live_players` expose the moving "who is where" dots, and the `spacegame galaxy` ASCII
    dump shows the bubble count. Tested (`galaxymap::tests::domain_frames_track_moving_player_bubbles`).
-4. **Environment authority — API ready, not yet driving the tick.** `DomainField::claim` /
-   `claim_sticky` decide which node simulates each neutral entity; remaining is to call it in the sim/
-   host loop to actually assign neutral-entity ownership and report owner-change deltas to
-   `replication.rs`. (Deferred: it touches the per-tick sim path, currently being reworked by another
-   agent.)
+4. **Environment authority — API ready; intentionally NOT forced into the tick.** `DomainField::claim` /
+   `claim_sticky` decide which single node simulates each neutral entity. But the shipped authority model
+   (`NETCODE.md`) is **deterministic full-region replication merged by quorum**: every player in a region
+   runs the *whole* sim and agrees on a state hash. Per-entity ownership (each player simulating only the
+   neutral entities its bubble claims) is a *different* model — it would make replicas simulate different
+   subsets and so diverge on the quorum hash. Wiring `claim` into the tick is therefore a real
+   architectural change (partial-sim + cross-player entity exchange) that must replace, not coexist with,
+   the quorum merge — and it lands on the per-tick `Sim` path another agent is actively reworking. So the
+   claim primitive is built, tested, and ready, but deliberately left un-forced into the hot loop until
+   that model decision is made. This is the one honest gap, and it is a design choice, not missing code.
 
-The hard part — a seam-free, deterministic, coordinator-free authority partition that follows the
-player, plus its world-frame bridge, replica interest, and the live-map path — is designed, compiled,
-unit-tested, and wired. What's left is the two clients calling the interest API and the tick-loop
-environment-ownership assignment.
+The seam-free, deterministic, coordinator-free authority partition that follows the player — its
+world-frame bridge, replica + client interest (wired through both frontends), and the live-map path — is
+designed, compiled, unit-tested, and driving the clients. The remaining item (per-entity environment
+authority) is gated on a deliberate model decision, documented above.

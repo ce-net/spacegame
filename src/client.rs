@@ -152,12 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn interest_set_shrinks_on_mobile() {
-        let n = Platform::Native.profile().interest_set(10.0, 10.0);
-        let m = Platform::MobileBrowser.profile().interest_set(10.0, 10.0);
-        assert_eq!(n.len(), 9, "native subscribes the full 3x3 ring");
-        assert_eq!(m.len(), 5, "mobile subscribes a smaller plus-shape");
-        assert!(m.iter().all(|s| n.contains(s)), "mobile's set is a subset of the full ring");
+    fn interest_follows_the_player_and_slides_across_seams() {
+        use crate::sim::SECTOR_SIZE;
+        let p = Platform::DesktopBrowser.profile();
+        // Mid-sector: interest is exactly the one home sector — no fixed ring.
+        let mid = p.interest_set(SECTOR_SIZE * 0.5, SECTOR_SIZE * 0.5);
+        assert_eq!(mid, vec![SectorId::new(0, 0)]);
+        // Near the east seam (within view_radius of it): the eastern neighbour joins, nothing else.
+        let edge = p.interest_set(SECTOR_SIZE - 50.0, SECTOR_SIZE * 0.5);
+        assert_eq!(edge.len(), 2);
+        assert!(edge.contains(&SectorId::new(0, 0)) && edge.contains(&SectorId::new(1, 0)));
+        // On a corner: four.
+        assert_eq!(p.interest_set(SECTOR_SIZE - 50.0, SECTOR_SIZE - 50.0).len(), 4);
+        // Mobile's tighter view_radius keeps it on one sector closer to the seam than desktop.
+        let m = Platform::MobileBrowser.profile();
+        assert_eq!(m.interest_set(SECTOR_SIZE - 1500.0, SECTOR_SIZE * 0.5), vec![SectorId::new(0, 0)]);
     }
 
     #[test]
