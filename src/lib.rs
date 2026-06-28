@@ -42,6 +42,7 @@ pub mod build;
 pub mod shipyard;
 pub mod client;
 pub mod domain;
+pub mod editor;
 pub mod effects;
 pub mod faction;
 pub mod hazard;

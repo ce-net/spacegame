@@ -778,6 +778,37 @@ impl Sim {
         }
     }
 
+    /// **Build & fit a CUSTOM design** the player composed in the ship editor (see [`crate::editor`]).
+    /// Resolves the provided [`Blueprint`](crate::build::Blueprint) against the live parts catalogue
+    /// (not a named ruleset entry), derives its [`Loadout`](crate::shipyard::Loadout), and re-fits the
+    /// ship — only if it resolves, stays within the part bound, and is flyable. Returns `false` (no
+    /// change) otherwise, so a malformed or brick design can never strand the player. Authoritative and
+    /// deterministic: every replica resolves the same bytes to the same loadout.
+    pub fn fit_design(&mut self, id: &str, design: &crate::build::Blueprint) -> bool {
+        // Bound the work an over-the-wire design can impose before resolving it.
+        if design.root.len() > crate::editor::MAX_PARTS {
+            return false;
+        }
+        let craft = match crate::build::resolve_design(&self.rules.catalog(), design, &std::collections::BTreeMap::new()) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if craft.parts.len() > crate::editor::MAX_PARTS {
+            return false; // a nested design could expand past the bound
+        }
+        let lo = crate::shipyard::loadout_from_craft(&craft);
+        if !lo.is_flyable() {
+            return false;
+        }
+        match self.ships.get_mut(id) {
+            Some(s) => {
+                s.apply_loadout(&lo, "custom");
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Accept a ship handed off from a neighbouring sector (the other end of [`take_transits`]).
     pub fn accept_transit(&mut self, snap: ShipSnap) {
         let ship = Ship::from_snap(&snap, self.tick);
@@ -2788,6 +2819,24 @@ mod tests {
         // `turret-pod` is a structure + a turret — no command centre, no engine: a brick.
         assert!(!s.fit_blueprint("p", "turret-pod"), "an unflyable design is rejected");
         assert_eq!(s.ships["p"].hull, base_hull, "a rejected fit leaves the ship unchanged");
+    }
+
+    #[test]
+    fn fitting_a_custom_editor_design_rebuilds_the_ship() {
+        use crate::editor::ShipEditor;
+        let mut s = arena();
+        s.join("p", "P", 0);
+        // A design composed in the editor flies once fitted.
+        let design = ShipEditor::starter().to_blueprint();
+        assert!(s.fit_design("p", &design), "a flyable custom design fits");
+        assert_eq!(s.ships["p"].hull, "custom", "a custom design marks the hull as custom");
+        assert!(s.ships["p"].mass > 0.0 && s.ships["p"].speed_mult > 0.0, "stats came from the parts");
+        // A brick (no engine) is rejected and the fitted ship is kept.
+        let mut brick = ShipEditor::new("Brick");
+        brick.place("struct-block", 0, 0, 0);
+        brick.place("command-center", 0, 0, 0);
+        assert!(!s.fit_design("p", &brick.to_blueprint()), "a brick design is rejected");
+        assert_eq!(s.ships["p"].hull, "custom", "the rejected design left the good ship in place");
     }
 
     // ---- Mining: gradual, shatters into alloy nuggets you collect ----

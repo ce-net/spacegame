@@ -87,6 +87,14 @@ pub enum ClientMsg {
     #[serde(rename = "fit")]
     Fit { blueprint: String },
 
+    /// **Build & fit a CUSTOM design from the ship editor.** Unlike [`ClientMsg::Fit`] (a named ruleset
+    /// blueprint), this carries a whole [`Blueprint`](crate::build::Blueprint) the player composed in the
+    /// editor. The host resolves it against its parts catalogue, derives the loadout, and refits the
+    /// player's ship if it is flyable. This is what makes the editor live: save a design, fit it. The
+    /// design is bounded ([`crate::editor::MAX_PARTS`]) so it can ride the input wire safely.
+    #[serde(rename = "fitdesign")]
+    FitDesign { design: crate::build::Blueprint },
+
     /// Command your faction's NPC fleet. `order` is one of
     /// `"defend" | "follow" | "mine" | "hold" | "attack" | "attackmove"`; `attackmove` uses `x`/`y`.
     #[serde(rename = "command")]

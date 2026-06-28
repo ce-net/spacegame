@@ -120,6 +120,9 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
         ClientMsg::Fit { blueprint } => {
             sim.fit_blueprint(from, &blueprint);
         }
+        ClientMsg::FitDesign { design } => {
+            sim.fit_design(from, &design);
+        }
         ClientMsg::Command { order, x, y } => {
             if let Some(cmd) = command_for(&order, x, y) {
                 sim.command_faction(from, cmd);
