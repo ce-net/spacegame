@@ -134,6 +134,7 @@ dependencies = [
 [[package]]
 name = "ce-cap"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#d23b9da15672a7fedc560c50f22ae0faf1027198"
 dependencies = [
  "anyhow",
  "bincode",
@@ -146,6 +147,7 @@ dependencies = [
 [[package]]
 name = "ce-identity"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#d23b9da15672a7fedc560c50f22ae0faf1027198"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -157,6 +159,7 @@ dependencies = [
 [[package]]
 name = "ce-rs"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce-rs#9d568b0b9e57de86c00929a1e081e8c28b905b76"
 dependencies = [
  "anyhow",
  "bytes",
