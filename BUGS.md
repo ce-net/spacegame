@@ -122,6 +122,18 @@ Verbatim:
 Status: ❌ Stars need to be drawn fainter + smaller, and scale with zoom only partially (a reduced zoom
 response vs the foreground — a parallax-like feel). Related to B11.
 
+## Directive (verbatim, palette + B5 still broken)
+> "The preview ghost should disapear when you hover over the menu where you select items / shape / blocks preview. Change so the preview is a scrollable sidepane. no categories just everything listed and you can scroll through them. sorted properly. every item should have its lavel under its preview. And STILL the player isnt being set to what you build but my enemies are super fucking powerful because i set the default blueprint but NOT my own ship??? Fix this"
+
+New bugs from this:
+- B14: hover ghost must hide when the cursor is over the palette/menu.
+- B15: palette = a SCROLLABLE side pane, NO categories, EVERYTHING listed, sorted, each item with a
+  label under its preview.
+- B5 (still): editing must change ONLY your own ship; enemies/world unchanged. User reports enemies are
+  far too powerful (B6 designs) while their own design still doesn't apply. Two parts: (a) tame enemy
+  power; (b) make the fit actually show on the player. Code paths verified identical (editor preview ==
+  fit_design == apply_local_now→home player→snapshot→render) — needs runtime debugging if still failing.
+
 ## Session outcome (after the "fix B2/B3/B4/B5/B10/B11 at once" order)
 Deployed: frontend `16fe95a7`, seed on new SDK. SDK 7459993 / render 5dd45fc / wasm ad6dfcb.
 - B2 ◐ — bullets now traverse the seam (no longer dropped at the sector edge; expire by `die_at`).

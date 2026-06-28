@@ -1758,7 +1758,10 @@ impl Sim {
             // Each marauder flies one of several distinct enemy hulls (deterministically by seed) so a raid
             // is a mixed fleet, not clones. Stats come from the design's parts (the same blueprint->loadout
             // path a player uses); the hull id is the blueprint, so `resolve_hull` draws the real silhouette.
-            const ENEMY_DESIGNS: [&str; 4] = ["raider", "brawler", "interceptor", "cruiser"];
+            // Light strike hulls only for regular raids (the heavy "cruiser" is a boss, not a grunt). The
+            // design gives the SILHOUETTE; HP is capped back to the tuned `enemy_hp` so a varied-looking
+            // raid is NOT tankier/stronger than a plain marauder wave.
+            const ENEMY_DESIGNS: [&str; 3] = ["raider", "interceptor", "brawler"];
             let pick = ENEMY_DESIGNS[((seed >> 20) as usize) % ENEMY_DESIGNS.len()];
             if let Ok(craft) =
                 crate::build::resolve_blueprint(&self.rules.catalog(), pick, &std::collections::BTreeMap::new())
@@ -1766,7 +1769,10 @@ impl Sim {
                 let lo = crate::shipyard::loadout_from_craft(&craft);
                 if lo.is_flyable() {
                     s.apply_loadout(&lo, pick);
-                    s.hp = s.max_hp;
+                    let hp = tun.enemy_hp.max(1);
+                    s.max_hp = hp;
+                    s.hp = hp;
+                    s.guns = s.guns.min(2); // keep firepower in check regardless of the design's gun count
                 }
             }
             self.ships.insert(id, s);
