@@ -145,13 +145,20 @@ accidentally-committed build artifacts). Clients git-dep `spacegame`/`spacegame-
 
 ## 3. Remainders / follow-ups
 
-Build system / editor
-- **Ship editor: model + native hot-reload shipped; richer UIs remain.** `src/editor.rs` + the native
-  file-watch deliver compose-parts → preview → fit-live. Still to do: an **interactive in-game editor**
-  (drag/click parts on a canvas) — native could render the `ShipEditor` grid and bind mouse placement;
-  and a **browser editor** for `spacegame-wasm` (it has no filesystem, so drive `ShipEditor` from a
-  canvas/localStorage/textarea and send `FitDesign`). The wasm/render fixed presets (`ship_slots()`)
+Build system / editor — **interactive editor shipped on both clients**
+- `spacegame_render::EditorView` is the shared in-canvas editor view: a parts palette, place/remove/
+  rotate/zoom, and `build_scene` drawing the design (grid + parts from their real shapes + a ghost) into
+  the game's own `Scene`, so it renders through the same rasteriser / wgpu pipeline.
+- **Native** (press `E`): mouse places/removes parts, `,`/`.` pick a part, `R` rotates, `X` clears,
+  `+/-` zoom; `E` saves the design to the ship file (the hot-reload watcher then fits it). Live stats in
+  the window title.
+- **Browser** (`EDITOR` button): a parts dropdown, click-to-place / right-click-remove on the canvas, a
+  **blueprints list** (a built-in Starter plus the account's saved designs), **Save to user**
+  (localStorage `sg-ships:<account>`), and **Apply** → `FitDesign`. The fixed `ship_slots()` presets
   still work alongside.
+- Still nice-to-have: a richer browser palette (drag, categories, search); loading a *ruleset* preset
+  (interceptor/gunship/hauler) back into the grid editor (today they Fit by name, and the editor's
+  blueprint list is ShipEditor-grid designs only); undo/redo.
 - **Custom hull is not rendered as its design.** A `FitDesign` ship flies correctly (its `Loadout`
   fields persist) but draws with the default/procgen shape, because only the loadout — not the part
   layout — reaches the renderer. To draw the actual design, the host would need to expose the resolved
