@@ -92,6 +92,9 @@ pub struct ShipSnap {
     /// Built-design rotational agility (heavier turns slower). Defaults to stock for old snapshots.
     #[serde(default = "one_f32_snap")]
     pub turn_mult: f32,
+    /// Built-design resolved part count (block damage/regrowth granularity). `0` = stock.
+    #[serde(default)]
+    pub part_count: u16,
     /// Blueprint id the ship was built from (`""` = stock hull).
     #[serde(default)]
     pub hull: String,

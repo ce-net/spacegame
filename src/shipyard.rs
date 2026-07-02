@@ -87,6 +87,10 @@ pub struct Loadout {
     /// Rotational agility vs the reference craft: `sqrt(REFERENCE_MASS / mass)`, clamped — heavier
     /// designs turn slower (rotational inertia), lighter ones snap around.
     pub turn_mult: f32,
+    /// How many concrete parts the design resolved to — the granularity of BLOCK damage/regrowth.
+    /// Blocks peel off in a deterministic order as hull drops and regrow one at a time from the core
+    /// (see the sim's hull regrowth + the renderer's peel order). `0` = un-fitted stock hull.
+    pub part_count: u16,
     /// Everything the designer should know — fatal first.
     pub issues: Vec<BuildIssue>,
 }
@@ -207,6 +211,7 @@ pub fn loadout_from_craft(craft: &ResolvedCraft) -> Loadout {
         energy,
         thrust_profile,
         turn_mult: (REFERENCE_MASS / mass).sqrt().clamp(0.55, 1.4),
+        part_count: craft.parts.len().min(u16::MAX as usize) as u16,
         issues,
     }
 }

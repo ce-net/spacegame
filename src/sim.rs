@@ -95,6 +95,13 @@ pub const DAMPING: f32 = 1.0;
 pub const TURN_RATE: f32 = 0.22;
 /// Base hull / max hull at spawn (reference base; live value from [`Tunables::base_hp`]).
 pub const BASE_HP: i32 = 100;
+/// BLOCK REGROWTH (Reassembly-style): a fitted ship whose hull is damaged regrows ONE block's worth of
+/// hp every this many quiet ticks (no hit since `shield_block` cleared), paid in minerals — the craft
+/// visibly reassembles outward from the command core (the renderer materialises the next block in the
+/// deterministic peel order). Applies to EVERYONE: players, marauders, fleets — same physics, same rules.
+pub const REGROW_TICKS_PER_BLOCK: u64 = 90;
+/// Minerals one regrown block costs. A broke ship stays broken until it mines/loots.
+pub const REGROW_MINERAL_COST: u32 = 2;
 /// Max name length the server accepts.
 pub const MAX_NAME: usize = 16;
 /// Mineral value range of an asteroid.
@@ -269,6 +276,11 @@ pub struct Ship {
     /// ships swing the nose slower. `1.0` = stock.
     #[serde(default = "one_f32")]
     pub turn_mult: f32,
+    /// **Built design — resolved part count**: the granularity of block damage/regrowth. Blocks peel
+    /// deterministically as `hp` drops (renderer + every replica derive the SAME alive-set from
+    /// `hull + hp`, nothing extra on the wire) and regrow from the core when quiet. `0` = stock.
+    #[serde(default)]
+    pub part_count: u16,
     /// Blueprint id this ship was built from, or `""` for the stock hull. Lets the renderer draw the
     /// player's actual design and the HUD name it.
     #[serde(default)]
@@ -360,6 +372,7 @@ impl Ship {
             cargo: 0.0,
             thrust_profile: ones_profile(),
             turn_mult: 1.0,
+            part_count: 0,
             hull: String::new(),
             weapon: default_weapon.clone(),
             weapons: vec![default_weapon],
@@ -423,6 +436,7 @@ impl Ship {
             cargo: snap.cargo,
             thrust_profile: snap.thrust_profile,
             turn_mult: if snap.turn_mult > 0.0 { snap.turn_mult } else { 1.0 },
+            part_count: snap.part_count,
             hull: snap.hull.clone(),
             weapon: if snap.weapon.is_empty() { "blaster".into() } else { snap.weapon.clone() },
             weapons: if snap.weapons.is_empty() { vec![snap.weapon.clone()] } else { snap.weapons.clone() },
@@ -479,6 +493,7 @@ impl Ship {
         self.cargo = lo.cargo;
         self.thrust_profile = lo.thrust_profile;
         self.turn_mult = lo.turn_mult;
+        self.part_count = lo.part_count;
         self.hull = hull.to_string();
         if !lo.weapons.is_empty() {
             // Union the design's mounts into the unlocked set, and select the primary.
@@ -535,6 +550,7 @@ impl Ship {
             cargo: self.cargo,
             thrust_profile: self.thrust_profile,
             turn_mult: self.turn_mult,
+            part_count: self.part_count,
             hull: self.hull.clone(),
             weapon: self.weapon.clone(),
             weapons: self.weapons.clone(),
@@ -1211,6 +1227,21 @@ impl Sim {
                         s.shield = (s.shield + whole as i32).min(s.max_shield);
                     }
                 }
+                // BLOCK REGROWTH: out of combat, a fitted craft REASSEMBLES — one block's worth of hull
+                // every REGROW_TICKS_PER_BLOCK ticks, paid in minerals, until whole. The renderer draws
+                // the same peel order this hp restores through, so you SEE the next block materialise
+                // off the core. Everyone plays by this rule (player, marauder, fleet — no specials).
+                if s.part_count > 0
+                    && s.hp < s.max_hp
+                    && s.hp > 0
+                    && now >= s.shield_block
+                    && s.minerals >= REGROW_MINERAL_COST
+                    && now % REGROW_TICKS_PER_BLOCK == 0
+                {
+                    let chunk = (s.max_hp / s.part_count as i32).max(1);
+                    s.hp = (s.hp + chunk).min(s.max_hp);
+                    s.minerals -= REGROW_MINERAL_COST;
+                }
 
                 // Turn (button steering; mouse-aim already applied in apply_intent). Rotational
                 // inertia is real: the design's `turn_mult` (from mass) scales how fast the nose swings.
@@ -1226,7 +1257,14 @@ impl Sim {
                 // When NOTHING is asked for, the auto-stabiliser fires retro thrusters to cancel residual
                 // velocity — a real thruster firing, not invisible arcade friction (DAMPING is 1.0).
                 if can_thrust {
-                    let acc = s.accel_t(&tun) * mobility * dt_scale;
+                    // LOSING BLOCKS HURTS: peeled hull = lost engines/structure, so thrust authority
+                    // degrades with hull fraction (never below 35% — the core keeps attitude jets).
+                    let integrity = if s.max_hp > 0 {
+                        0.35 + 0.65 * (s.hp.max(0) as f32 / s.max_hp as f32)
+                    } else {
+                        1.0
+                    };
+                    let acc = s.accel_t(&tun) * mobility * dt_scale * integrity;
                     let mut driven = false;
                     // SHIP-FRAME translation: W is ALWAYS "forward from the ship's point of view" —
                     // the pilot steers in their own frame, never in screen/world axes. Longitudinal
@@ -3330,6 +3368,73 @@ mod tests {
             assert!(p.pos.x >= 0.0 && p.pos.x <= SECTOR_SIZE);
             assert!(p.pos.y >= 0.0 && p.pos.y <= SECTOR_SIZE);
         }
+    }
+
+    #[test]
+    fn a_damaged_fitted_ship_regrows_blocks_from_the_core_for_minerals() {
+        // Reassembly rule: out of combat, one block's worth of hull returns per REGROW interval, paid
+        // in minerals; a broke ship stays broken; a dead core (hp 0) never regrows.
+        let mut s = Sim::new();
+        s.join("p", "leif", 0);
+        solo(&mut s);
+        let (max_hp, parts) = {
+            let sh = s.ships.get_mut("p").unwrap();
+            assert!(sh.part_count > 0, "join fits the starter design, so blocks exist");
+            sh.minerals = 40;
+            sh.hp = 1; // shredded to the core
+            sh.shield_block = 0; // long quiet
+            (sh.max_hp, sh.part_count as i32)
+        };
+        let chunk = (max_hp / parts).max(1);
+        let before = s.ships["p"].minerals;
+        for _ in 0..(REGROW_TICKS_PER_BLOCK * 3 + 2) {
+            s.apply_intent("p", Intent::default(), 0); // stay connected (no thrust, no fire)
+            s.tick(1.0);
+        }
+        let sh = &s.ships["p"];
+        assert!(sh.hp >= 1 + chunk * 2, "blocks came back over quiet time: hp {} (chunk {chunk})", sh.hp);
+        assert!(sh.minerals < before, "regrowth is paid for in minerals");
+        // Broke: no minerals, no regrowth.
+        let hp_now = {
+            let sh = s.ships.get_mut("p").unwrap();
+            sh.minerals = 0;
+            sh.hp = (sh.max_hp / 2).max(1);
+            sh.hp
+        };
+        for _ in 0..(REGROW_TICKS_PER_BLOCK * 2 + 2) {
+            s.apply_intent("p", Intent::default(), 0);
+            s.tick(1.0);
+        }
+        assert_eq!(s.ships["p"].hp, hp_now, "no minerals, no blocks");
+    }
+
+    #[test]
+    fn a_shredded_hull_thrusts_weaker_than_a_whole_one() {
+        // Losing blocks costs real capability: the same design at 1 hp accelerates far slower than
+        // whole (integrity scaling), so a wreck limps home instead of flying like new.
+        let speed_after = |hp_frac: f32| -> f32 {
+            let mut s = Sim::new();
+            s.join("p", "leif", 0);
+            solo(&mut s);
+            {
+                let sh = s.ships.get_mut("p").unwrap();
+                sh.hp = ((sh.max_hp as f32) * hp_frac).max(1.0) as i32;
+                sh.shield_block = u64::MAX; // block regrowth so hull stays put
+                sh.minerals = 0;
+            }
+            for _ in 0..20 {
+                s.apply_intent("p", Intent { strafe_y: 1, aim: Some(0.0), ..Default::default() }, 0);
+                s.tick(1.0);
+            }
+            let sh = &s.ships["p"];
+            (sh.vx * sh.vx + sh.vy * sh.vy).sqrt()
+        };
+        let whole = speed_after(1.0);
+        let wreck = speed_after(0.02);
+        assert!(
+            wreck < whole * 0.75,
+            "a wreck is markedly slower off the line: {wreck} vs {whole}"
+        );
     }
 
     #[test]
