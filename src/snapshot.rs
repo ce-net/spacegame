@@ -89,6 +89,9 @@ pub struct ShipSnap {
     /// failover/transit; defaults to full authority for a v1 snapshot.
     #[serde(default = "ones_profile_snap")]
     pub thrust_profile: [f32; crate::shipyard::THRUST_BINS],
+    /// Built-design rotational agility (heavier turns slower). Defaults to stock for old snapshots.
+    #[serde(default = "one_f32_snap")]
+    pub turn_mult: f32,
     /// Blueprint id the ship was built from (`""` = stock hull).
     #[serde(default)]
     pub hull: String,

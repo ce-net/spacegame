@@ -49,6 +49,7 @@ pub mod faction;
 pub mod hazard;
 pub mod leaderboard;
 pub mod mapview;
+pub mod noise;
 pub mod physics;
 pub mod procgen;
 pub mod replica;

@@ -100,6 +100,13 @@ pub const MAX_NAME: usize = 16;
 /// Mineral value range of an asteroid.
 pub const ROCK_MIN_VAL: u32 = 5;
 pub const ROCK_MAX_VAL: u32 = 30;
+/// Asteroid-belt noise: frequency of the fBm field in ROCK-CELL units. At 300 u/cell this gives belt
+/// features spanning roughly 8–40 cells (2.5–12 km) — big enough to fly through, small enough to find.
+pub const ROCK_NOISE_SCALE: f32 = 0.055;
+/// fBm density above which a cell can hold a rock (below = open void between belts).
+pub const ROCK_BELT_THRESHOLD: f32 = 0.56;
+/// The galaxy's worldgen seed for the asteroid field (mirrored by the JS galaxy map — keep in sync).
+pub const ROCK_NOISE_SEED: u32 = 7;
 /// Synthetic owner id for the marauder (hostile PvE) faction. It is *not* a real [`crate::faction::Faction`]
 /// — it owns no economy and never appears in the faction summaries — it is purely a tag that makes a ship
 /// hostile to everyone and aggressive. Marauder ships are `npc:marauders:*` and hunt the nearest target.
@@ -144,23 +151,15 @@ pub const ROCKS_PER_SECTOR: i32 = (SECTOR_SIZE / ROCK_CELL) as i32;
 /// sector-local (so transit, mining cells, and the broad-phase are unchanged). The home sector `(0,0)` maps
 /// global == local, so its field is byte-identical to the legacy [`rock_in_cell`].
 pub fn rock_in_cell_at(sector: SectorId, cx: i32, cy: i32) -> Option<Rock> {
+    // ONE worldgen: delegate to the global noise-driven field and rebase to sector-local coordinates,
+    // so the authoritative sim and every renderer derive the identical galaxy from the same function
+    // (a fork here would let clients draw rocks the sim does not simulate).
     let gcx = sector.sx.saturating_mul(ROCKS_PER_SECTOR).saturating_add(cx);
     let gcy = sector.sy.saturating_mul(ROCKS_PER_SECTOR).saturating_add(cy);
-    let h = cell_hash(gcx, gcy, "rock");
-    if h % 100 >= 55 {
-        return None; // ~55% of cells host a rock
-    }
-    let ox = ((h >> 8) % 1000) as f32 / 1000.0;
-    let oy = ((h >> 18) % 1000) as f32 / 1000.0;
-    let x = cx as f32 * ROCK_CELL + ox * ROCK_CELL;
-    let y = cy as f32 * ROCK_CELL + oy * ROCK_CELL;
-    if x < 30.0 || y < 30.0 || x > SECTOR_SIZE - 30.0 || y > SECTOR_SIZE - 30.0 {
-        return None;
-    }
-    let span = ROCK_MAX_VAL - ROCK_MIN_VAL;
-    let val = ROCK_MIN_VAL + (cell_hash(gcx, gcy, "val") % (span + 1));
-    let hp = 18 + (cell_hash(gcx, gcy, "hp") % 30);
-    Some(Rock { x, y, val, hp, cx, cy })
+    let r = rock_world(gcx, gcy)?;
+    let x = r.x - sector.sx as f32 * SECTOR_SIZE;
+    let y = r.y - sector.sy as f32 * SECTOR_SIZE;
+    Some(Rock { x, y, val: r.val, hp: r.hp, cx, cy })
 }
 
 /// The deterministic asteroid (if any) for **home-sector** grid cell `(cx, cy)`. Back-compat shim equal to
@@ -179,8 +178,20 @@ pub fn rock_in_cell(cx: i32, cy: i32) -> Option<Rock> {
 /// the within-sector local cell, identically on both, so a rock near a sector seam is kept (or culled) the
 /// same way everywhere.
 pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
+    // BELTS, NOT CONFETTI: existence is driven by a deterministic fBm noise field (see
+    // [`crate::noise`]) sampled at belt scale, so asteroids form visible clusters and winding belts
+    // with real empty voids between them — the same field every sim, renderer and the live galaxy map
+    // derive independently and identically. Inside a belt the cells are DENSE (the local hash only
+    // thins the belt interior), so a field reads as a field.
+    let density = crate::noise::fbm2(gcx as f32 * ROCK_NOISE_SCALE, gcy as f32 * ROCK_NOISE_SCALE, 4, ROCK_NOISE_SEED);
+    if density < ROCK_BELT_THRESHOLD {
+        return None; // open void between belts
+    }
     let h = cell_hash(gcx, gcy, "rock");
-    if h % 100 >= 55 {
+    // Denser toward a belt's core: at the threshold ~55% of cells hold a rock, at the core ~95%.
+    let t = ((density - ROCK_BELT_THRESHOLD) / (1.0 - ROCK_BELT_THRESHOLD)).clamp(0.0, 1.0);
+    let keep = 55 + (t * 40.0) as u32;
+    if h % 100 >= keep {
         return None;
     }
     let ox = ((h >> 8) % 1000) as f32 / 1000.0;
@@ -194,7 +205,10 @@ pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
         return None;
     }
     let span = ROCK_MAX_VAL - ROCK_MIN_VAL;
-    let val = ROCK_MIN_VAL + (cell_hash(gcx, gcy, "val") % (span + 1));
+    // Belt cores are RICHER: mineral value scales up toward the density peak, so venturing into the
+    // thick of a field pays better than skimming its edge.
+    let base = cell_hash(gcx, gcy, "val") % (span + 1);
+    let val = ROCK_MIN_VAL + ((base as f32 * (0.6 + 0.4 * t)) as u32).min(span);
     let hp = 18 + (cell_hash(gcx, gcy, "hp") % 30);
     Some(Rock { x: gcx as f32 * ROCK_CELL + ox * ROCK_CELL, y: gcy as f32 * ROCK_CELL + oy * ROCK_CELL, val, hp, cx: lcx, cy: lcy })
 }
@@ -251,6 +265,10 @@ pub struct Ship {
     /// strafe authority. `[1.0; 8]` for the stock hull.
     #[serde(default = "ones_profile")]
     pub thrust_profile: [f32; crate::shipyard::THRUST_BINS],
+    /// **Built design — rotational agility** from the design's mass (rotational inertia): heavier
+    /// ships swing the nose slower. `1.0` = stock.
+    #[serde(default = "one_f32")]
+    pub turn_mult: f32,
     /// Blueprint id this ship was built from, or `""` for the stock hull. Lets the renderer draw the
     /// player's actual design and the HUD name it.
     #[serde(default)]
@@ -341,6 +359,7 @@ impl Ship {
             thrust_mult: 1.0,
             cargo: 0.0,
             thrust_profile: ones_profile(),
+            turn_mult: 1.0,
             hull: String::new(),
             weapon: default_weapon.clone(),
             weapons: vec![default_weapon],
@@ -403,6 +422,7 @@ impl Ship {
             thrust_mult: if snap.thrust_mult > 0.0 { snap.thrust_mult } else { 1.0 },
             cargo: snap.cargo,
             thrust_profile: snap.thrust_profile,
+            turn_mult: if snap.turn_mult > 0.0 { snap.turn_mult } else { 1.0 },
             hull: snap.hull.clone(),
             weapon: if snap.weapon.is_empty() { "blaster".into() } else { snap.weapon.clone() },
             weapons: if snap.weapons.is_empty() { vec![snap.weapon.clone()] } else { snap.weapons.clone() },
@@ -458,6 +478,7 @@ impl Ship {
         self.thrust_mult = lo.thrust_mult;
         self.cargo = lo.cargo;
         self.thrust_profile = lo.thrust_profile;
+        self.turn_mult = lo.turn_mult;
         self.hull = hull.to_string();
         if !lo.weapons.is_empty() {
             // Union the design's mounts into the unlocked set, and select the primary.
@@ -513,6 +534,7 @@ impl Ship {
             thrust_mult: self.thrust_mult,
             cargo: self.cargo,
             thrust_profile: self.thrust_profile,
+            turn_mult: self.turn_mult,
             hull: self.hull.clone(),
             weapon: self.weapon.clone(),
             weapons: self.weapons.clone(),
@@ -1010,7 +1032,8 @@ impl Sim {
             if let Some(aim) = intent.aim {
                 let mut d = (aim - s.a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                     - std::f32::consts::PI;
-                d = d.clamp(-turn_rate, turn_rate);
+                let rate = turn_rate * s.turn_mult; // rotational inertia: heavier noses swing slower
+                d = d.clamp(-rate, rate);
                 s.a = (s.a + d).rem_euclid(std::f32::consts::TAU);
             }
             s.last_input_tick = tick;
@@ -1189,8 +1212,10 @@ impl Sim {
                     }
                 }
 
-                // Turn (button steering; mouse-aim already applied in apply_intent).
-                s.a = (s.a + s.want_turn as f32 * tun.turn_rate).rem_euclid(std::f32::consts::TAU);
+                // Turn (button steering; mouse-aim already applied in apply_intent). Rotational
+                // inertia is real: the design's `turn_mult` (from mass) scales how fast the nose swings.
+                s.a = (s.a + s.want_turn as f32 * tun.turn_rate * s.turn_mult)
+                    .rem_euclid(std::f32::consts::TAU);
 
                 // THRUSTERS — the ONLY source of self-propulsion (gated by EMP). Two ways to ask for force:
                 //   • `want_thrust`  → classic forward thrust along the ship's facing (NPC brains, legacy).
@@ -1214,11 +1239,21 @@ impl Sim {
                     if fwd != 0.0 || lat != 0.0 {
                         let len = (fwd * fwd + lat * lat).sqrt();
                         let craft_ang = lat.atan2(fwd); // 0 = straight ahead
-                        let f = acc * s.thrust_frac(craft_ang) / len.max(1.0);
+                        let mut f = acc * s.thrust_frac(craft_ang) / len.max(1.0);
                         let (ca, sa) = (s.a.cos(), s.a.sin());
                         // forward unit = (ca, sa); starboard unit = (-sa, ca).
-                        s.vx += (fwd * ca - lat * sa) * f;
-                        s.vy += (fwd * sa + lat * ca) * f;
+                        let (ux, uy) = ((fwd * ca - lat * sa) / len, (fwd * sa + lat * ca) / len);
+                        // PHYSICAL TOP SPEED: thrust effectiveness fades as speed ALONG the push
+                        // direction approaches the hull's rated max (drive efficiency falls off), so a
+                        // ship asymptotes to its top speed instead of slamming into an invisible wall.
+                        // Pushing against your motion (retro/lateral) keeps full authority.
+                        let vmax = s.max_speed_t(&tun) * mobility;
+                        let along = s.vx * ux + s.vy * uy;
+                        if along > 0.0 && vmax > 0.0 {
+                            f *= (1.0 - (along / vmax).min(1.0)).max(0.0);
+                        }
+                        s.vx += ux * f * len;
+                        s.vy += uy * f * len;
                         driven = true;
                     }
                     if !driven {

@@ -29,6 +29,11 @@ pub const THRUSTER_GIMBAL: f32 = std::f32::consts::FRAC_PI_3;
 /// Directions sampled for the per-direction thrust profile (craft frame, bin `k` = `k * 45°`).
 pub const THRUST_BINS: usize = 8;
 
+/// Reference craft mass for rotational agility (≈ the starter design). A ship's turn rate scales with
+/// `sqrt(REFERENCE_MASS / mass)` — rotational inertia grows with mass, so a heavy cruiser swings its
+/// nose slower than an interceptor, straight out of the parts.
+pub const REFERENCE_MASS: f32 = 9.0;
+
 /// A non-fatal-to-fatal problem the designer should know about. Fatal issues make the craft
 /// **unflyable** (it would be a brick); the rest are penalties or advice.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,9 @@ pub struct Loadout {
     /// craft with engines facing all around gets a flat profile (full strafe authority); one with a
     /// single rear engine is strong ahead and nearly dead astern.
     pub thrust_profile: [f32; THRUST_BINS],
+    /// Rotational agility vs the reference craft: `sqrt(REFERENCE_MASS / mass)`, clamped — heavier
+    /// designs turn slower (rotational inertia), lighter ones snap around.
+    pub turn_mult: f32,
     /// Everything the designer should know — fatal first.
     pub issues: Vec<BuildIssue>,
 }
@@ -198,6 +206,7 @@ pub fn loadout_from_craft(craft: &ResolvedCraft) -> Loadout {
         shield: shield.max(0),
         energy,
         thrust_profile,
+        turn_mult: (REFERENCE_MASS / mass).sqrt().clamp(0.55, 1.4),
         issues,
     }
 }
