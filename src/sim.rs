@@ -220,6 +220,54 @@ pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
     Some(Rock { x: gcx as f32 * ROCK_CELL + ox * ROCK_CELL, y: gcy as f32 * ROCK_CELL + oy * ROCK_CELL, val, hp, cx: lcx, cy: lcy })
 }
 
+/// A marauder **LAIR** — a deterministic worldgen feature: the anchor of a resident hostile garrison
+/// (see `Sim::spawn_enemies`). Derived from the same integer-hash worldgen as the asteroid field, so
+/// every replica and renderer agrees where the enemy lives with zero wire state. Distance from the
+/// origin sets the `tier` (the frontier is meaner — worldgen's danger gradient).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lair {
+    /// Sector-local position of the nest.
+    pub x: f32,
+    pub y: f32,
+    /// Strength tier (1 = nursery). Scales garrison size, hp, guns and design pool.
+    pub tier: u32,
+    /// The lair's worldgen seed (stable id — garrison slot ids derive from it).
+    pub seed: u32,
+}
+
+/// The lairs of one sector — pure worldgen (same `(sector)` → same lairs, everywhere, forever).
+/// Genesis `(0,0)` always has exactly ONE weak nest pushed away from the centre spawn area, so a new
+/// player can learn to fight without being camped; the ring outward raises count, chance and tier.
+pub fn lairs_for_sector(sector: SectorId) -> Vec<Lair> {
+    let ring = sector.sx.unsigned_abs().max(sector.sy.unsigned_abs());
+    let mut out = Vec::new();
+    let slots = if ring == 0 { 1 } else { 3 };
+    for k in 0..slots {
+        let h = fnv1a(&format!("lair:{}:{}:{k}", sector.sx, sector.sy));
+        let chance: u32 = if ring == 0 { 100 } else { 35 + ring.min(9) * 6 };
+        if h % 100 >= chance {
+            continue;
+        }
+        let jx = ((h >> 8) % 1000) as f32 / 1000.0;
+        let jy = ((h >> 20) % 1000) as f32 / 1000.0;
+        let mut x = 900.0 + jx * (SECTOR_SIZE - 1800.0);
+        let mut y = 900.0 + jy * (SECTOR_SIZE - 1800.0);
+        if ring == 0 {
+            // The genesis nursery: keep the nest well clear of the centre spawn band.
+            let (cx, cy) = (SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0);
+            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            if d < 2600.0 {
+                let a = (y - cy).atan2(x - cx);
+                x = (cx + a.cos() * 2800.0).clamp(900.0, SECTOR_SIZE - 900.0);
+                y = (cy + a.sin() * 2800.0).clamp(900.0, SECTOR_SIZE - 900.0);
+            }
+        }
+        let tier = 1 + ring.min(6) + ((h >> 30) & 1);
+        out.push(Lair { x, y, tier, seed: h });
+    }
+    out
+}
+
 /// A ship's authoritative state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Ship {
@@ -1720,7 +1768,13 @@ impl Sim {
         }
 
         let senses = Senses { now, hp_frac, enemy: enemy.clone(), rock, current_rock_live, current_target_held, engage_r };
-        let obj = ai::next_objective(role, cmd, &cur, &senses);
+        let mut obj = ai::next_objective(role, cmd, &cur, &senses);
+        // A hostile garrison HOLDS its ground when idle: it has no owner ship, so the escort ring
+        // would anchor on itself and random-walk it across the sector (and off the edge). Territory
+        // means standing on it.
+        if owner == HOSTILE_OWNER && obj == Objective::Escort {
+            obj = Objective::Idle;
+        }
         let (tx, ty, fire) = self.objective_goal(&obj, id, owner, x, y, enemy.as_ref());
         (obj, tx, ty, fire)
     }
@@ -1739,8 +1793,13 @@ impl Sim {
         enemy: Option<&crate::ai::Contact>,
     ) -> (f32, f32, bool) {
         use crate::ai::{self, Objective};
-        let anchor =
-            self.ships.get(owner).map(|s| (s.pos.x, s.pos.y)).unwrap_or((SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0));
+        // A fleet unit anchors on its owner's ship. A HOSTILE has no owner ship — it anchors on
+        // ITSELF (holds its nest's ground) instead of drifting to the sector centre.
+        let anchor = self
+            .ships
+            .get(owner)
+            .map(|s| (s.pos.x, s.pos.y))
+            .unwrap_or(if owner == HOSTILE_OWNER { (x, y) } else { (SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0) });
         match obj {
             Objective::Idle => (x, y, false),
             Objective::Move { x: mx, y: my } => (*mx, *my, false),
@@ -1927,81 +1986,125 @@ impl Sim {
         }
     }
 
-    /// **Marauder raids** — the PvE threat. On the raid cadence, if the sector holds at least one live
-    /// player and is below the hostile cap, spawn a wave of [`HOSTILE_OWNER`] fighters at range around a
-    /// deterministically-chosen player. They hunt (the [`drive_npcs`](Self::drive_npcs) AttackNearest path)
-    /// and drop minerals on death. Fully deterministic — gated on the shared tick and seeded from it — so
-    /// every replica spawns the identical wave. Disabled when `enemy_wave_ticks == 0`.
+    /// **RESIDENT ENEMY TERRITORY — presence, not popups** (VISION.md §21). A sector's hostile
+    /// presence is a deterministic worldgen feature: [`lairs_for_sector`] places marauder NESTS, and
+    /// each nest's garrison is ALREADY THERE when the sim starts — exploring means approaching their
+    /// territory, conquering means wiping a nest out. A wiped slot refills slowly AT THE LAIR — and
+    /// never while any player is close enough to watch it pop in. Strength, count and design diversity
+    /// rise with the ring (procgen grammar ships join the named hulls at higher tiers). Deterministic:
+    /// every replica derives the identical garrison from (sector, tick).
     fn spawn_enemies(&mut self, tun: &Tunables) {
-        if tun.enemy_wave_ticks == 0 || tun.enemy_max == 0 || tun.enemy_wave_size == 0 {
+        if tun.enemy_max == 0 {
             return;
         }
         let now = self.tick;
-        if now == 0 || now % tun.enemy_wave_ticks != 0 {
+        // The full garrison seeds on the sim's first ticks (present from the start); afterwards only
+        // the cheap reinforcement check runs, on a coarse cadence.
+        if now > 2 && now % 30 != 0 {
             return;
         }
-        // Only raid sectors with a live human to fight; and never exceed the alive-hostile cap.
-        let mut players: Vec<(String, f32, f32)> = self
+        let players: Vec<(f32, f32)> = self
             .ships
             .values()
             .filter(|s| s.alive && s.owner.is_none())
-            .map(|s| (s.name.clone(), s.pos.x, s.pos.y))
+            .map(|s| (s.pos.x, s.pos.y))
             .collect();
-        if players.is_empty() {
-            return;
-        }
         let alive_hostiles = self
             .ships
             .values()
             .filter(|s| s.alive && s.owner.as_deref() == Some(HOSTILE_OWNER))
             .count() as u32;
-        if alive_hostiles >= tun.enemy_max {
-            return;
+        let mut budget = tun.enemy_max.saturating_sub(alive_hostiles);
+        let reinforce_every = tun.enemy_wave_ticks.max(1) * 4; // a slow trickle, never a wave
+        for lair in lairs_for_sector(self.sector) {
+            let garrison = (1 + lair.tier).min(6);
+            for slot in 0..garrison {
+                if budget == 0 {
+                    return;
+                }
+                let id = format!("npc:{HOSTILE_OWNER}:{}:{slot}", lair.seed);
+                if self.ships.contains_key(&id) {
+                    continue; // alive, or a fresh corpse still cooling
+                }
+                if now > 2 {
+                    // Reinforcement: each slot refills on its own deterministic phase.
+                    let phase = (fnv1a(&id) as u64) % reinforce_every;
+                    if now % reinforce_every != phase {
+                        continue;
+                    }
+                }
+                // NEVER materialise a ship in front of someone — not at seed time, not as a
+                // reinforcement. No arcade spawns on top of anyone, ever.
+                let near = players.iter().any(|(px, py)| {
+                    let dx = px - lair.x;
+                    let dy = py - lair.y;
+                    dx * dx + dy * dy < 2200.0 * 2200.0
+                });
+                if near {
+                    continue;
+                }
+                // A deterministic perch on a ring around the nest.
+                let h = fnv1a(&format!("{id}:pos"));
+                let ang = (h % 3600) as f32 / 3600.0 * std::f32::consts::TAU;
+                let dist = 140.0 + ((h >> 12) % 260) as f32;
+                let sx = (lair.x + ang.cos() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                let sy = (lair.y + ang.sin() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
+                // Hue 0 = an aggressive red, so marauders read instantly as a threat.
+                let mut s = Ship::npc(
+                    ShipRole::Fighter,
+                    HOSTILE_OWNER.to_string(),
+                    self.galaxy_pos(sx, sy),
+                    tun.enemy_hp.max(1),
+                    0,
+                    now,
+                );
+                s.outfit(tun);
+                self.dress_garrison_ship(&mut s, &lair, slot, tun);
+                self.ships.insert(id, s);
+                budget -= 1;
+            }
         }
-        let room = (tun.enemy_max - alive_hostiles).min(tun.enemy_wave_size);
+    }
 
-        // Target a deterministically-chosen player (sorted, indexed by the tick) so all replicas agree.
-        players.sort_by(|a, b| a.0.cmp(&b.0));
-        let (px, py) = {
-            let pick = (now as usize / tun.enemy_wave_ticks.max(1) as usize) % players.len();
-            (players[pick].1, players[pick].2)
-        };
-
-        for k in 0..room {
-            let seed = fnv1a(&format!("raid:{now}:{k}"));
-            let ang = (seed % 3600) as f32 / 3600.0 * std::f32::consts::TAU;
-            let dist = tun.enemy_spawn_dist + ((seed >> 12) % 500) as f32;
-            let sx = (px + ang.cos() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
-            let sy = (py + ang.sin() * dist).clamp(SHIP_R, SECTOR_SIZE - SHIP_R);
-            let id = format!("npc:{HOSTILE_OWNER}:{now}:{k}");
-            // Hue 0 = an aggressive red, so marauders read instantly as a threat.
-            let mut s = Ship::npc(ShipRole::Fighter, HOSTILE_OWNER.to_string(), self.galaxy_pos(sx, sy), tun.enemy_hp.try_into().unwrap(), 0, now);
-            s.outfit(tun);
-            // Each marauder flies one of several distinct enemy hulls (deterministically by seed) so a raid
-            // is a mixed fleet, not clones. Stats come from the design's parts (the same blueprint->loadout
-            // path a player uses); the hull id is the blueprint, so `resolve_hull` draws the real silhouette.
-            // Light strike hulls only for regular raids (the heavy "cruiser" is a boss, not a grunt). The
-            // design gives the SILHOUETTE; HP is capped back to the tuned `enemy_hp` so a varied-looking
-            // raid is NOT tankier/stronger than a plain marauder wave.
-            // A varied raid: light interceptors, raiders, brawlers, gunships, and the occasional heavy
-            // hauler/cruiser — every design is a real multi-part blueprint, so they look distinct in-game.
-            const ENEMY_DESIGNS: [&str; 6] =
-                ["raider", "interceptor", "brawler", "gunship", "hauler", "cruiser"];
-            let pick = ENEMY_DESIGNS[((seed >> 20) as usize) % ENEMY_DESIGNS.len()];
-            if let Ok(craft) =
-                crate::build::resolve_blueprint(&self.rules.catalog(), pick, &std::collections::BTreeMap::new())
+    /// Dress a garrison ship in its design + tier-scaled strength. Low tiers fly the light named hulls
+    /// (weak — a nursery nest is beatable in a starter ship); higher tiers mix in heavies and one-off
+    /// PROCGEN warships grown from the ship grammar (seeded by the lair), so no two nests look alike.
+    /// Stats come from the design's parts through the same blueprint→loadout path a player uses; HP is
+    /// then set by tier so looks stay diverse while difficulty stays tuned.
+    fn dress_garrison_ship(&self, s: &mut Ship, lair: &Lair, slot: u32, tun: &Tunables) {
+        const LIGHT: [&str; 3] = ["raider", "interceptor", "brawler"];
+        const HEAVY: [&str; 3] = ["gunship", "hauler", "cruiser"];
+        let h = fnv1a(&format!("{}:{slot}:design", lair.seed));
+        let catalog = self.rules.catalog();
+        // Tier 3+: nearly half the garrison are grammar-grown one-offs.
+        if lair.tier >= 3 && h % 100 < 45 {
+            let seed = ((lair.seed as u64) << 8) | slot as u64;
+            if let Ok(gs) = self.rules.generate_ship("warship", seed)
+                && let Ok(craft) =
+                    crate::build::resolve_design(&catalog, &gs.blueprint, &std::collections::BTreeMap::new())
             {
                 let lo = crate::shipyard::loadout_from_craft(&craft);
                 if lo.is_flyable() {
-                    s.apply_loadout(&lo, pick);
-                    let hp = tun.enemy_hp.max(1);
-                    s.max_hp = hp;
-                    s.hp = hp;
-                    s.guns = s.guns.min(2); // keep firepower in check regardless of the design's gun count
+                    let hull = serde_json::to_string(&gs.blueprint).unwrap_or_default();
+                    s.apply_loadout(&lo, &hull);
                 }
             }
-            self.ships.insert(id, s);
+        } else {
+            let pool: &[&str] = if lair.tier <= 2 { &LIGHT } else { &HEAVY };
+            let pick = pool[(h >> 8) as usize % pool.len()];
+            if let Ok(craft) = crate::build::resolve_blueprint(&catalog, pick, &std::collections::BTreeMap::new()) {
+                let lo = crate::shipyard::loadout_from_craft(&craft);
+                if lo.is_flyable() {
+                    s.apply_loadout(&lo, pick);
+                }
+            }
         }
+        // Tier sets the actual toughness/firepower (looks vary freely, difficulty stays tuned):
+        // tier 1 ≈ 70% of the tuned enemy_hp (a nursery nest is beatable in a starter ship).
+        let hp = ((tun.enemy_hp.max(1) as f32) * (0.5 + 0.2 * lair.tier as f32)) as i32;
+        s.max_hp = hp.max(1);
+        s.hp = s.max_hp;
+        s.guns = s.guns.min(if lair.tier <= 2 { 1 } else { 2 });
     }
 
     /// Fire ship `id`'s selected weapon, dispatching on its kind. Reads the live ruleset, so a hot
@@ -3532,11 +3635,11 @@ mod tests {
             p.vy = 0.0;
         }
         for _ in 0..3 {
+            if !s.ships.contains_key("n") {
+                break; // transited (a resident garrison keeps the world non-empty now)
+            }
             s.apply_intent("n", Intent { thrust: true, aim: Some(0.0), ..Default::default() }, 0);
             s.tick(1.0);
-            if s.ships.is_empty() {
-                break;
-            }
         }
         let transits = s.take_transits();
         assert!(!s.ships.contains_key("n"), "ship left this sector");
@@ -3900,50 +4003,78 @@ mod tests {
 
     #[test]
     fn marauders_raid_a_sector_with_a_player_and_drop_loot() {
+        // TERRITORY, NOT POPUPS (VISION.md §21): the sector's garrison is ALREADY THERE on the first
+        // tick — anchored at its worldgen lair, never spawned around the player — and killing one
+        // drops the mineral cache that funds the conquest loop.
         let mut s = arena();
-        let mut rules = crate::ruleset::Ruleset::builtin();
-        rules.tunables.enemy_wave_ticks = 5; // raid quickly so the test is fast
-        rules.tunables.enemy_wave_size = 2;
-        rules.tunables.enemy_max = 4;
-        s.apply_ruleset(std::sync::Arc::new(rules));
         s.join("n", "p", 0);
-
-        // No raid before a player is present is impossible here (one joined); advance to the first raid.
-        for _ in 0..5 {
-            s.tick(1.0);
-        }
+        s.tick(1.0);
+        let lairs = lairs_for_sector(s.sector);
+        assert_eq!(lairs.len(), 1, "genesis keeps exactly one weak nursery nest");
+        assert!(lairs[0].tier <= 2, "the genesis nest is low tier");
         let hostiles: Vec<String> = s
             .ships
             .iter()
             .filter(|(_, sh)| sh.owner.as_deref() == Some(HOSTILE_OWNER) && sh.alive)
             .map(|(id, _)| id.clone())
             .collect();
-        assert!(!hostiles.is_empty(), "a raid spawned marauders into a populated sector");
+        assert!(!hostiles.is_empty(), "the garrison is present from the very first tick");
         assert!(!s.factions.contains_key(HOSTILE_OWNER), "marauders own no economy/faction");
-
-        // Killing a marauder drops a mineral cache: the kill -> reward -> rebuild loop.
+        // Every garrison ship perches near ITS lair — none popped in around the player.
+        let (px, py) = {
+            let p = &s.ships["n"];
+            (p.pos.x, p.pos.y)
+        };
+        for id in &hostiles {
+            let sh = &s.ships[id];
+            let d_lair = ((sh.pos.x - lairs[0].x).powi(2) + (sh.pos.y - lairs[0].y).powi(2)).sqrt();
+            let d_player = ((sh.pos.x - px).powi(2) + (sh.pos.y - py).powi(2)).sqrt();
+            assert!(d_lair < 600.0, "garrison holds its nest (d={d_lair})");
+            assert!(d_player > 1200.0, "nothing spawns on top of the player (d={d_player})");
+        }
+        // Killing a marauder drops a mineral cache: the kill -> reward -> conquest loop.
         s.apply_damage(&hostiles[0], 99_999, "n", s.tick);
         assert!(!s.ships.contains_key(&hostiles[0]), "the destroyed marauder is removed from the world");
         assert!(
             s.pickups.iter().any(|p| matches!(p.kind, PickupKind::Minerals)),
             "a destroyed marauder dropped a mineral cache"
         );
+        // And the empty slot does NOT refill while the killer is parked on the nest.
+        let before: usize = s.ships.values().filter(|sh| sh.owner.as_deref() == Some(HOSTILE_OWNER) && sh.alive).count();
+        {
+            let p = s.ships.get_mut("n").unwrap();
+            p.pos.x = lairs[0].x;
+            p.pos.y = lairs[0].y;
+            p.max_hp = 1_000_000; // survive the siege — this test watches the spawner, not the fight
+            p.hp = 1_000_000;
+        }
+        for _ in 0..200 {
+            s.apply_intent("n", Intent::default(), 0);
+            s.tick(1.0);
+        }
+        let after: usize = s.ships.values().filter(|sh| sh.owner.as_deref() == Some(HOSTILE_OWNER) && sh.alive).count();
+        assert!(after <= before, "no reinforcement pops in while a player besieges the nest");
     }
 
     #[test]
-    fn no_raid_in_an_empty_sector() {
-        // PvE only harasses sectors that actually hold a live player — an empty sector stays quiet.
-        let mut s = arena();
-        let mut rules = crate::ruleset::Ruleset::builtin();
-        rules.tunables.enemy_wave_ticks = 5;
-        s.apply_ruleset(std::sync::Arc::new(rules));
+    fn garrisons_are_resident_bounded_and_do_not_grow() {
+        // TERRITORY model: hostiles are a worldgen fixture — present with or without players (they are
+        // ALREADY THERE when you arrive), anchored at their lairs, capped by enemy_max, and the count
+        // never grows over time in a quiet sector.
+        let mut s = Sim::new();
         for _ in 0..20 {
             s.tick(1.0);
         }
-        assert!(
-            !s.ships.values().any(|sh| sh.owner.as_deref() == Some(HOSTILE_OWNER)),
-            "no marauders spawn with no player to raid"
-        );
+        let count = |s: &Sim| {
+            s.ships.values().filter(|sh| sh.owner.as_deref() == Some(HOSTILE_OWNER) && sh.alive).count()
+        };
+        let n0 = count(&s);
+        assert!(n0 > 0, "the nest garrison exists without any player");
+        assert!(n0 <= s.rules.tunables.enemy_max as usize, "bounded by enemy_max");
+        for _ in 0..400 {
+            s.tick(1.0);
+        }
+        assert_eq!(count(&s), n0, "a quiet sector's garrison is stable, not a spawner");
     }
 
     #[test]

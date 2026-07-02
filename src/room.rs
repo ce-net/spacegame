@@ -586,7 +586,7 @@ mod tests {
         apply_client_msg(&mut sim, "playerA", ClientMsg::Weapon { id: "railgun".into() });
         sim.tick(1.0);
         let snap = build_snapshot(&sim, "0_0", "hostNode", 123_456);
-        let sv = &snap.ships[0];
+        let sv = snap.ships.iter().find(|s| s.id == "playerA").expect("player in snapshot");
         assert_eq!(sv.weapon, "railgun");
         assert!(sv.weapons.contains(&"railgun".to_string()));
         assert_eq!(snap.ruleset, sim.rules.version);
@@ -602,7 +602,8 @@ mod tests {
         );
         sim.tick(1.0);
         let snap = build_snapshot(&sim, "0_0", "h", 0);
-        assert_eq!(snap.ships[0].hue, hue_for("p"));
+        let sv = snap.ships.iter().find(|s| s.id == "p").expect("player in snapshot");
+        assert_eq!(sv.hue, hue_for("p"));
     }
 
     #[test]
@@ -625,8 +626,9 @@ mod tests {
         assert!(ids.contains(&"near"), "the near ship is visible");
         assert!(!ids.contains(&"far"), "the far ship is culled — bounded per-client bandwidth");
 
-        // The full snapshot still has both (used for small sectors).
+        // The full snapshot still has both players (plus the sector's resident garrison).
         let full = build_snapshot(&sim, "0_0", "h", 0);
-        assert_eq!(full.ships.len(), 2);
+        let players = full.ships.iter().filter(|s| s.id == "near" || s.id == "far").count();
+        assert_eq!(players, 2);
     }
 }

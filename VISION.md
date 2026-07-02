@@ -107,3 +107,7 @@ whole ship in one pass, getting its AABB efficiently, and caching it.)
 ### 20 — visual verification + screenshots + native app, web/native coexisting
 
 > Make a system so that you can visually verify it and take screenshots and drive design development. Write a native app to access spacegame locally also - web and browser should coexist and work together seamlessly.
+
+### 21 — enemy factions: presence, not popups (2026-07-02)
+
+> three overpowered enemies spawning right on top of you is not very fun. Make a proper enemy faction and spawning system. they should already be there and not just popup. It should feel like exploring and conquering not like an arcade with ships spawning on top of you. and we need a lot more diversity for the ships. Note everything i say down verbatim.
