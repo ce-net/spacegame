@@ -67,8 +67,10 @@ pub enum ClientMsg {
         aim: Option<f32>,
         #[serde(default)]
         name: Option<String>,
-        /// World-axis strafe vector (each -1/0/+1) for direct WASD translation, decoupled from facing.
-        /// Defaults to `0` so an older client that omits it still parses.
+        /// SHIP-FRAME translation intent (each -1/0/+1), from the pilot's point of view: `strafe_y` is
+        /// longitudinal (+1 = forward along the nose, -1 = retro), `strafe_x` is lateral (+1 =
+        /// starboard/right, -1 = port/left). W always means "forward for MY ship", whatever the camera
+        /// or heading. Defaults to `0` so an older client that omits them still parses.
         #[serde(default)]
         strafe_x: i32,
         #[serde(default)]

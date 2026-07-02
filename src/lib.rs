@@ -440,6 +440,9 @@ pub async fn run_sector(
                             }
                         }
                     }
+                    // Cross-seam rounds: this single-sector host has no warm neighbour replica to hand
+                    // them to (players' SectorHosts route these locally); drain so the queue never grows.
+                    sim.take_bullet_transits();
 
                     let mut snap = room::build_snapshot(&sim, &cfg.sector, &host_id, now_ms());
                     // Tell each player which of their reliable actions we have applied, so they can stop

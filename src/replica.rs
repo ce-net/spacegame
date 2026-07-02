@@ -144,6 +144,17 @@ impl Replica {
         self.sim.accept_transit(ship);
     }
 
+    /// Drain the rounds that flew off this replica's sector edge this tick (rebased to their
+    /// destination's frame) — routed by [`SectorHost::step_transits`] like ship transits.
+    pub fn drain_bullet_transits(&mut self) -> Vec<(SectorId, crate::sim::Bullet)> {
+        self.sim.take_bullet_transits()
+    }
+
+    /// Admit a round handed off from a neighbouring sector's replica.
+    pub fn accept_bullet(&mut self, b: crate::sim::Bullet) {
+        self.sim.accept_bullet(b);
+    }
+
     /// The **entity-anchored authority bubbles** for everything this replica simulates — the local
     /// player, their fleet, and any NPC factions present — in the absolute world frame, each grown by
     /// `view_radius`. See [`crate::domain`]: a domain follows its owner, so the partition moves with the
@@ -362,8 +373,10 @@ impl SectorHost {
     /// risked, and never a full-world pop.
     pub fn step_transits(&mut self, me: &str) -> Option<SectorId> {
         let mut pending: Vec<crate::sim::Transit> = Vec::new();
+        let mut rounds: Vec<(SectorId, crate::sim::Bullet)> = Vec::new();
         for r in self.reps.values_mut() {
             pending.extend(r.drain_transits());
+            rounds.extend(r.drain_bullet_transits());
         }
         let mut new_home = None;
         for t in pending {
@@ -378,6 +391,15 @@ impl SectorHost {
                 dst.accept_transit(t.ship);
             }
             // else: destination not hosted here — its owner's node has it.
+        }
+        // Route cross-seam rounds into their destination's warm replica — a bullet fired across a seam
+        // keeps flying (and hitting) on the other side. A round whose destination is not warm here is
+        // dropped: it is off every locally-relevant screen, and the replicas that DO host that region
+        // simulate it themselves.
+        for (to, b) in rounds {
+            if let Some(dst) = self.reps.get_mut(&to) {
+                dst.accept_bullet(b);
+            }
         }
         new_home
     }

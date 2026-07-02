@@ -286,10 +286,10 @@ pub struct Ship {
     pub want_turn: i32,
     #[serde(skip)]
     pub want_fire: bool,
-    /// **Desired translation** in WORLD axes (each -1/0/+1), from the pilot's strafe keys (WASD). The
-    /// flight computer fires whatever combination of thrusters best produces this net force with no net
-    /// torque (modelled here as omnidirectional thrust up to the ship's total), so movement is decoupled
-    /// from facing — you aim with the mouse and translate with the keys. `(0,0)` means "hold position":
+    /// **Desired translation in the SHIP's OWN frame** (each -1/0/+1) from the pilot's keys: `y` is
+    /// longitudinal (+1 = forward along the nose, -1 = retro), `x` is lateral (+1 = starboard). W always
+    /// pushes the ship forward from its point of view. The flight computer turns this into thruster
+    /// firings (bounded by the design's per-direction [`Self::thrust_profile`]); `(0,0)` means "hold":
     /// the auto-stabiliser retro-thrusts to null residual velocity. Transient.
     #[serde(skip)]
     pub want_strafe_x: i32,
@@ -696,7 +696,8 @@ pub struct Intent {
     pub fire: bool,
     pub aim: Option<f32>,
     pub name: Option<String>,
-    /// Desired translation in world axes (each -1/0/+1) from the strafe keys — see [`Ship::want_strafe_x`].
+    /// Desired translation in the SHIP's frame (each -1/0/+1): `y` +1 = forward along the nose, `x`
+    /// +1 = starboard — see [`Ship::want_strafe_x`].
     pub strafe_x: i32,
     pub strafe_y: i32,
 }
@@ -739,6 +740,15 @@ pub struct Sim {
     pub explosions: Vec<Explosion>,
     /// Ships that left this sector this tick, to be delivered to neighbours. Drained by the host.
     pub transit_out: Vec<Transit>,
+    /// Bullets/missiles that flew off this sector's edge this tick, rebased to the destination's local
+    /// frame — the host routes each into the warm neighbour replica exactly like a ship [`Transit`],
+    /// so a round crossing a seam keeps flying AND keeps hitting (its collision continues in the sim
+    /// that owns the ships it is now among). No more rounds vanishing at an invisible wall.
+    pub bullet_out: Vec<(SectorId, Bullet)>,
+    /// Ships that recently transited OUT: id → (out-of-bounds exit point in this frame, tick). Lets a
+    /// hostile mid-hunt pursue its target over the seam (steer past the edge → transit → reacquire)
+    /// instead of forgetting it at an invisible wall. Pruned after [`DEPARTED_TTL`] ticks.
+    pub departed: HashMap<String, (f32, f32, u64)>,
     /// Per-player **always-alive** factions, keyed by owner NodeId. Ticked every sim tick whether or
     /// not the player's ship is present — your industrial swarm keeps building while you are away.
     pub factions: std::collections::HashMap<String, Faction>,
@@ -765,11 +775,16 @@ impl Default for Sim {
             beams: Vec::new(),
             explosions: Vec::new(),
             transit_out: Vec::new(),
+            bullet_out: Vec::new(),
+            departed: HashMap::new(),
             factions: std::collections::HashMap::new(),
             debris: physics::World::new(),
         }
     }
 }
+
+/// How long (ticks) a transited-out ship's exit point is remembered for cross-seam pursuit (~15 s).
+pub const DEPARTED_TTL: u64 = 900;
 
 impl Sim {
     pub fn new() -> Self {
@@ -941,6 +956,18 @@ impl Sim {
     /// Drain the ships that left this sector this tick (the host publishes each to its destination).
     pub fn take_transits(&mut self) -> Vec<Transit> {
         std::mem::take(&mut self.transit_out)
+    }
+
+    /// Drain the bullets that flew off this sector's edge this tick (already rebased to their
+    /// destination's local frame) — the other end is [`accept_bullet`](Self::accept_bullet).
+    pub fn take_bullet_transits(&mut self) -> Vec<(SectorId, Bullet)> {
+        std::mem::take(&mut self.bullet_out)
+    }
+
+    /// Admit a round handed off from a neighbouring sector (see [`take_bullet_transits`]). It keeps its
+    /// owner, damage, homing and fuse — it simply continues flying in this sim's frame.
+    pub fn accept_bullet(&mut self, b: Bullet) {
+        self.bullets.push(b);
     }
 
     /// Select an unlocked weapon. Ignored if the ship has not unlocked it.
@@ -1176,26 +1203,22 @@ impl Sim {
                 if can_thrust {
                     let acc = s.accel_t(&tun) * mobility * dt_scale;
                     let mut driven = false;
-                    if s.want_thrust {
-                        // Forward burn: full authority requires engines that can point astern (craft
-                        // angle 0 = forward), which the profile encodes.
-                        let f = acc * s.thrust_frac(0.0);
-                        s.vx += s.a.cos() * f;
-                        s.vy += s.a.sin() * f;
-                        driven = true;
-                    }
-                    if s.want_strafe_x != 0 || s.want_strafe_y != 0 {
-                        let (dx, dy) = (s.want_strafe_x as f32, s.want_strafe_y as f32);
-                        let len = (dx * dx + dy * dy).sqrt();
-                        if len > 0.0 {
-                            // The wanted push in WORLD angle → craft angle → how hard the mounted
-                            // thrusters (with gimbal) can actually shove that way. A rear-engine-only
-                            // design strafes poorly; ring your ship with engines for full authority.
-                            let want = dy.atan2(dx);
-                            let f = acc * s.thrust_frac(want - s.a);
-                            s.vx += (dx / len) * f;
-                            s.vy += (dy / len) * f;
-                        }
+                    // SHIP-FRAME translation: W is ALWAYS "forward from the ship's point of view" —
+                    // the pilot steers in their own frame, never in screen/world axes. Longitudinal
+                    // intent = W/S (+ the legacy forward-thrust button); lateral = A/D. The craft-frame
+                    // wish rotates by the heading into a world force, scaled by how hard the mounted
+                    // thrusters (± gimbal) can actually push that way (`thrust_frac`) — a rear-engine
+                    // design burns hard ahead but strafes/retros weakly; ring engines for authority.
+                    let fwd = s.want_strafe_y as f32 + if s.want_thrust { 1.0 } else { 0.0 };
+                    let lat = s.want_strafe_x as f32;
+                    if fwd != 0.0 || lat != 0.0 {
+                        let len = (fwd * fwd + lat * lat).sqrt();
+                        let craft_ang = lat.atan2(fwd); // 0 = straight ahead
+                        let f = acc * s.thrust_frac(craft_ang) / len.max(1.0);
+                        let (ca, sa) = (s.a.cos(), s.a.sin());
+                        // forward unit = (ca, sa); starboard unit = (-sa, ca).
+                        s.vx += (fwd * ca - lat * sa) * f;
+                        s.vy += (fwd * sa + lat * ca) * f;
                         driven = true;
                     }
                     if !driven {
@@ -1244,9 +1267,12 @@ impl Sim {
                 s.pos.y += s.vy * dt_scale;
 
                 let out = s.pos.x < 0.0 || s.pos.y < 0.0 || s.pos.x >= SECTOR_SIZE || s.pos.y >= SECTOR_SIZE;
-                // Only player ships transit between sectors; NPC fleet ships belong to their faction's
-                // sector and bounce off the edge instead of wandering off the mesh.
-                if out && self.seamless && s.owner.is_none() {
+                // Players AND hostile marauders transit between sectors — an enemy CHASES you across a
+                // seam instead of bouncing off an invisible wall (sectors are addressing, not walls).
+                // Only a faction's own fleet NPCs stay sector-bound: they guard the home their economy
+                // lives in.
+                let transits_edges = s.owner.is_none() || s.owner.as_deref() == Some(HOSTILE_OWNER);
+                if out && self.seamless && transits_edges {
                     // INFINITE MAP: hand the ship to the neighbour sector instead of bouncing.
                     let mut dsx = 0;
                     let mut dsy = 0;
@@ -1315,6 +1341,15 @@ impl Sim {
             }
 
             if let Some(t) = transit {
+                // Remember WHERE the ship left (its out-of-bounds exit point in THIS sim's frame), so a
+                // hostile mid-hunt can PURSUE it over the seam instead of forgetting it exists — the
+                // steer point past the edge carries the hunter across, where it transits and reacquires.
+                let dsx = (t.to.sx - self.sector.sx) as f32;
+                let dsy = (t.to.sy - self.sector.sy) as f32;
+                self.departed.insert(
+                    id.clone(),
+                    (t.ship.pos.x + dsx * SECTOR_SIZE, t.ship.pos.y + dsy * SECTOR_SIZE, now),
+                );
                 self.ships.remove(id);
                 self.transit_out.push(t);
                 continue;
@@ -1589,6 +1624,27 @@ impl Sim {
                 .unwrap_or(false),
             _ => false,
         };
+
+        // CROSS-SEAM PURSUIT: if the locked target is GONE from this sim because it transited out (not
+        // dead — departed), and nothing else is in sight, a hostile drives to the target's exit point
+        // just past the edge. That carries the hunter over the seam, where it transits and reacquires —
+        // enemies chase you across sectors instead of forgetting you at an invisible wall. The pursuit
+        // holds (`Move` re-committed each tick) until the hunter arrives or spots something to shoot;
+        // hostiles take no player orders, so a hostile's `Move` is only ever this pursuit.
+        if owner == HOSTILE_OWNER && enemy.is_none() {
+            if let Objective::Engage { target, .. } = &cur
+                && !self.ships.contains_key(target)
+                && let Some(&(ex, ey, _)) = self.departed.get(target)
+            {
+                return (Objective::Move { x: ex, y: ey }, ex, ey, false);
+            }
+            if let Objective::Move { x: mx, y: my } = cur {
+                let d2 = (mx - x).powi(2) + (my - y).powi(2);
+                if d2 > 120.0 * 120.0 {
+                    return (Objective::Move { x: mx, y: my }, mx, my, false);
+                }
+            }
+        }
 
         let senses = Senses { now, hp_frac, enemy: enemy.clone(), rock, current_rock_live, current_target_held, engage_r };
         let obj = ai::next_objective(role, cmd, &cur, &senses);
@@ -2143,6 +2199,13 @@ impl Sim {
 
     /// Steer homing missiles, integrate every bullet, and resolve ship hits using the AABB broad-phase.
     fn advance_bullets(&mut self, now: u64, tree: &AabbTree<String>, dt_scale: f32) {
+        // Defensive bound: a host that never drains cross-seam rounds (a bare test loop) must not grow
+        // the queue without limit. Drained hosts never come close to this.
+        if self.bullet_out.len() > 2048 {
+            self.bullet_out.clear();
+        }
+        // Forget exits old enough that pursuit is pointless (bounds the map).
+        self.departed.retain(|_, &mut (_, _, t)| now.saturating_sub(t) < DEPARTED_TTL);
         let bullets = std::mem::take(&mut self.bullets);
         let mut surviving: Vec<Bullet> = Vec::with_capacity(bullets.len());
         for mut b in bullets {
@@ -2176,11 +2239,37 @@ impl Sim {
                 b.vy += g.y * dt_scale;
             }
             // Move in the sim's continuous frame. Bullets are NOT clamped/dropped at the old sector edge —
-            // sectors are a dynamic addressing grid, not a wall, so a round flies transparently across a
-            // boundary and only expires by `die_at`. (Per-bullet cross-sim authority hand-off is the deeper
-            // step; this removes the visible seam where rounds used to vanish.)
+            // sectors are a dynamic addressing grid, not a wall.
             b.pos.x += b.vx * dt_scale;
             b.pos.y += b.vy * dt_scale;
+            // CROSS-SEAM HAND-OFF: a round that left this sector's frame is rebased into the neighbour's
+            // local coordinates and queued for the host to route into that warm replica — exactly the
+            // ship [`Transit`] path. It keeps flying AND keeps hitting over there (its collision now runs
+            // in the sim that owns the ships around it). Only when the destination is not simulated
+            // anywhere nearby does it fizzle, unseen.
+            if self.seamless
+                && (b.pos.x < 0.0 || b.pos.y < 0.0 || b.pos.x >= SECTOR_SIZE || b.pos.y >= SECTOR_SIZE)
+            {
+                let mut dsx = 0;
+                let mut dsy = 0;
+                if b.pos.x < 0.0 {
+                    dsx = -1;
+                    b.pos.x += SECTOR_SIZE;
+                } else if b.pos.x >= SECTOR_SIZE {
+                    dsx = 1;
+                    b.pos.x -= SECTOR_SIZE;
+                }
+                if b.pos.y < 0.0 {
+                    dsy = -1;
+                    b.pos.y += SECTOR_SIZE;
+                } else if b.pos.y >= SECTOR_SIZE {
+                    dsy = 1;
+                    b.pos.y -= SECTOR_SIZE;
+                }
+                let to = SectorId::new(self.sector.sx + dsx, self.sector.sy + dsy);
+                self.bullet_out.push((to, b));
+                continue;
+            }
             // Broad-phase: only ships near the bullet are candidates.
             let mut candidates = tree.query(&Aabb::around(b.pos.x, b.pos.y, SHIP_R + 4.0));
             candidates.sort();
@@ -2698,15 +2787,29 @@ impl Sim {
     /// Push overlapping ships apart so they cannot stack — the ship↔ship collision physics. Uses the
     /// AABB tree to find neighbouring pairs, processes each unordered pair once (sorted ids), and
     /// applies an equal-and-opposite positional + velocity impulse so momentum is conserved.
+    ///
+    /// **RAMMING IS REAL**: a hard impact (closing speed along the contact normal above
+    /// [`RAM_MIN_CLOSING`]) deals kinetic damage to BOTH hulls through the normal shield-soaking path,
+    /// split by mass — the lighter ship takes the larger share, so a heavy hauler can bull through an
+    /// interceptor. Damage grows with the square of closing speed (kinetic energy), a formation flying
+    /// at matched velocities never grinds itself down, and same-faction ships never ram each other.
     fn resolve_ship_collisions(&mut self, tree: &AabbTree<String>, tun: &Tunables) {
+        /// Closing speed (world units/tick) below which a bump is harmless (docking, formation jostle).
+        const RAM_MIN_CLOSING: f32 = 6.0;
+        /// Kinetic-damage scale: a full-speed (2×16 u/t) head-on between equals is lethal to both.
+        const RAM_DMG_K: f32 = 0.2;
+        /// Per-impact damage cap, so an outlier closing speed can't one-shot a capital many times over.
+        const RAM_DMG_CAP: i32 = 160;
+        let now = self.tick;
+        let mut rams: Vec<(String, i32, String)> = Vec::new(); // (victim, dmg, attacker)
         let min_d = SHIP_R * 2.0;
         let mut pushes: HashMap<String, (f32, f32)> = HashMap::new();
         let mut ids: Vec<String> = self.ships.iter().filter(|(_, s)| s.alive).map(|(id, _)| id.clone()).collect();
         ids.sort();
         for a in &ids {
-            let (ax, ay, ma) = {
+            let (ax, ay, ma, avx, avy, afac) = {
                 let s = &self.ships[a];
-                (s.pos.x, s.pos.y, s.mass.max(0.05))
+                (s.pos.x, s.pos.y, s.mass.max(0.05), s.vx, s.vy, s.faction_id(a).to_string())
             };
             let mut neigh = tree.query(&Aabb::around(ax, ay, min_d));
             neigh.sort();
@@ -2719,6 +2822,8 @@ impl Sim {
                     continue;
                 }
                 let mb = sb.mass.max(0.05);
+                let (bvx, bvy) = (sb.vx, sb.vy);
+                let bfac = sb.faction_id(&b).to_string();
                 let dx = sb.pos.x - ax;
                 let dy = sb.pos.y - ay;
                 let d2 = dx * dx + dy * dy;
@@ -2739,6 +2844,23 @@ impl Sim {
                     let ang = (h as f32 / u64::MAX as f32) * std::f32::consts::TAU;
                     (ang.cos(), ang.sin())
                 };
+                // RAM DAMAGE: kinetic hit when the pair is closing hard along the contact normal.
+                // Split by mass (lighter takes more), attacker = the other ship, through the normal
+                // shield-soaking path. Same-faction pairs (your own fleet) never grind each other.
+                if afac != bfac {
+                    let closing = -((bvx - avx) * nx + (bvy - avy) * ny);
+                    if closing > RAM_MIN_CLOSING {
+                        let e = RAM_DMG_K * closing * closing;
+                        let dmg_a = ((e * (mb / (ma + mb))) as i32).min(RAM_DMG_CAP);
+                        let dmg_b = ((e * (ma / (ma + mb))) as i32).min(RAM_DMG_CAP);
+                        if dmg_a > 0 {
+                            rams.push((a.clone(), dmg_a, b.clone()));
+                        }
+                        if dmg_b > 0 {
+                            rams.push((b.clone(), dmg_b, a.clone()));
+                        }
+                    }
+                }
                 // Mass-aware separation (Task: physics not arcade): the lighter ship yields more, so a
                 // heavy hauler bulls through a swarm of light drones instead of being shoved equally.
                 // Shares sum to the full overlap, so the pair always separates and momentum is conserved.
@@ -2762,6 +2884,10 @@ impl Sim {
                 s.vx += px * 0.3;
                 s.vy += py * 0.3;
             }
+        }
+        // Kinetic (ram) damage, deterministic order (pairs were visited in sorted order).
+        for (victim, dmg, attacker) in rams {
+            self.apply_damage(&victim, dmg, &attacker, now);
         }
     }
 
@@ -3169,6 +3295,85 @@ mod tests {
             assert!(p.pos.x >= 0.0 && p.pos.x <= SECTOR_SIZE);
             assert!(p.pos.y >= 0.0 && p.pos.y <= SECTOR_SIZE);
         }
+    }
+
+    #[test]
+    fn a_bullet_crossing_the_edge_is_handed_off_not_dropped() {
+        // The seam is invisible for rounds too: a bullet that flies off the east edge is rebased into
+        // the neighbour's local frame and queued for the host to route (like a ship Transit) — it does
+        // NOT silently vanish at the boundary.
+        let mut s = Sim::for_sector(SectorId::new(0, 0), Arc::new(Ruleset::builtin()));
+        let pos = s.galaxy_pos(SECTOR_SIZE - 3.0, 1500.0);
+        s.bullets.push(Bullet {
+            owner: "gunner".into(),
+            pos,
+            vx: 9.0,
+            vy: 0.0,
+            dmg: 5,
+            hue: 0,
+            die_at: 10_000,
+            homing: 0.0,
+            explode_radius: 0.0,
+            effect: None,
+            submunitions: 0,
+        });
+        s.tick(1.0);
+        assert!(s.bullets.is_empty(), "the round left this sector's frame");
+        let handed = s.take_bullet_transits();
+        assert_eq!(handed.len(), 1, "queued for the neighbour, not dropped");
+        let (to, b) = &handed[0];
+        assert_eq!(*to, SectorId::new(1, 0));
+        assert!(b.pos.x >= 0.0 && b.pos.x < SECTOR_SIZE, "rebased to the destination's local frame");
+        assert_eq!(b.owner, "gunner", "owner/damage carried across");
+    }
+
+    #[test]
+    fn a_hostile_transits_the_edge_and_pursues_a_departed_target() {
+        // Enemies chase ACROSS the seam: a marauder at the edge flies over it (transits like a player,
+        // no bounce), and one whose locked target transited out drives to the target's exit point.
+        let mut s = Sim::for_sector(SectorId::new(0, 0), Arc::new(Ruleset::builtin()));
+        // (a) a hostile crossing the edge transits instead of bouncing.
+        let mut m = Ship::npc(
+            ShipRole::Fighter,
+            HOSTILE_OWNER.to_string(),
+            crate::coords::GalaxyPos::new(crate::coords::Anchor::ORIGIN, SECTOR_SIZE - 2.0, 1500.0),
+            80,
+            0,
+            0,
+        );
+        m.vx = 8.0;
+        m.want_thrust = false;
+        s.ships.insert("npc:marauders:t".into(), m);
+        s.tick(1.0);
+        let transits = s.take_transits();
+        assert!(
+            transits.iter().any(|t| t.ship.id == "npc:marauders:t" && t.to == SectorId::new(1, 0)),
+            "the hostile handed off east instead of bouncing"
+        );
+        // (b) a hostile whose Engage target departed pursues the exit point (an out-of-bounds steer
+        // that will carry it over the same edge).
+        let mut hunter = Ship::npc(
+            ShipRole::Fighter,
+            HOSTILE_OWNER.to_string(),
+            crate::coords::GalaxyPos::new(crate::coords::Anchor::ORIGIN, 1000.0, 1500.0),
+            80,
+            0,
+            0,
+        );
+        hunter.ai = crate::ai::Objective::Engage { target: "prey".into(), since: 0 };
+        s.ships.insert("npc:marauders:h".into(), hunter);
+        s.departed.insert("prey".into(), (SECTOR_SIZE + 200.0, 1500.0, s.tick));
+        let x0 = s.ships["npc:marauders:h"].pos.x;
+        for _ in 0..30 {
+            s.tick(1.0);
+        }
+        let h = &s.ships["npc:marauders:h"];
+        assert!(
+            matches!(h.ai, crate::ai::Objective::Move { x, .. } if x > SECTOR_SIZE),
+            "the hunter committed to the exit point past the edge, got {:?}",
+            h.ai
+        );
+        assert!(h.pos.x > x0 + 10.0, "and is closing on it: {} -> {}", x0, h.pos.x);
     }
 
     #[test]
