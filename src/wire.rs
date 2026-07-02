@@ -67,6 +67,12 @@ pub enum ClientMsg {
         aim: Option<f32>,
         #[serde(default)]
         name: Option<String>,
+        /// World-axis strafe vector (each -1/0/+1) for direct WASD translation, decoupled from facing.
+        /// Defaults to `0` so an older client that omits it still parses.
+        #[serde(default)]
+        strafe_x: i32,
+        #[serde(default)]
+        strafe_y: i32,
     },
 
     /// Buy from the tech tree (server-priced and gated). `kind` is a tech node id
@@ -428,12 +434,12 @@ mod tests {
 
     #[test]
     fn client_input_roundtrips_with_defaults() {
-        let m = ClientMsg::Input { thrust: true, turn: -1, fire: true, aim: Some(1.5), name: None };
+        let m = ClientMsg::Input { thrust: true, turn: -1, fire: true, aim: Some(1.5), name: None, strafe_x: 0, strafe_y: 0 };
         let bytes = m.encode().unwrap();
         assert_eq!(ClientMsg::decode(&bytes).unwrap(), m);
         // Missing fields default (the frontend may omit them).
         let sparse = serde_json::from_str::<ClientMsg>(r#"{"t":"in","thrust":true}"#).unwrap();
-        assert_eq!(sparse, ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None });
+        assert_eq!(sparse, ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None, strafe_x: 0, strafe_y: 0 });
     }
 
     #[test]
@@ -458,7 +464,7 @@ mod tests {
     #[test]
     fn client_packet_roundtrips() {
         let pkt = ClientPacket {
-            input: Some(ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(0.5), name: None }),
+            input: Some(ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(0.5), name: None, strafe_x: 0, strafe_y: 0 }),
             input_seq: 42,
             reliable: vec![
                 SeqMsg { seq: 7, msg: ClientMsg::Build { kind: "tech-railgun".into() } },
@@ -473,7 +479,7 @@ mod tests {
     fn a_bare_client_msg_is_not_mistaken_for_a_packet() {
         // The host tries ClientPacket first, then falls back to a bare ClientMsg. A legacy bare message
         // MUST fail packet decode (deny_unknown_fields) so it is not silently swallowed as an empty packet.
-        let bare = ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None }.encode().unwrap();
+        let bare = ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None, strafe_x: 0, strafe_y: 0 }.encode().unwrap();
         assert!(ClientPacket::decode(&bare).is_err(), "bare ClientMsg must not decode as a ClientPacket");
         assert!(ClientMsg::decode(&bare).is_ok(), "bare ClientMsg still decodes on the fallback path");
     }

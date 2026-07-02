@@ -139,6 +139,29 @@ impl ShipEditor {
         Blueprint { id: self.slug(), name: self.name.clone(), params: vec![], root }
     }
 
+    /// Recover an editable grid design from a lowered [`Blueprint`] — the inverse of [`Self::to_blueprint`].
+    /// Used to open the editor on the player's **current** ship (its fitted `hull`) so editing modifies
+    /// the craft you actually fly, not a fresh starter. Only flat top-level object placements are
+    /// recovered (exactly what the editor produces); any nested sub-blueprints are skipped.
+    pub fn from_blueprint(bp: &Blueprint) -> Self {
+        let g = GRID;
+        let q = std::f32::consts::FRAC_PI_2;
+        let parts = bp
+            .root
+            .iter()
+            .filter_map(|p| match &p.kind {
+                crate::build::PlacementKind::Object { def } => Some(PlacedPart {
+                    def: def.clone(),
+                    gx: (p.at.x / g).round() as i32,
+                    gy: (p.at.y / g).round() as i32,
+                    rot: ((p.at.rot / q).round().rem_euclid(4.0)) as u8,
+                }),
+                _ => None,
+            })
+            .collect();
+        ShipEditor { name: if bp.name.is_empty() { "My Ship".into() } else { bp.name.clone() }, grid: g, parts }
+    }
+
     /// Resolve this design against a parts catalogue and return its live [`Loadout`] — the stats the UI
     /// shows while building, identical to what fitting it yields. `Err` only if a part id is unknown.
     pub fn preview(&self, catalog: &Catalog) -> Result<Loadout, String> {

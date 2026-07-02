@@ -85,11 +85,12 @@ pub const SHIP_R: f32 = 18.0;
 pub const MAX_SPEED: f32 = 16.0;
 /// Canonical thrust accel (world units / tick^2) — snappy off-the-line response.
 pub const THRUST: f32 = 0.95;
-/// Canonical per-tick velocity damping. Higher = more glide/momentum (still self-arresting). Tuned up
-/// from the old arcade `0.965` toward true Newtonian drift: a ship now coasts on its momentum and you
-/// fly it by managing inertia (thrust to build speed, thrust against it to shed it) rather than stopping
-/// dead the instant you release thrust. Still <1 so a drifting ship eventually settles.
-pub const DAMPING: f32 = 0.984;
+/// Canonical per-tick velocity damping. `1.0` = **true Newtonian drift**: a ship's velocity is changed
+/// ONLY by thrusters (and environmental fields), never by an invisible arcade friction. You build speed
+/// by thrusting and you shed it by thrusting against your motion — or you let the flight computer's
+/// auto-stabiliser fire retro thrusters for you (see the idle auto-brake in `tick`). There is no magic
+/// deceleration. (A nebula's drag and a stasis lock still bleed speed — those are physical fields.)
+pub const DAMPING: f32 = 1.0;
 /// Canonical turn rate (radians / tick) — tight mouse-aim tracking.
 pub const TURN_RATE: f32 = 0.22;
 /// Base hull / max hull at spawn (reference base; live value from [`Tunables::base_hp`]).
@@ -244,6 +245,12 @@ pub struct Ship {
     /// **Built design — cargo capacity** from the design's tanks/containers.
     #[serde(default)]
     pub cargo: f32,
+    /// **Built design — per-direction thrust authority** (craft frame, 8 bins of 45°; see
+    /// [`crate::shipyard::Loadout::thrust_profile`]). The flight computer can only push a direction as
+    /// hard as the thrusters mounted (± gimbal) toward it allow — place engines all around for full
+    /// strafe authority. `[1.0; 8]` for the stock hull.
+    #[serde(default = "ones_profile")]
+    pub thrust_profile: [f32; crate::shipyard::THRUST_BINS],
     /// Blueprint id this ship was built from, or `""` for the stock hull. Lets the renderer draw the
     /// player's actual design and the HUD name it.
     #[serde(default)]
@@ -279,6 +286,15 @@ pub struct Ship {
     pub want_turn: i32,
     #[serde(skip)]
     pub want_fire: bool,
+    /// **Desired translation** in WORLD axes (each -1/0/+1), from the pilot's strafe keys (WASD). The
+    /// flight computer fires whatever combination of thrusters best produces this net force with no net
+    /// torque (modelled here as omnidirectional thrust up to the ship's total), so movement is decoupled
+    /// from facing — you aim with the mouse and translate with the keys. `(0,0)` means "hold position":
+    /// the auto-stabiliser retro-thrusts to null residual velocity. Transient.
+    #[serde(skip)]
+    pub want_strafe_x: i32,
+    #[serde(skip)]
+    pub want_strafe_y: i32,
     #[serde(skip)]
     pub last_input_tick: u64,
     /// Objective-driven NPC brain (server-owned, transient — recomputed each tick with commitment, never
@@ -290,6 +306,11 @@ pub struct Ship {
 /// serde default for the built-design multipliers/mass: the stock hull is `1.0`.
 fn one_f32() -> f32 {
     1.0
+}
+
+/// serde default for the per-direction thrust profile: full authority every way (stock hull).
+fn ones_profile() -> [f32; crate::shipyard::THRUST_BINS] {
+    [1.0; crate::shipyard::THRUST_BINS]
 }
 
 impl Ship {
@@ -319,6 +340,7 @@ impl Ship {
             speed_mult: 1.0,
             thrust_mult: 1.0,
             cargo: 0.0,
+            thrust_profile: ones_profile(),
             hull: String::new(),
             weapon: default_weapon.clone(),
             weapons: vec![default_weapon],
@@ -333,6 +355,8 @@ impl Ship {
             want_thrust: false,
             want_turn: 0,
             want_fire: false,
+            want_strafe_x: 0,
+            want_strafe_y: 0,
             last_input_tick: tick,
             ai: crate::ai::Objective::Idle,
         }
@@ -378,6 +402,7 @@ impl Ship {
             speed_mult: if snap.speed_mult > 0.0 { snap.speed_mult } else { 1.0 },
             thrust_mult: if snap.thrust_mult > 0.0 { snap.thrust_mult } else { 1.0 },
             cargo: snap.cargo,
+            thrust_profile: snap.thrust_profile,
             hull: snap.hull.clone(),
             weapon: if snap.weapon.is_empty() { "blaster".into() } else { snap.weapon.clone() },
             weapons: if snap.weapons.is_empty() { vec![snap.weapon.clone()] } else { snap.weapons.clone() },
@@ -392,6 +417,8 @@ impl Ship {
             want_thrust: false,
             want_turn: 0,
             want_fire: false,
+            want_strafe_x: 0,
+            want_strafe_y: 0,
             last_input_tick: tick,
             ai: crate::ai::Objective::Idle,
         }
@@ -408,6 +435,17 @@ impl Ship {
         tun.thrust * (1.0 + self.speed_lv as f32 * tun.thruster_step) * self.thrust_mult
     }
 
+    /// The fraction (0..=1) of full thrust the flight computer can point along CRAFT-frame angle
+    /// `craft_ang` — linear interpolation of the design's 8-bin [`Self::thrust_profile`]. Forward is
+    /// craft angle `0`; a world direction `θ` samples at `θ - self.a`.
+    pub fn thrust_frac(&self, craft_ang: f32) -> f32 {
+        let n = crate::shipyard::THRUST_BINS;
+        let k = craft_ang.rem_euclid(std::f32::consts::TAU) / (std::f32::consts::TAU / n as f32);
+        let i = (k.floor() as usize) % n;
+        let f = k - k.floor();
+        self.thrust_profile[i] * (1.0 - f) + self.thrust_profile[(i + 1) % n] * f
+    }
+
     /// **Apply a built [`Loadout`](crate::shipyard::Loadout)** to this ship — the moment a design becomes
     /// the craft you fly. Hull, mass, handling, weapon mounts, shield and capacitor all come from the
     /// parts. Hull is healed to the new max so refitting at a station fixes you up; current minerals,
@@ -419,6 +457,7 @@ impl Ship {
         self.speed_mult = lo.speed_mult;
         self.thrust_mult = lo.thrust_mult;
         self.cargo = lo.cargo;
+        self.thrust_profile = lo.thrust_profile;
         self.hull = hull.to_string();
         if !lo.weapons.is_empty() {
             // Union the design's mounts into the unlocked set, and select the primary.
@@ -445,7 +484,7 @@ impl Ship {
     /// Reference max speed using the legacy default constants (kept for tests / callers without a
     /// ruleset in hand; matches [`max_speed_t`](Self::max_speed_t) under default tunables).
     pub fn max_speed(&self) -> f32 {
-        MAX_SPEED * (1.0 + self.speed_lv as f32 * 0.16)
+        MAX_SPEED * (1.0 + self.speed_lv as f32 * 0.16) * self.speed_mult
     }
 
     /// A serializable capture of this ship's persistent state, at id `id`.
@@ -473,6 +512,7 @@ impl Ship {
             speed_mult: self.speed_mult,
             thrust_mult: self.thrust_mult,
             cargo: self.cargo,
+            thrust_profile: self.thrust_profile,
             hull: self.hull.clone(),
             weapon: self.weapon.clone(),
             weapons: self.weapons.clone(),
@@ -656,6 +696,9 @@ pub struct Intent {
     pub fire: bool,
     pub aim: Option<f32>,
     pub name: Option<String>,
+    /// Desired translation in world axes (each -1/0/+1) from the strafe keys — see [`Ship::want_strafe_x`].
+    pub strafe_x: i32,
+    pub strafe_y: i32,
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -788,6 +831,10 @@ impl Sim {
                 let mut s = Ship::new(name, hue, tick, dw, base_hp);
                 s.outfit(&self.rules.tunables);
                 self.ships.insert(id.to_string(), s);
+                // Spawn flying a REAL, editable craft — the starter design — so the renderer draws actual
+                // parts from frame one (never the placeholder arrow) and the editor opens on YOUR ship.
+                // Everything is built from the same part system; the stock ship is just another design.
+                self.fit_design(id, &crate::editor::ShipEditor::starter().to_blueprint());
             }
         }
     }
@@ -921,6 +968,8 @@ impl Sim {
             let mut s = Ship::new(sanitize_name(&name), hue_fallback, tick, dw, base_hp);
             s.outfit(&self.rules.tunables);
             self.ships.insert(id.to_string(), s);
+            // Same as `join`: fly the starter design immediately so the ship is a real built craft.
+            self.fit_design(id, &crate::editor::ShipEditor::starter().to_blueprint());
         }
         if let Some(s) = self.ships.get_mut(id) {
             if let Some(n) = intent.name {
@@ -929,6 +978,8 @@ impl Sim {
             s.want_thrust = intent.thrust;
             s.want_turn = intent.turn.clamp(-1, 1);
             s.want_fire = intent.fire;
+            s.want_strafe_x = intent.strafe_x.clamp(-1, 1);
+            s.want_strafe_y = intent.strafe_y.clamp(-1, 1);
             if let Some(aim) = intent.aim {
                 let mut d = (aim - s.a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                     - std::f32::consts::PI;
@@ -1113,11 +1164,53 @@ impl Sim {
 
                 // Turn (button steering; mouse-aim already applied in apply_intent).
                 s.a = (s.a + s.want_turn as f32 * tun.turn_rate).rem_euclid(std::f32::consts::TAU);
-                // Thrust (gated by EMP).
-                if s.want_thrust && can_thrust {
+
+                // THRUSTERS — the ONLY source of self-propulsion (gated by EMP). Two ways to ask for force:
+                //   • `want_thrust`  → classic forward thrust along the ship's facing (NPC brains, legacy).
+                //   • `want_strafe_*`→ a world-axis translation vector (the pilot's WASD). The flight
+                //     computer auto-manages the thruster bank to produce this net force regardless of where
+                //     the nose points (modelled as omnidirectional thrust up to the ship's total), so you
+                //     translate with the keys and aim independently with the mouse.
+                // When NOTHING is asked for, the auto-stabiliser fires retro thrusters to cancel residual
+                // velocity — a real thruster firing, not invisible arcade friction (DAMPING is 1.0).
+                if can_thrust {
                     let acc = s.accel_t(&tun) * mobility * dt_scale;
-                    s.vx += s.a.cos() * acc;
-                    s.vy += s.a.sin() * acc;
+                    let mut driven = false;
+                    if s.want_thrust {
+                        // Forward burn: full authority requires engines that can point astern (craft
+                        // angle 0 = forward), which the profile encodes.
+                        let f = acc * s.thrust_frac(0.0);
+                        s.vx += s.a.cos() * f;
+                        s.vy += s.a.sin() * f;
+                        driven = true;
+                    }
+                    if s.want_strafe_x != 0 || s.want_strafe_y != 0 {
+                        let (dx, dy) = (s.want_strafe_x as f32, s.want_strafe_y as f32);
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len > 0.0 {
+                            // The wanted push in WORLD angle → craft angle → how hard the mounted
+                            // thrusters (with gimbal) can actually shove that way. A rear-engine-only
+                            // design strafes poorly; ring your ship with engines for full authority.
+                            let want = dy.atan2(dx);
+                            let f = acc * s.thrust_frac(want - s.a);
+                            s.vx += (dx / len) * f;
+                            s.vy += (dy / len) * f;
+                        }
+                        driven = true;
+                    }
+                    if !driven {
+                        // Auto-stabilise: retro-thrust to a stop, bounded by what the thrusters can
+                        // actually deliver AGAINST the current velocity (so a fast ship slows over
+                        // several ticks, and a ship with no retro authority takes longer to arrest).
+                        let spd = (s.vx * s.vx + s.vy * s.vy).sqrt();
+                        if spd > 1e-4 {
+                            let brake_ang = (-s.vy).atan2(-s.vx) - s.a;
+                            let brake = acc * s.thrust_frac(brake_ang);
+                            let k = ((spd - brake.min(spd)) / spd).max(0.0);
+                            s.vx *= k;
+                            s.vy *= k;
+                        }
+                    }
                 }
                 // ENVIRONMENTAL HAZARDS: gravity wells pull the ship inward; nebula clouds add drag.
                 // Read from the sector's deterministic field (a disjoint borrow from `ships`).
@@ -1761,7 +1854,10 @@ impl Sim {
             // Light strike hulls only for regular raids (the heavy "cruiser" is a boss, not a grunt). The
             // design gives the SILHOUETTE; HP is capped back to the tuned `enemy_hp` so a varied-looking
             // raid is NOT tankier/stronger than a plain marauder wave.
-            const ENEMY_DESIGNS: [&str; 3] = ["raider", "interceptor", "brawler"];
+            // A varied raid: light interceptors, raiders, brawlers, gunships, and the occasional heavy
+            // hauler/cruiser — every design is a real multi-part blueprint, so they look distinct in-game.
+            const ENEMY_DESIGNS: [&str; 6] =
+                ["raider", "interceptor", "brawler", "gunship", "hauler", "cruiser"];
             let pick = ENEMY_DESIGNS[((seed >> 20) as usize) % ENEMY_DESIGNS.len()];
             if let Ok(craft) =
                 crate::build::resolve_blueprint(&self.rules.catalog(), pick, &std::collections::BTreeMap::new())

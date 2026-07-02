@@ -20,6 +20,15 @@ use crate::build::{ObjectCategory, ResolvedCraft};
 /// the builtin "interceptor" lands a bit above 1.0 and the "hauler" a bit below.
 pub const REFERENCE_TWR: f32 = 6.0;
 
+/// How far a mounted thruster can GIMBAL (rotate) off its mounting to aim its thrust vector, radians.
+/// The flight computer swivels each engine toward the wanted force direction; beyond this it can only
+/// contribute the projection of what it reaches. ±60° — generous, but a craft with all engines facing
+/// one way still can't push the other way. Place thrusters facing in all directions for full authority.
+pub const THRUSTER_GIMBAL: f32 = std::f32::consts::FRAC_PI_3;
+
+/// Directions sampled for the per-direction thrust profile (craft frame, bin `k` = `k * 45°`).
+pub const THRUST_BINS: usize = 8;
+
 /// A non-fatal-to-fatal problem the designer should know about. Fatal issues make the craft
 /// **unflyable** (it would be a brick); the rest are penalties or advice.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +73,12 @@ pub struct Loadout {
     pub shield: i32,
     /// Energy capacitor from surplus reactor power.
     pub energy: f32,
+    /// **Per-direction thrust authority** (craft frame, [`THRUST_BINS`] bins of 45°, each 0..=1 of the
+    /// craft's best direction): how much of the total thrust the flight computer can actually point along
+    /// each direction, given where the thrusters are mounted and their ±[`THRUSTER_GIMBAL`] swivel. A
+    /// craft with engines facing all around gets a flat profile (full strafe authority); one with a
+    /// single rear engine is strong ahead and nearly dead astern.
+    pub thrust_profile: [f32; THRUST_BINS],
     /// Everything the designer should know — fatal first.
     pub issues: Vec<BuildIssue>,
 }
@@ -87,10 +102,26 @@ pub fn loadout_from_craft(craft: &ResolvedCraft) -> Loadout {
     let mut guns = 0u32;
     let mut armor_bonus = 0i32;
     let mut shield = 0i32;
+    // Per-direction thrust: each mounted thruster pushes along its mounting angle (craft frame), and can
+    // gimbal ±THRUSTER_GIMBAL toward the wanted direction, contributing the cosine of what's left.
+    let mut dir_thrust = [0.0f32; THRUST_BINS];
     for p in &craft.parts {
         match p.category {
             ObjectCategory::CommandCenter => has_command = true,
-            ObjectCategory::Thruster => has_thruster = true,
+            ObjectCategory::Thruster => {
+                has_thruster = true;
+                let f = p.stats.thrust.max(0.0);
+                for (k, d) in dir_thrust.iter_mut().enumerate() {
+                    let want = k as f32 * (std::f32::consts::TAU / THRUST_BINS as f32);
+                    let mut diff = (want - p.world.rot + std::f32::consts::PI)
+                        .rem_euclid(std::f32::consts::TAU)
+                        - std::f32::consts::PI;
+                    diff = (diff.abs() - THRUSTER_GIMBAL).max(0.0);
+                    if diff < std::f32::consts::FRAC_PI_2 {
+                        *d += f * diff.cos();
+                    }
+                }
+            }
             ObjectCategory::Weapon | ObjectCategory::Turret | ObjectCategory::Gun => {
                 if p.stats.weapon.is_some() {
                     guns += 1;
@@ -141,6 +172,20 @@ pub fn loadout_from_craft(craft: &ResolvedCraft) -> Loadout {
 
     issues.sort_by_key(|i| if i.is_fatal() { 0 } else { 1 });
 
+    // Normalise the directional profile to the craft's BEST direction (that's what `thrust_mult`
+    // already measures), so each bin is the fraction of full authority available that way. A tiny floor
+    // keeps every craft controllable (attitude jets), just badly, off-axis.
+    let peak = dir_thrust.iter().cloned().fold(0.0f32, f32::max);
+    let thrust_profile = if peak > 0.0 {
+        let mut prof = [0.0f32; THRUST_BINS];
+        for (o, d) in prof.iter_mut().zip(dir_thrust.iter()) {
+            *o = (d / peak).clamp(0.08, 1.0);
+        }
+        prof
+    } else {
+        [1.0; THRUST_BINS] // no thrusters: moot (fatal NoThruster) — keep neutral
+    };
+
     Loadout {
         max_hp: (craft.total_hp + armor_bonus).max(1),
         mass,
@@ -152,6 +197,7 @@ pub fn loadout_from_craft(craft: &ResolvedCraft) -> Loadout {
         cargo: craft.storage_capacity,
         shield: shield.max(0),
         energy,
+        thrust_profile,
         issues,
     }
 }

@@ -3,6 +3,9 @@
 > "I hate sector clamping — the sectors should ADAPT to players and other servers should automatically
 > take over." — Leif (`STATE-MODEL.md`, verbatim)
 
+> "Yes the sectors should be dynamic and not chunks AND they should be able to transparently traverse
+> chunks without noticing. the api should handle it for them." — Leif (2026-07-02, verbatim)
+
 This is the answer to that directive, and to "make chunks/sections seamless — no lag transitions and
 ideally no transition required at all… recursive AABB which follows the player and its ships and
 factions." It is the design and API of `src/domain.rs`.

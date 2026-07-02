@@ -430,7 +430,7 @@ mod tests {
             tick,
             player: player.into(),
             seq,
-            msg: ClientMsg::Input { thrust: true, turn: 1, fire: true, aim: Some(0.7), name: None },
+            msg: ClientMsg::Input { thrust: true, turn: 1, fire: true, aim: Some(0.7), name: None, strafe_x: 0, strafe_y: 0 },
         }
     }
 
@@ -503,7 +503,7 @@ mod tests {
             tick: t + 1,
             player: p.into(),
             seq: 2,
-            msg: ClientMsg::Input { thrust: false, turn: 0, fire: true, aim: Some(0.0), name: None },
+            msg: ClientMsg::Input { thrust: false, turn: 0, fire: true, aim: Some(0.0), name: None, strafe_x: 0, strafe_y: 0 },
         });
         // Check right after the shot is fired, before it has flown far (bullets travel ~30/tick).
         r.advance_to(t + 3);

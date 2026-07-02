@@ -34,6 +34,11 @@ fn one_f32_snap() -> f32 {
     1.0
 }
 
+/// serde default for the per-direction thrust profile on a pre-profile snapshot: full authority.
+fn ones_profile_snap() -> [f32; crate::shipyard::THRUST_BINS] {
+    [1.0; crate::shipyard::THRUST_BINS]
+}
+
 /// A serializable capture of one ship's authoritative, persistent state. The newer loadout/tech fields
 /// carry `#[serde(default)]` so a v1 snapshot (pre-weapons) still decodes — the ship simply comes back
 /// with the default blaster.
@@ -79,6 +84,11 @@ pub struct ShipSnap {
     /// Built-design cargo capacity.
     #[serde(default)]
     pub cargo: f32,
+    /// Built-design per-direction thrust authority (craft frame, 8 bins of 45° — see
+    /// [`crate::shipyard::Loadout::thrust_profile`]). Carried so directional handling survives
+    /// failover/transit; defaults to full authority for a v1 snapshot.
+    #[serde(default = "ones_profile_snap")]
+    pub thrust_profile: [f32; crate::shipyard::THRUST_BINS],
     /// Blueprint id the ship was built from (`""` = stock hull).
     #[serde(default)]
     pub hull: String,
@@ -229,8 +239,8 @@ mod tests {
         }
         apply_client_msg(&mut s, "nodeA", ClientMsg::Build { kind: "tech-missile".into() });
         apply_client_msg(&mut s, "nodeA", ClientMsg::Weapon { id: "missile".into() });
-        apply_client_msg(&mut s, "nodeA", ClientMsg::Input { thrust: true, turn: 0, fire: true, aim: Some(0.0), name: None });
-        apply_client_msg(&mut s, "nodeB", ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(1.0), name: None });
+        apply_client_msg(&mut s, "nodeA", ClientMsg::Input { thrust: true, turn: 0, fire: true, aim: Some(0.0), name: None, strafe_x: 0, strafe_y: 0 });
+        apply_client_msg(&mut s, "nodeB", ClientMsg::Input { thrust: true, turn: 1, fire: false, aim: Some(1.0), name: None, strafe_x: 0, strafe_y: 0 });
         s.tick(1.0);
         s.tick(1.0);
         s

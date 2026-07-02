@@ -150,7 +150,7 @@ fn busy_sim() -> Sim {
     apply_client_msg(&mut s, "a", ClientMsg::Build { kind: "tech-missile".into() });
     apply_client_msg(&mut s, "a", ClientMsg::Weapon { id: "missile".into() });
     for _ in 0..3 {
-        apply_client_msg(&mut s, "a", ClientMsg::Input { thrust: true, turn: 0, fire: true, aim: Some(0.0), name: None });
+        apply_client_msg(&mut s, "a", ClientMsg::Input { thrust: true, turn: 0, fire: true, aim: Some(0.0), name: None, strafe_x: 0, strafe_y: 0 });
         s.tick(1.0);
     }
     s

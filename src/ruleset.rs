@@ -1145,6 +1145,30 @@ fn builtin_objects() -> Vec<ObjectDef> {
         ObjectDef::new("struct-corner", "Corner Brace", Structure, Shape2D::Triangle { w: 2.0, h: 2.0, skew: 0.0 })
             .mass(1.4)
             .hp(160),
+        // Structure comes in many shapes — the hull vocabulary (wedges, tapers, hexes, spars, fins) that
+        // lets a design read as a SHIP, not a pile of squares. Rotate them (R) and override w/h/r per
+        // placement (`Placement::params`) to customise a block's shape further.
+        ObjectDef::new("struct-wedge", "Structure Wedge", Structure, Shape2D::Triangle { w: 2.0, h: 2.0, skew: 1.0 })
+            .mass(1.4)
+            .hp(170),
+        ObjectDef::new("struct-taper", "Tapered Block", Structure, Shape2D::Trapezoid { top_w: 1.0, bottom_w: 2.0, h: 2.0, top_skew: 0.0 })
+            .mass(1.7)
+            .hp(190),
+        ObjectDef::new("struct-hex", "Hex Frame", Structure, Shape2D::RegularPolygon { sides: 6, r: 1.15 })
+            .mass(1.8)
+            .hp(210),
+        ObjectDef::new("struct-tri", "Tri Frame", Structure, Shape2D::RegularPolygon { sides: 3, r: 1.2 })
+            .mass(1.1)
+            .hp(140),
+        ObjectDef::new("struct-spar", "Spar", Structure, Shape2D::Rect { w: 2.0, h: 0.7 })
+            .mass(0.8)
+            .hp(110),
+        ObjectDef::new("struct-half", "Half Block", Structure, Shape2D::Rect { w: 1.0, h: 2.0 })
+            .mass(1.0)
+            .hp(130),
+        ObjectDef::new("struct-fin", "Fin", Structure, Shape2D::Triangle { w: 1.0, h: 2.4, skew: 0.8 })
+            .mass(0.7)
+            .hp(90),
         ObjectDef::new("container", "Cargo Container", Container, Shape2D::Rect { w: 2.0, h: 2.0 })
             .mass(1.5)
             .hp(140)

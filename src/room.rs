@@ -108,8 +108,8 @@ pub fn apply_client_msg(sim: &mut Sim, from: &str, msg: ClientMsg) -> bool {
             // already trusted from the authenticated `from`.
             sim.join(from, &name, hue);
         }
-        ClientMsg::Input { thrust, turn, fire, aim, name } => {
-            sim.apply_intent(from, Intent { thrust, turn, fire, aim, name }, hue);
+        ClientMsg::Input { thrust, turn, fire, aim, name, strafe_x, strafe_y } => {
+            sim.apply_intent(from, Intent { thrust, turn, fire, aim, name, strafe_x, strafe_y }, hue);
         }
         ClientMsg::Build { kind } => {
             sim.buy_tech(from, tech_node_for(&kind));
@@ -509,7 +509,7 @@ mod tests {
         sim.join(p, "P", hue_for(p));
 
         let thrust = |seq: u64| ClientPacket {
-            input: Some(ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None }),
+            input: Some(ClientMsg::Input { thrust: true, turn: 0, fire: false, aim: None, name: None, strafe_x: 0, strafe_y: 0 }),
             input_seq: seq,
             reliable: vec![],
         };
@@ -520,7 +520,7 @@ mod tests {
             &mut sim,
             p,
             ClientPacket {
-                input: Some(ClientMsg::Input { thrust: false, turn: 0, fire: false, aim: None, name: None }),
+                input: Some(ClientMsg::Input { thrust: false, turn: 0, fire: false, aim: None, name: None, strafe_x: 0, strafe_y: 0 }),
                 input_seq: 6,
                 reliable: vec![],
             },
@@ -598,7 +598,7 @@ mod tests {
         apply_client_msg(
             &mut sim,
             "p",
-            ClientMsg::Input { thrust: false, turn: 0, fire: false, aim: None, name: Some("nm".into()) },
+            ClientMsg::Input { thrust: false, turn: 0, fire: false, aim: None, name: Some("nm".into()), strafe_x: 0, strafe_y: 0 },
         );
         sim.tick(1.0);
         let snap = build_snapshot(&sim, "0_0", "h", 0);
