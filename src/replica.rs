@@ -457,6 +457,31 @@ mod tests {
     }
 
     #[test]
+    fn applying_a_design_through_the_host_rebuilds_your_ship() {
+        // The EXACT browser Apply path: join via apply_local_now, then FitDesign via apply_local_now —
+        // the home sim's ship must come out flying the composed design (hull = the design's JSON), so
+        // "press Apply / leave the editor" REALLY turns the player into what they built.
+        let mut host = SectorHost::from_home(Sim::new());
+        host.apply_local_now("me", ClientMsg::Join { name: "Leif".into(), cap: None });
+        // Compose a distinct design in the editor model (starter + an extra armored prow).
+        let mut ed = crate::editor::ShipEditor::starter();
+        ed.name = "Reaver".into();
+        ed.place("armor-hex", 0, 4, 0);
+        let design = ed.to_blueprint();
+        let expected = serde_json::to_string(&design).unwrap_or_default();
+        host.apply_local_now("me", ClientMsg::FitDesign { design });
+        let ship = host.home_sim().ships.get("me").expect("joined");
+        assert_eq!(ship.hull, expected, "the ship IS the design (inline blueprint JSON in hull)");
+        assert!(ship.mass > 1.0, "mass comes from the parts");
+        // And an UNFLYABLE design (no thruster/command) is rejected — the ship keeps its craft.
+        let mut brick = crate::editor::ShipEditor::new("Brick");
+        brick.place("struct-block", 0, 0, 0);
+        host.apply_local_now("me", ClientMsg::FitDesign { design: brick.to_blueprint() });
+        let ship = host.home_sim().ships.get("me").expect("still there");
+        assert_eq!(ship.hull, expected, "a brick never replaces a flyable ship");
+    }
+
+    #[test]
     fn two_replicas_from_the_same_inputs_reach_identical_state() {
         // The premise of "everyone runs the server and they agree": two replicas, the SAME tick-tagged
         // inputs scheduled in DIFFERENT order, must end bit-identical. If this ever fails, the quorum
