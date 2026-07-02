@@ -1395,6 +1395,45 @@ fn builtin_blueprints() -> Vec<Blueprint> {
         ],
     );
 
+    // OUTPOST — a marauder nest STRUCTURE (VISION.md §23): a hex core ringed by armor with paired
+    // turrets and a stores tank. No thrusters — it is a PLACE, built from the same part/blueprint
+    // system as every ship, so it renders, collides, takes block damage and regrows like anything else.
+    let outpost = bp(
+        "outpost",
+        "Marauder Outpost",
+        vec![
+            Placement::object("struct-hex", Transform2D::new(0.0, 0.0, 0.0))
+                .with_children(vec![Placement::object("command-center", Transform2D::default())]),
+            Placement::object("struct-block", Transform2D::new(0.0, 2.2, 0.0)),
+            Placement::object("struct-block", Transform2D::new(0.0, -2.2, 0.0))
+                .with_children(vec![Placement::object("reactor", Transform2D::default())]),
+            Placement::object("struct-half", Transform2D::new(-2.0, 0.0, 0.0)),
+            Placement::object("struct-half", Transform2D::new(2.0, 0.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(-2.6, 2.0, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(2.6, 2.0, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(0.0, 3.6, 0.0)),
+            Placement::object("armor-plate", Transform2D::new(0.0, -3.6, 0.0)),
+            Placement::object("tank-round", Transform2D::new(-2.6, -2.0, 0.0)),
+        ],
+    );
+
+    // BASTION — the frontier fortress: an outpost grown into a bristling ring (high-tier lairs).
+    let bastion = bp(
+        "bastion",
+        "Marauder Bastion",
+        vec![
+            Placement::blueprint("outpost", Transform2D::new(0.0, 0.0, 0.0)),
+            Placement::object("struct-taper", Transform2D::new(-4.2, 0.0, std::f32::consts::FRAC_PI_2)),
+            Placement::object("struct-taper", Transform2D::new(4.2, 0.0, -std::f32::consts::FRAC_PI_2)),
+            Placement::blueprint("turret-pod", Transform2D::new(0.0, 5.2, 0.0)),
+            Placement::blueprint("turret-pod", Transform2D::new(0.0, -5.2, 0.0)),
+            Placement::object("missile-rack", Transform2D::new(-4.2, 2.4, 0.0)),
+            Placement::object("missile-rack", Transform2D::new(4.2, 2.4, 0.0)),
+            Placement::object("armor-hex", Transform2D::new(-4.2, -2.6, 0.0)),
+            Placement::object("armor-hex", Transform2D::new(4.2, -2.6, 0.0)),
+        ],
+    );
+
     // BRAWLER — an armored bruiser: heavy plating + a forward gun, slow but very tough.
     let brawler = bp(
         "brawler",
@@ -1444,7 +1483,7 @@ fn builtin_blueprints() -> Vec<Blueprint> {
         ],
     );
 
-    vec![pod, scout, core, wing, engine, nose, interceptor, gunship, hauler, raider, brawler, cruiser]
+    vec![pod, scout, core, wing, engine, nose, interceptor, gunship, hauler, raider, brawler, cruiser, outpost, bastion]
 }
 
 /// A small hot-reloadable shape library, referenced by id or edited to restyle many blocks at once.

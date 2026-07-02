@@ -146,6 +146,12 @@ pub struct Rock {
     pub hp: u32,
     pub cx: i32,
     pub cy: i32,
+    /// Physical radius, world units — from pebbles (~10) to rare giants (~140). Drives collision,
+    /// mining reach, bullet impact and the rendered size, so what you see IS what you hit.
+    pub r: f32,
+    /// Composition: 0 = rocky, 1 = ice, 2 = metal-rich, 3 = crystal. Regional (a coarse noise field),
+    /// so belts read as ice fields / ore fields / crystal gardens, not confetti. Scales value.
+    pub kind: u8,
 }
 
 /// Asteroid grid cells per sector edge (`SECTOR_SIZE / ROCK_CELL`). A sector-local cell `cx ∈ 0..30` maps to
@@ -166,7 +172,7 @@ pub fn rock_in_cell_at(sector: SectorId, cx: i32, cy: i32) -> Option<Rock> {
     let r = rock_world(gcx, gcy)?;
     let x = r.x - sector.sx as f32 * SECTOR_SIZE;
     let y = r.y - sector.sy as f32 * SECTOR_SIZE;
-    Some(Rock { x, y, val: r.val, hp: r.hp, cx, cy })
+    Some(Rock { x, y, val: r.val, hp: r.hp, cx, cy, r: r.r, kind: r.kind })
 }
 
 /// The deterministic asteroid (if any) for **home-sector** grid cell `(cx, cy)`. Back-compat shim equal to
@@ -212,12 +218,44 @@ pub fn rock_world(gcx: i32, gcy: i32) -> Option<Rock> {
         return None;
     }
     let span = ROCK_MAX_VAL - ROCK_MIN_VAL;
-    // Belt cores are RICHER: mineral value scales up toward the density peak, so venturing into the
-    // thick of a field pays better than skimming its edge.
+    // SIZE: cube-biased so most rocks are small/medium and giants are rare landmarks; belts thicken
+    // their cores (density scales size a little). Radius caps under half a cell so neighbours clear.
+    let su = (cell_hash(gcx, gcy, "size") % 1000) as f32 / 1000.0;
+    let r = (10.0 + 130.0 * su * su * su) * (0.8 + 0.5 * t);
+    // KIND: a coarse composition field — whole regions read as ice fields / ore belts / crystal
+    // gardens rather than per-rock confetti; a small hash jitter salts the borders.
+    let comp = crate::noise::fbm2(gcx as f32 * 0.013, gcy as f32 * 0.013, 3, 31);
+    let kj = (cell_hash(gcx, gcy, "kind") % 100) as f32 / 100.0;
+    let kind: u8 = if comp < 0.42 {
+        0 // rocky
+    } else if comp < 0.56 {
+        if kj < 0.85 { 1 } else { 0 } // ice
+    } else if comp < 0.7 {
+        if kj < 0.8 { 2 } else { 0 } // metal-rich
+    } else if kj < 0.6 {
+        3 // crystal
+    } else {
+        2
+    };
+    // VALUE: belt cores are richer, big rocks hold more, and composition multiplies (metal 1.6x,
+    // crystal 2.4x, ice 0.8x) — venturing deep into the right belt pays.
     let base = cell_hash(gcx, gcy, "val") % (span + 1);
-    let val = ROCK_MIN_VAL + ((base as f32 * (0.6 + 0.4 * t)) as u32).min(span);
-    let hp = 18 + (cell_hash(gcx, gcy, "hp") % 30);
-    Some(Rock { x: gcx as f32 * ROCK_CELL + ox * ROCK_CELL, y: gcy as f32 * ROCK_CELL + oy * ROCK_CELL, val, hp, cx: lcx, cy: lcy })
+    let kind_mult = [1.0f32, 0.8, 1.6, 2.4][kind as usize];
+    let size_mult = 0.6 + r / 90.0;
+    let val = ROCK_MIN_VAL
+        + (((base as f32 * (0.6 + 0.4 * t)) * kind_mult * size_mult) as u32).min(span * 3);
+    // HP scales with volume-ish so a giant is a real excavation, a pebble pops.
+    let hp = (10.0 + r * 0.9) as u32 + (cell_hash(gcx, gcy, "hp") % 14);
+    Some(Rock {
+        x: gcx as f32 * ROCK_CELL + ox * ROCK_CELL,
+        y: gcy as f32 * ROCK_CELL + oy * ROCK_CELL,
+        val,
+        hp,
+        cx: lcx,
+        cy: lcy,
+        r,
+        kind,
+    })
 }
 
 /// A marauder **LAIR** — a deterministic worldgen feature: the anchor of a resident hostile garrison
@@ -1234,6 +1272,7 @@ impl Sim {
             v.sort();
             v
         };
+        let mut rock_rams: Vec<(String, i32)> = Vec::new(); // kinetic asteroid impacts, applied post-loop
         for id in &ids {
             let drop = {
                 let s = &self.ships[id];
@@ -1246,6 +1285,8 @@ impl Sim {
 
             // Cells this ship is in mining reach of this tick: (cx, cy, rock value, rock base hp).
             let mut mine_cells: Vec<(i32, i32, u32, u32)> = Vec::new();
+            // Solid asteroid overlaps to resolve after the ship borrow ends: (rock x, y, radius).
+            let mut rock_contacts: Vec<(f32, f32, f32)> = Vec::new();
             let mut transit: Option<Transit> = None;
             {
                 let s = self.ships.get_mut(id).expect("present");
@@ -1438,7 +1479,7 @@ impl Sim {
                 // scoop up. Collect the cells in reach here; apply the damage after the `s` borrow ends.
                 if transit.is_none() {
                     let (sx, sy) = (s.pos.x, s.pos.y);
-                    let reach = SHIP_R + 22.0;
+                    let reach = SHIP_R + 150.0; // cell scan reach; per-rock tests below use true radii
                     let min_cx = ((sx - reach) / ROCK_CELL).floor() as i32;
                     let max_cx = ((sx + reach) / ROCK_CELL).floor() as i32;
                     let min_cy = ((sy - reach) / ROCK_CELL).floor() as i32;
@@ -1453,10 +1494,50 @@ impl Sim {
                             }
                             let ddx = r.x - sx;
                             let ddy = r.y - sy;
-                            if ddx * ddx + ddy * ddy <= reach * reach {
+                            let d2 = ddx * ddx + ddy * ddy;
+                            // Mining: grind what your beam can touch (the rock's REAL radius).
+                            if d2 <= (SHIP_R + r.r + 14.0).powi(2) {
                                 mine_cells.push((cx, cy, r.val, r.hp));
                             }
+                            // SOLID: asteroids are matter, not decoration — you cannot fly through
+                            // one. Record the overlap; resolved just below (after this borrow ends).
+                            if d2 < (SHIP_R * 0.75 + r.r).powi(2) {
+                                rock_contacts.push((r.x, r.y, r.r));
+                            }
                         }
+                    }
+                }
+            }
+
+            // Resolve rock contacts: push the hull out along the contact normal, kill the inward
+            // velocity with a modest bounce, and take KINETIC damage that scales with how hard the
+            // impact was (shield-soaked like any hit — grazing a pebble stings, slamming a giant at
+            // full burn wrecks you). Deterministic: rocks are static worldgen.
+            if !rock_contacts.is_empty()
+                && let Some(s) = self.ships.get_mut(id)
+            {
+                for (rx, ry, rr) in rock_contacts {
+                    let dx = s.pos.x - rx;
+                    let dy = s.pos.y - ry;
+                    let d = (dx * dx + dy * dy).sqrt().max(0.001);
+                    let min_d = SHIP_R * 0.75 + rr;
+                    if d >= min_d {
+                        continue;
+                    }
+                    let (nx, ny) = (dx / d, dy / d);
+                    // Impact speed INTO the rock (before we cancel it) drives the damage.
+                    let closing = -(s.vx * nx + s.vy * ny);
+                    s.pos.x = rx + nx * min_d;
+                    s.pos.y = ry + ny * min_d;
+                    let vn = s.vx * nx + s.vy * ny;
+                    if vn < 0.0 {
+                        // Reflect the normal component with a dull stone bounce (0.35 restitution).
+                        s.vx -= (1.0 + 0.35) * vn * nx;
+                        s.vy -= (1.0 + 0.35) * vn * ny;
+                    }
+                    if closing > 4.0 {
+                        let dmg = (0.6 * closing * closing) as i32;
+                        rock_rams.push((id.clone(), dmg.min(120)));
                     }
                 }
             }
@@ -1480,6 +1561,10 @@ impl Sim {
             for (cx, cy, val, base_hp) in mine_cells {
                 self.damage_rock(cx, cy, base_hp, val, mine_rate, now);
             }
+        }
+        // Kinetic asteroid impacts (shield-soaked; the rock is the attacker in the feed).
+        for (victim, dmg) in rock_rams {
+            self.apply_damage(&victim, dmg, "asteroid", now);
         }
 
         // --- Pass 1b: damage-over-time (Burn) and lethal hazards (black-hole event horizons). Collect
@@ -2076,6 +2161,23 @@ impl Sim {
         const HEAVY: [&str; 3] = ["gunship", "hauler", "cruiser"];
         let h = fnv1a(&format!("{}:{slot}:design", lair.seed));
         let catalog = self.rules.catalog();
+        // SLOT 0 IS THE NEST ITSELF: a fortified STRUCTURE (outpost; bastion on the frontier) built
+        // from the same part system as every ship — it renders, collides, peels and regrows like one.
+        // No thrusters, huge mass: it holds its ground; kill its core to break the nest.
+        if slot == 0 {
+            let pick = if lair.tier >= 4 { "bastion" } else { "outpost" };
+            if let Ok(craft) =
+                crate::build::resolve_blueprint(&catalog, pick, &std::collections::BTreeMap::new())
+            {
+                let lo = crate::shipyard::loadout_from_craft(&craft);
+                s.apply_loadout(&lo, pick); // structures need not be flyable
+            }
+            let hp = ((tun.enemy_hp.max(1) as f32) * (2.5 + 0.6 * lair.tier as f32)) as i32;
+            s.max_hp = hp.max(1);
+            s.hp = s.max_hp;
+            s.guns = s.guns.min(2);
+            return;
+        }
         // Tier 3+: nearly half the garrison are grammar-grown one-offs.
         if lair.tier >= 3 && h % 100 < 45 {
             let seed = ((lair.seed as u64) << 8) | slot as u64;
@@ -2510,7 +2612,7 @@ impl Sim {
             {
                 continue;
             }
-            if (r.x - x).powi(2) + (r.y - y).powi(2) <= ROCK_R * ROCK_R {
+            if (r.x - x).powi(2) + (r.y - y).powi(2) <= (r.r + 4.0).powi(2) {
                 return Some((cx, cy));
             }
         }
@@ -3281,6 +3383,20 @@ mod tests {
 
     /// Clear every faction's roster + autonomy so no NPC fleet ships spawn — for tests that assert
     /// pure single-ship mechanics (counts, snapshot ordering, missile targeting) without fleet noise.
+    /// A spot whose 3x3 rock-cell neighbourhood is empty — combat tests pin ships here so the new
+    /// SOLID asteroids can't shove them off their firing line. Deterministic (worldgen scan).
+    fn rock_free_spot(s: &Sim) -> (f32, f32) {
+        for cy in 3..27 {
+            for cx in 3..27 {
+                let clear = (-1..=1).all(|dy| (-1..=1).all(|dx| s.rock(cx + dx, cy + dy).is_none()));
+                if clear {
+                    return (cx as f32 * ROCK_CELL + 150.0, cy as f32 * ROCK_CELL + 150.0);
+                }
+            }
+        }
+        (SECTOR_SIZE / 2.0, SECTOR_SIZE / 2.0)
+    }
+
     fn solo(s: &mut Sim) {
         for f in s.factions.values_mut() {
             f.units.clear();
@@ -3541,6 +3657,64 @@ mod tests {
     }
 
     #[test]
+    fn rocks_vary_from_pebbles_to_giants_with_regional_kinds() {
+        // Procedural variety (VISION.md §22/§23): sizes span pebbles to giant landmarks, and
+        // composition is regional (several kinds present over a wide scan), all pure worldgen.
+        let (mut min_r, mut max_r) = (f32::MAX, 0.0f32);
+        let mut kinds = std::collections::BTreeSet::new();
+        for gx in -300..300 {
+            for gy in -300..300 {
+                if let Some(r) = rock_world(gx, gy) {
+                    min_r = min_r.min(r.r);
+                    max_r = max_r.max(r.r);
+                    kinds.insert(r.kind);
+                }
+            }
+        }
+        assert!(min_r < 20.0, "pebbles exist: {min_r}");
+        assert!(max_r > 100.0, "giants exist: {max_r}");
+        assert!(kinds.len() >= 3, "regional composition variety: {kinds:?}");
+    }
+
+    #[test]
+    fn flying_into_an_asteroid_is_a_solid_kinetic_impact() {
+        // Asteroids are MATTER: a ship at full burn into a rock is stopped at its surface and takes
+        // kinetic damage through the normal (shield-soaked) path — no more flying through scenery.
+        let mut s = Sim::new();
+        s.join("p", "leif", 0);
+        solo(&mut s);
+        // Find a real rock in this sector and charge straight at it.
+        let rock = (0..ROCKS_PER_SECTOR)
+            .flat_map(|cx| (0..ROCKS_PER_SECTOR).map(move |cy| (cx, cy)))
+            .find_map(|(cx, cy)| s.rock(cx, cy))
+            .expect("the belt worldgen leaves at least one rock in a sector");
+        let start_hp = {
+            let p = s.ships.get_mut("p").unwrap();
+            p.max_shield = 0; // read the impact straight off the hull
+            p.shield = 0;
+            p.pos.x = rock.x - (rock.r + SHIP_R + 30.0);
+            p.pos.y = rock.y;
+            p.vx = 14.0; // full burn into the face
+            p.vy = 0.0;
+            p.a = 0.0;
+            p.hp
+        };
+        for _ in 0..30 {
+            // Keep burning INTO the rock (W forward, aimed east) so the first contact is a hard one.
+            s.apply_intent("p", Intent { strafe_y: 1, aim: Some(0.0), ..Default::default() }, 0);
+            s.tick(1.0);
+        }
+        let p = &s.ships["p"];
+        let d = ((p.pos.x - rock.x).powi(2) + (p.pos.y - rock.y).powi(2)).sqrt();
+        assert!(
+            d >= SHIP_R * 0.7 + rock.r - 1.0,
+            "the hull stopped at the surface (d={d}, rock r={})",
+            rock.r
+        );
+        assert!(p.hp < start_hp, "the impact hurt: {} -> {}", start_hp, p.hp);
+    }
+
+    #[test]
     fn a_bullet_crossing_the_edge_is_handed_off_not_dropped() {
         // The seam is invisible for rounds too: a bullet that flies off the east edge is rebased into
         // the neighbour's local frame and queued for the host to route (like a ship Transit) — it does
@@ -3712,20 +3886,21 @@ mod tests {
         let mut s = arena();
         s.join("gunner", "G", 10);
         s.join("target", "T", 20);
+        let (fx, fy) = rock_free_spot(&s);
         {
             let g = s.ships.get_mut("gunner").unwrap();
             g.weapons.push("laser".into());
             g.weapon = "laser".into();
-            g.pos.x = 500.0;
-            g.pos.y = 500.0;
+            g.pos.x = fx;
+            g.pos.y = fy;
             g.a = 0.0;
             g.vx = 0.0;
             g.vy = 0.0;
         }
         {
             let t = s.ships.get_mut("target").unwrap();
-            t.pos.x = 650.0; // within laser range
-            t.pos.y = 500.0;
+            t.pos.x = fx + 150.0; // within laser range
+            t.pos.y = fy;
             t.hp = 200;
             t.max_hp = 200;
             t.vx = 0.0;
@@ -3735,13 +3910,13 @@ mod tests {
         for _ in 0..10 {
             {
                 let t = s.ships.get_mut("target").unwrap();
-                t.pos.x = 650.0;
-                t.pos.y = 500.0;
+                t.pos.x = fx + 150.0;
+                t.pos.y = fy;
             }
             {
                 let g = s.ships.get_mut("gunner").unwrap();
-                g.pos.x = 500.0;
-                g.pos.y = 500.0;
+                g.pos.x = fx;
+                g.pos.y = fy;
                 g.a = 0.0;
             }
             s.apply_intent("gunner", Intent { fire: true, aim: Some(0.0), ..Default::default() }, 10);

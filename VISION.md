@@ -111,3 +111,11 @@ whole ship in one pass, getting its AABB efficiently, and caching it.)
 ### 21 — enemy factions: presence, not popups (2026-07-02)
 
 > three overpowered enemies spawning right on top of you is not very fun. Make a proper enemy faction and spawning system. they should already be there and not just popup. It should feel like exploring and conquering not like an arcade with ships spawning on top of you. and we need a lot more diversity for the ships. Note everything i say down verbatim.
+
+### 22 — facing, physics, collidable everything, asteroid variety, n-body future (2026-07-02)
+
+> The ship is facing the wrong way. Our thruster system needs to be physically accurate. Do a full update on the physics and make everything collidable and make all asteroids procedural and beautiful and of huge and small nature - later we will add nbody simulation to simulate entire galaxies properly on this huge player driven server.
+
+### 23 — procgen structures + asteroid types, used everywhere (2026-07-02)
+
+> Create or expand the procgen system to support artifical structures like outposts and bases and more asteroid types and make sure its used everywhere - instead of the current small ugly blobs as "asteroids" - document all i say verbatim
