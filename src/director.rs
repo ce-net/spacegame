@@ -160,6 +160,34 @@ pub async fn restore_snapshot(ce: &CeClient, cid: &str) -> Result<Sim> {
     Ok(snap.restore())
 }
 
+/// The on-disk snapshot file for a sector, relative to the host's run directory (the ceapp daemon's
+/// CWD, e.g. `/opt/ce-build/spacegame-run`). THE restart-persistence anchor: pubsub announces die with
+/// their announcer, but this file is still here when the daemon comes back.
+pub fn snapshot_file(sector: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("snapshots").join(format!("{sector}.bin"))
+}
+
+/// Persist the sector's full snapshot to its local file (atomic tmp + rename), so a restarted host
+/// resumes THIS state even if the mesh has no live announcer to ask. Pairs with [`load_snapshot_file`].
+pub fn persist_snapshot_file(sector: &str, sim: &Sim) -> Result<()> {
+    let snap = SectorSnapshot::capture(sim);
+    let bytes = snap.encode().context("encode snapshot for file")?;
+    let path = snapshot_file(sector);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create snapshots dir")?;
+    }
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, &bytes).context("write snapshot tmp")?;
+    std::fs::rename(&tmp, &path).context("rename snapshot into place")?;
+    Ok(())
+}
+
+/// Load the sector's locally persisted snapshot, if any (corrupt/missing → `None`).
+pub fn load_snapshot_file(sector: &str) -> Option<SectorSnapshot> {
+    let bytes = std::fs::read(snapshot_file(sector)).ok()?;
+    SectorSnapshot::decode(&bytes).ok()
+}
+
 /// The DHT service name under which holders of a sector's latest replicated snapshot advertise.
 pub fn snapshot_service(sector: &str) -> String {
     format!("{}/snap", topics::service(sector))

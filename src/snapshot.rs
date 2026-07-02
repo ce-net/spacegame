@@ -150,6 +150,9 @@ pub struct SectorSnapshot {
     /// missing a beat. (Ephemeral debris is not snapshotted — it is cosmetic and bounded.)
     #[serde(default)]
     pub factions: Vec<Faction>,
+    /// Parked (idle-dropped) players' full ship state — progress persists across host restarts too.
+    #[serde(default)]
+    pub parked: Vec<ShipSnap>,
 }
 
 impl SectorSnapshot {
@@ -169,6 +172,9 @@ impl SectorSnapshot {
         let mut factions: Vec<Faction> = sim.factions.values().cloned().collect();
         factions.sort_by(|a, b| a.owner.cmp(&b.owner));
 
+        let mut parked: Vec<ShipSnap> = sim.parked.values().cloned().collect();
+        parked.sort_by(|a, b| a.id.cmp(&b.id));
+
         SectorSnapshot {
             version: SNAPSHOT_VERSION,
             sx: sim.sector.sx,
@@ -182,6 +188,7 @@ impl SectorSnapshot {
             mined,
             rock_dmg,
             factions,
+            parked,
         }
     }
 
@@ -202,6 +209,9 @@ impl SectorSnapshot {
         sim.set_rock_damage(self.rock_dmg.iter().copied());
         for f in &self.factions {
             sim.factions.insert(f.owner.clone(), f.clone());
+        }
+        for p in &self.parked {
+            sim.parked.insert(p.id.clone(), p.clone());
         }
         sim
     }

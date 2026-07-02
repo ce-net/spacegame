@@ -410,6 +410,12 @@ pub async fn run_sector(
             tokio::select! {
                 _ = &mut shutdown => {
                     tracing::info!(sector = %cfg.sector, "shutdown requested; stopping sector");
+                    // FINAL SAVE: the exact last state, locally and to the blob store — a graceful
+                    // stop loses NOTHING (a hard kill loses at most one snapshot interval).
+                    if let Err(e) = director::persist_snapshot_file(&cfg.sector, &sim) {
+                        tracing::warn!(error = %e, "final local snapshot failed");
+                    }
+                    let _ = director::replicate_snapshot(ce, &cfg.sector, &sim).await;
                     return Ok(());
                 }
 
@@ -510,6 +516,11 @@ pub async fn run_sector(
                         let sector2 = cfg.sector.clone();
                         let sim2 = sim.clone();
                         tokio::spawn(async move {
+                            // Durable-across-restarts local file FIRST (the blob announce dies with
+                            // this process; the file does not), then the mesh replication.
+                            if let Err(e) = director::persist_snapshot_file(&sector2, &sim2) {
+                                tracing::debug!(error = %e, "local snapshot persist failed");
+                            }
                             if let Err(e) = director::replicate_snapshot(&ce2, &sector2, &sim2).await {
                                 tracing::debug!(error = %e, "snapshot replication failed (transient)");
                             }
@@ -741,9 +752,22 @@ pub async fn adopt_latest_snapshot(ce: &CeClient, sector: &str) -> Result<Option
     };
     let _ = tokio::time::timeout(Duration::from_secs(6), listen).await;
 
-    match best {
-        Some(ann) => Ok(Some(director::restore_snapshot(ce, &ann.cid).await?)),
-        None => Ok(None),
+    // The LOCAL snapshot file survives restarts even when no live host is left to announce (the
+    // pubsub announce dies with its announcer — the whole reason state used to reset on redeploy).
+    // Take whichever of {local file, freshest mesh announce} carries the higher tick.
+    let local = director::load_snapshot_file(sector);
+    match (best, local) {
+        (Some(ann), Some(l)) if l.tick >= ann.tick => Ok(Some(l.restore())),
+        (Some(ann), _) => match director::restore_snapshot(ce, &ann.cid).await {
+            Ok(sim) => Ok(Some(sim)),
+            // The announced blob may be gone (blob store wiped); the file is still good.
+            Err(_) => Ok(director::load_snapshot_file(sector).map(|l| l.restore())),
+        },
+        (None, Some(l)) => {
+            tracing::info!(sector, tick = l.tick, "restored sector from the LOCAL snapshot file");
+            Ok(Some(l.restore()))
+        }
+        (None, None) => Ok(None),
     }
 }
 #[cfg(feature = "mesh")]

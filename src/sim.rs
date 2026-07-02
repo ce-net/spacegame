@@ -876,6 +876,11 @@ pub struct Sim {
     /// Per-player **always-alive** factions, keyed by owner NodeId. Ticked every sim tick whether or
     /// not the player's ship is present — your industrial swarm keeps building while you are away.
     pub factions: std::collections::HashMap<String, Faction>,
+    /// **Parked players** — the full persistent state of players dropped for idle timeout, keyed by
+    /// id. A rejoin restores the parked ship (minerals, kills, tech, fitted design, position) instead
+    /// of a fresh starter, and the set rides the sector snapshot, so YOUR PROGRESS survives both your
+    /// own disconnects and host restarts. Bounded (a full lot stops parking, never evicts silently).
+    pub parked: std::collections::HashMap<String, ShipSnap>,
     /// Free-floating wreckage simulated with the LOD rigid-body engine: high precision near players,
     /// coarse far away. Spawned on kills; demonstrates the advanced 2D physics at scale.
     pub debris: physics::World,
@@ -902,6 +907,7 @@ impl Default for Sim {
             bullet_out: Vec::new(),
             departed: HashMap::new(),
             factions: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
             debris: physics::World::new(),
         }
     }
@@ -960,6 +966,17 @@ impl Sim {
         let dw = self.rules.default_weapon();
         let base_hp = self.rules.tunables.base_hp;
         self.factions.entry(id.to_string()).or_insert_with(|| Faction::founding(id));
+        // A returning player RESUMES their parked ship — minerals, kills, tech, fitted design and
+        // position all intact. Progress is never reset by leaving.
+        if !self.ships.contains_key(id)
+            && let Some(snap) = self.parked.remove(id)
+        {
+            let mut s = Ship::from_snap(&snap, tick);
+            s.name = name;
+            s.hue = hue;
+            self.ships.insert(id.to_string(), s);
+            return;
+        }
         match self.ships.get_mut(id) {
             Some(s) => {
                 s.name = name;
@@ -1279,7 +1296,15 @@ impl Sim {
                 now.saturating_sub(s.last_input_tick) > tun.player_ttl_ticks
             };
             if drop {
-                self.ships.remove(id);
+                // PARK a departing PLAYER's full state (progress persistence): their rejoin resumes
+                // this exact ship. NPCs are not parked — worldgen/factions regenerate them.
+                if let Some(s) = self.ships.remove(id)
+                    && s.owner.is_none()
+                    && s.alive
+                    && self.parked.len() < 4096
+                {
+                    self.parked.insert(id.clone(), s.snap(id));
+                }
                 continue;
             }
 
@@ -3235,6 +3260,17 @@ impl Sim {
 
         // Bullets: order-independent (XOR fold), since the Vec order is an implementation detail.
         let mut bsum: u64 = 0;
+        // Parked players fold ORDER-INDEPENDENTLY (XOR accumulate, mix once) — map iteration order
+        // must never cause a false disagreement between honest replicas.
+        let mut parked_acc: u64 = 0;
+        for (id, p) in &self.parked {
+            let mut ph: u64 = 0xcbf29ce484222325;
+            for byte in id.bytes() {
+                ph = (ph ^ byte as u64).wrapping_mul(PRIME);
+            }
+            parked_acc ^= ph ^ ((p.minerals as u64) << 32) ^ p.kills as u64;
+        }
+        mix(&mut h, parked_acc);
         for b in &self.bullets {
             let mut bh: u64 = 0x9e3779b97f4a7c15;
             mix(&mut bh, fnv1a(&b.owner) as u64);
@@ -4299,6 +4335,39 @@ mod tests {
             s.tick(1.0);
         }
         assert_eq!(s.player_count(), 0);
+    }
+
+    #[test]
+    fn a_parked_player_resumes_with_their_progress() {
+        // PROGRESS PERSISTS: an idle-dropped player's full state parks; the rejoin resumes THAT ship —
+        // minerals, kills and the fitted design intact — never a fresh starter reset.
+        let mut s = arena();
+        s.join("n", "leif", 0);
+        solo(&mut s);
+        let mut ed = crate::editor::ShipEditor::starter();
+        ed.name = "Keeper".into();
+        ed.place("armor-hex", 0, 4, 0);
+        assert!(s.fit_design("n", &ed.to_blueprint()), "custom design fitted");
+        let hull = s.ships["n"].hull.clone();
+        {
+            let p = s.ships.get_mut("n").unwrap();
+            p.minerals = 777;
+            p.kills = 9;
+        }
+        for _ in 0..(Tunables::default().player_ttl_ticks + 2) {
+            s.tick(1.0);
+        }
+        assert!(!s.ships.contains_key("n"), "idle ship left the live set");
+        assert!(s.parked.contains_key("n"), "…and parked with full state");
+        // SNAPSHOT ROUNDTRIP: parked players ride the sector snapshot (host-restart persistence).
+        let snap = crate::snapshot::SectorSnapshot::capture(&s);
+        let mut restored = snap.restore();
+        restored.apply_ruleset(s.rules.clone());
+        restored.join("n", "leif", 0);
+        let p = &restored.ships["n"];
+        assert_eq!(p.minerals, 777, "minerals survived the restart");
+        assert_eq!(p.kills, 9, "kills survived");
+        assert_eq!(p.hull, hull, "the fitted design survived");
     }
 
     // ---- Living-galaxy expansion: shields, energy, status effects, hazards, mines, pickups ----
