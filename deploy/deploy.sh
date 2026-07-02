@@ -76,9 +76,9 @@ seed() {
     # already-installed app, and uninstall does not stop a running instance, so we also pkill it).
     ce-publish app ceapp.toml --bin target/release/spacegame --target linux-amd64 --hub '"$HUB"'
     ce app uninstall spacegame >/dev/null 2>&1 || true
-    # [h]ost: the bracket keeps this pkill from matching the SSH session's own command line (which
-    # contains this very pattern) — without it the deploy killed ITSELF here and the reinstall silently
-    # never ran, leaving the seed down after every deploy.
+    # [h]ost: the bracket keeps this pkill from matching the ssh command line that carries this very
+    # pattern — without it the deploy killed ITSELF here and the reinstall silently never ran, leaving
+    # the seed down after every deploy. NO apostrophes in this block: it rides inside single quotes.
     pkill -f "apps/spacegame/.*/spacegame [h]ost" >/dev/null 2>&1 || true
     # Use the DEFAULT registry (the relay hub IS ce-net.com): passing --registry http://127.0.0.1:8970
     # here HANGS the materialize step, whereas the default resolves the just-published manifest instantly.
